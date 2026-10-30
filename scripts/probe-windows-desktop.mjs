@@ -334,10 +334,14 @@ try {
 		await editor.waitFor({ state: 'detached' });
 		await folder(window, 'General').locator('.folders-tree__branch').getByText('main', { exact: true }).waitFor();
 
-		const [sessionId] = await visibleSessions(window);
 		await type(window, `Set-Location "${repository}"`);
 		await type(window, 'git worktree add ..\\probe-worktree -b probe-worktree');
-		await folder(window, 'probe-worktree').locator(`[data-folder-terminal-session="${sessionId}"]`).waitFor();
+		// The project's one terminal is the one that ran Git.
+		await folder(window, 'probe-worktree').locator('.folders-tree__row--terminal').waitFor();
+		await until(
+			async () => (await folder(window, 'General').locator('.folders-tree__row--terminal').count()) === 0,
+			'the terminal that ran git worktree add stayed in General',
+		);
 	});
 
 	await step('command prompt input, output, and exit', async () => {
