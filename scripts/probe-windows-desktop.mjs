@@ -241,6 +241,21 @@ socket.on('data', (chunk) => {
 socket.on('error', (error) => console.log('mcp-result=' + error.code));
 `;
 
+/** The application's log lines that match, newest last, bounded. */
+async function logLines(pattern) {
+	try {
+		const directory = join(dataDir, 'logs');
+		const files = (await readdir(directory)).filter((name) => name.endsWith('.jsonl')).sort();
+		const lines = (await Promise.all(files.map((name) => readFile(join(directory, name), 'utf8'))))
+			.join('\n')
+			.split('\n')
+			.filter((line) => pattern.test(line) && !line.includes('port-diagnostic'));
+		return lines.slice(-40).join('\n').slice(-6000);
+	} catch (error) {
+		return `no log (${error})`;
+	}
+}
+
 async function diagnostics() {
 	try {
 		const directory = join(dataDir, 'logs');
@@ -348,9 +363,9 @@ try {
 			await settings
 				.screenshot({ path: join(dirname(recordPath), 'windows-probe-extensions-settings.png'), timeout: 10_000 })
 				.catch(() => {});
-			const text = (await settings.locator('body').innerText().catch(() => '')).slice(0, 1500);
+			const text = (await settings.locator('body').innerText().catch(() => '')).slice(0, 3000);
 			if (settings !== window) await settings.close().catch(() => {});
-			throw new Error(`Settings showed no extension (${settings === window ? 'no new window' : settings.url()}): ${text}`, { cause: error });
+			throw new Error(`Settings showed no extension card: ${text}; log: ${await logLines(/extension|agents|koffi|canvas/iu)}`, { cause: error });
 		}
 		// An extension starting up says pending; give each a moment to settle.
 		let seen = [];
@@ -389,6 +404,8 @@ try {
 		await type(window, `Set-Location "${repository}"`);
 		await type(window, 'Write-Output "trace2=$env:GIT_TRACE2_EVENT"');
 		const trace2 = await printed(window, 'trace2');
+		await type(window, `Write-Output "tracedir=$(Test-Path '${join(dataDir, 'run', 'git-trace')}')"`);
+		const traceDirectory = await printed(window, 'tracedir');
 		await type(window, 'git worktree add ..\\probe-worktree -b probe-worktree');
 		const folders = () =>
 			window.locator('.project-workspace--active .folders-tree__row--folder .folders-tree__name').allInnerTexts();
@@ -401,7 +418,20 @@ try {
 		try {
 			await folder(window, 'probe-worktree').locator('.folders-tree__row--terminal').waitFor();
 		} catch (error) {
-			throw new Error(`the folder appeared but its terminal was not moved (trace2: ${trace2})`, { cause: error });
+			// Is Git reporting at all, or did the first terminal start before
+			// the stream was listening? A terminal opened now says.
+			await appCommand(window, 'new-terminal');
+			let fresh;
+			await until(async () => {
+				fresh = (await visibleSessions(window)).find((id) => id && id !== 'default');
+				return fresh !== undefined;
+			}, 'no new terminal');
+			await type(window, 'Write-Output "trace2=$env:GIT_TRACE2_EVENT"', fresh);
+			const freshTrace2 = await printed(window, 'trace2', fresh).catch(() => '?');
+			throw new Error(
+				`the folder appeared but its terminal was not moved (trace2: "${trace2}", in a new terminal: "${freshTrace2}", trace directory exists: ${traceDirectory}; log: ${await logLines(/git|trace|worktree|capture/iu)})`,
+				{ cause: error },
+			);
 		}
 		await until(
 			async () => (await folder(window, 'General').locator('.folders-tree__row--terminal').count()) === 0,
