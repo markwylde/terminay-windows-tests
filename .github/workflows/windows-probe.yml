@@ -1,0 +1,53 @@
+# Runs only the Windows Desktop probe, against the installer the last passing
+# windows-spikes build uploaded, so a change to the probe needs no rebuild.
+name: windows-probe
+
+on:
+  push:
+    paths:
+      - scripts/probe-windows-desktop.*
+      - .github/workflows/windows-probe.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: windows-probe
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-installer
+          path: installer
+          run-id: 41138607874
+          github-token: ${{ github.token }}
+      - run: npm install --no-save --no-audit --no-fund --ignore-scripts @playwright/test@1.60.0
+        timeout-minutes: 5
+      - name: Probe the installer
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          $installer = Get-ChildItem -Recurse installer -Filter 'Terminay-Windows-*-Setup.exe' | Select-Object -First 1
+          ./scripts/probe-windows-desktop.ps1 -Installer $installer.FullName -Record "$env:RUNNER_TEMP/windows-probe.json"
+      - if: always()
+        shell: bash
+        run: cat "$RUNNER_TEMP/windows-probe.json" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-probe
+          path: |
+            ${{ runner.temp }}/windows-probe.json
+            ${{ runner.temp }}/windows-probe-failure.png
+          if-no-files-found: ignore

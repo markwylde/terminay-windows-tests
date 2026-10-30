@@ -4,6 +4,9 @@ name: windows-spikes
 
 on:
   push:
+    paths-ignore:
+      - scripts/probe-windows-desktop.*
+      - .github/workflows/windows-probe.yml
   workflow_dispatch:
 
 permissions:
