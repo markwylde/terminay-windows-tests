@@ -90,10 +90,13 @@
     ],
     "artifactName": "${productName}-Windows-${version}-Setup.${ext}"
   },
+  // Per-user and one-click, so Terminay lives in %LOCALAPPDATA%\Programs,
+  // which the user owns: updates install silently, without elevation, into
+  // the directory they replace (native-windows-desktop, design decision 3).
   "nsis": {
-    "oneClick": false,
+    "oneClick": true,
     "perMachine": false,
-    "allowToChangeInstallationDirectory": true,
+    "allowToChangeInstallationDirectory": false,
     "deleteAppDataOnUninstall": false
   },
   "linux": {

@@ -160,6 +160,7 @@ import {
 	resolveTerminalForegroundProcess,
 	resolveTerminalProcessCwd,
 } from './processCwd';
+import { currentHolderAddressing } from './windowsUser';
 
 const require = createRequire(import.meta.url);
 type MainServerPortDiagnostics = {
@@ -1041,6 +1042,7 @@ export class ServerTerminalAuthority {
 						launch: options.sessionHolder.launch,
 						limitMs: options.sessionHolder.limitMs,
 						requireMutualProof: process.platform === 'win32',
+						addressing: currentHolderAddressing(),
 						onObservation: (report) =>
 							options.onSessionHolderObservation?.(report),
 						resolveCwd: resolveTerminalProcessCwd,

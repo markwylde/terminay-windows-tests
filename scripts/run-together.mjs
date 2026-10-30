@@ -21,7 +21,12 @@ function stopOthers() {
 	for (const child of children) {
 		try {
 			// A command is a shell with children of its own; end the group.
-			process.kill(-child.pid, 'SIGTERM');
+			// Windows has no process groups: end the tree by its root instead.
+			if (process.platform === 'win32')
+				spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
+					stdio: 'ignore',
+				});
+			else process.kill(-child.pid, 'SIGTERM');
 		} catch {
 			/* already gone */
 		}

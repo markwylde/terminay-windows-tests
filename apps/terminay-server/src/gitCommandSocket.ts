@@ -1,7 +1,9 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { join, win32 } from 'node:path';
 import {
+	currentWindowsUserSid,
 	loadGitTraceKey,
+	protectWindowsDirectory,
 	type WorktreeCaptureHostOptions,
 } from '@terminay/server-core';
 import {
@@ -96,7 +98,11 @@ function windowsHostOptions(
 	perRun: { readonly socketPath: string },
 ): Pick<
 	WorktreeCaptureHostOptions,
-	'socketPath' | 'traceDirectory' | 'socketPlacement' | 'tokenKey'
+	| 'socketPath'
+	| 'traceDirectory'
+	| 'prepareTraceDirectory'
+	| 'socketPlacement'
+	| 'tokenKey'
 > {
 	// Windows paths, whatever host computes them, so the choice is testable.
 	const runDirectory = {
@@ -105,6 +111,7 @@ function windowsHostOptions(
 			options.temporaryDirectory,
 			win32.basename(perRun.socketPath, '.sock'),
 		),
+		prepareTraceDirectory: protectTraceDirectory,
 		socketPlacement: 'trace-directory' as const,
 	};
 	if (options.dataDirectory === undefined) return runDirectory;
@@ -117,7 +124,14 @@ function windowsHostOptions(
 	return {
 		socketPath: perRun.socketPath,
 		traceDirectory: win32.join(options.dataDirectory, 'run', 'git-trace'),
+		prepareTraceDirectory: protectTraceDirectory,
 		socketPlacement: 'trace-directory',
 		tokenKey,
 	};
+}
+
+/** Only this user, SYSTEM and Administrators may write Git's events (ADR-0079). */
+function protectTraceDirectory(path: string): boolean {
+	const userSid = currentWindowsUserSid();
+	return userSid !== null && protectWindowsDirectory(path, userSid);
 }
