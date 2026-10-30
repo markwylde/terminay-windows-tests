@@ -26,12 +26,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24.15.0
-      - name: Find the last passing build
+      - name: Find the newest built installer
         id: build
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: echo "run=$(gh run list -R "$GITHUB_REPOSITORY" -w windows-spikes.yml -s success -L 1 --json databaseId --jq '.[0].databaseId')" >> "$GITHUB_OUTPUT"
+        run: echo "run=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=windows-installer" --jq '.artifacts[0].workflow_run.id')" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
         with:
           name: windows-installer
