@@ -84,8 +84,9 @@ export const DIRECT_RUNTIME_DEPENDENCIES = {
   tweetnacl: '1.0.3',
 }
 
-// Upstream allows a range for pvutils. Keep source-mirror acquisition on the
-// audited candidate graph even when npm publishes a newer compatible release.
+// Upstream allows a range for pvutils and tslib. Keep source-mirror acquisition
+// on the audited candidate graph even when npm publishes a newer compatible
+// release. tsyringe keeps the older tslib it retains beneath itself.
 export const TRANSITIVE_RUNTIME_DEPENDENCY_OVERRIDES = {
   '@peculiar/asn1-cms': '2.8.0',
   '@peculiar/asn1-csr': '2.8.0',
@@ -99,6 +100,8 @@ export const TRANSITIVE_RUNTIME_DEPENDENCY_OVERRIDES = {
   '@peculiar/asn1-x509-attr': '2.8.0',
   asn1js: '3.0.10',
   pvutils: '1.1.5',
+  tslib: '2.8.1',
+  tsyringe: { '.': '4.10.0', tslib: '1.14.1' },
 }
 
 export { parseSingleNpmPackResult }
