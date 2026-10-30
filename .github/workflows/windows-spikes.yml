@@ -58,7 +58,7 @@ jobs:
           name: windows-probe
           path: |
             ${{ runner.temp }}/windows-probe.json
-            ${{ runner.temp }}/windows-probe-failure.png
+            ${{ runner.temp }}/windows-probe-*.png
           if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         if: success()

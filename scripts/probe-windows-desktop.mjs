@@ -6,7 +6,8 @@
 //   2. PowerShell: input and output, then a window resize the shell sees;
 //   3. parity: a split starts in the directory of the terminal it splits, a
 //      foreground `node` is reported busy, the MCP pipe answers from inside a
-//      terminal, and `git worktree add` moves its terminal into the new folder;
+//      terminal, every built-in extension is active, and `git worktree add`
+//      moves its terminal into the new folder;
 //   4. Command Prompt, opened from the shell profile chooser: input, output,
 //      and `exit` ending it, then closing its tab;
 //   5. quit with the PowerShell terminal held, relaunch, and find the same
@@ -64,12 +65,24 @@ async function step(name, run) {
 	}
 }
 
-/** A parity check: recorded like a step, but a failure lets the run go on. */
+/**
+ * A parity check: recorded like a step, but a failure lets the run go on. A
+ * failure keeps a screenshot and the text of the terminal on screen.
+ */
 async function check(name, run) {
 	try {
 		await step(name, run);
 	} catch {
-		// Recorded by step(); the run fails at the end.
+		const entry = steps.at(-1);
+		const slug = name.replace(/[^a-z0-9]+/giu, '-').replace(/^-|-$/gu, '').toLowerCase();
+		await session?.window
+			.screenshot({ path: join(dirname(recordPath), `windows-probe-${slug}.png`), timeout: 10_000 })
+			.catch(() => {});
+		entry.screen = await session?.window
+			.locator('.terminal-panel:visible .xterm-rows')
+			.allInnerTexts()
+			.then((texts) => texts.join('\n---\n').slice(-4000))
+			.catch(() => undefined);
 	}
 }
 
@@ -300,6 +313,8 @@ try {
 		await terminal(window).locator('.xterm-helper-textarea').focus();
 		await window.keyboard.press('Control+C');
 		await until(async () => (await runningTerminals(app, window)) === 0, 'the terminal stayed busy after node ended');
+		await type(window, 'Write-Output "after-busy-$(1+1)"');
+		await output(window, 'after-busy-2');
 	});
 
 	await check('the MCP pipe answers from inside a terminal', async () => {
@@ -312,6 +327,34 @@ try {
 		assert.match(socket, /^\/\/\.\/pipe\//u, 'the control endpoint must be a named pipe');
 		assert.equal(result, 'ok');
 		return { socket };
+	});
+
+	await check('every built-in extension is active', async () => {
+		const { app, window } = session;
+		// Settings › Extensions, from the command bar; it opens in its own window.
+		const opened = app.waitForEvent('window', { timeout: 30_000 }).catch(() => undefined);
+		await window.keyboard.press('Control+L');
+		await window.keyboard.type('Extensions');
+		await window
+			.getByRole('dialog', { name: 'Command bar' })
+			.locator('.macro-launcher-item-title', { hasText: /^Extensions$/u })
+			.first()
+			.click();
+		const settings = (await opened) ?? window;
+		const states = settings.locator('.extension-card .extension-state');
+		await states.first().waitFor();
+		// An extension starting up says pending; give each a moment to settle.
+		let seen = [];
+		await until(async () => {
+			seen = await states.allInnerTexts();
+			return !seen.includes('pending');
+		}, 'a built-in extension never finished starting');
+		const installed = seen.filter((state) => state !== 'available');
+		const unhealthy = installed.filter((state) => state !== 'installed' && state !== 'disabled');
+		if (settings !== window) await settings.close();
+		assert.ok(installed.length > 0, 'no extension is installed');
+		assert.deepEqual(unhealthy, [], `extension states: ${seen.join(', ')}`);
+		return { states: seen };
 	});
 
 	await check('git worktree add moves its terminal into the new folder', async () => {

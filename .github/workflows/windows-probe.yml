@@ -26,11 +26,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24.15.0
+      - name: Find the last passing build
+        id: build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "run=$(gh run list -R "$GITHUB_REPOSITORY" -w windows-spikes.yml -s success -L 1 --json databaseId --jq '.[0].databaseId')" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
         with:
           name: windows-installer
           path: installer
-          run-id: 41138607874
+          run-id: ${{ steps.build.outputs.run }}
           github-token: ${{ github.token }}
       - run: npm install --no-save --no-audit --no-fund --ignore-scripts @playwright/test@1.60.0
         timeout-minutes: 5
@@ -49,5 +55,5 @@ jobs:
           name: windows-probe
           path: |
             ${{ runner.temp }}/windows-probe.json
-            ${{ runner.temp }}/windows-probe-failure.png
+            ${{ runner.temp }}/windows-probe-*.png
           if-no-files-found: ignore
