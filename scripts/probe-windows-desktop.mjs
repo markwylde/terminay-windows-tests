@@ -241,6 +241,26 @@ socket.on('data', (chunk) => {
 socket.on('error', (error) => console.log('mcp-result=' + error.code));
 `;
 
+/** Every failure an extension registry in the data directory records. */
+async function registryFailures() {
+	const found = [];
+	const walk = async (directory, depth) => {
+		if (depth > 5) return;
+		for (const entry of await readdir(directory, { withFileTypes: true }).catch(() => [])) {
+			const path = join(directory, entry.name);
+			if (entry.isDirectory() && entry.name !== 'node_modules') await walk(path, depth + 1);
+			else if (entry.isFile() && entry.name.endsWith('.json')) {
+				const text = await readFile(path, 'utf8').catch(() => '');
+				for (const match of text.matchAll(/"extensionId":"([^"]+)"[^{}]*?"failureClass":"([^"]+)"/gu))
+					found.push(`${match[1]}: ${match[2]}`);
+				for (const match of text.matchAll(/"failureClass":\s*"([^"]+)"/gu)) found.push(`${entry.name}: ${match[1]}`);
+			}
+		}
+	};
+	await walk(dataDir, 0);
+	return [...new Set(found)].join('; ') || 'no failure recorded';
+}
+
 /** The application's log lines that match, newest last, bounded. */
 async function logLines(pattern) {
 	try {
@@ -356,29 +376,25 @@ try {
 			.first()
 			.click();
 		const settings = (await opened) ?? window;
-		const states = settings.locator('.extension-card .extension-state');
-		try {
-			await states.first().waitFor();
-		} catch (error) {
-			await settings
-				.screenshot({ path: join(dirname(recordPath), 'windows-probe-extensions-settings.png'), timeout: 10_000 })
-				.catch(() => {});
-			const text = (await settings.locator('body').innerText().catch(() => '')).slice(0, 3000);
-			if (settings !== window) await settings.close().catch(() => {});
-			throw new Error(`Settings showed no extension card: ${text}; log: ${await logLines(/builtin-agents|all-your-agents|koffi/iu)}`, { cause: error });
-		}
-		// An extension starting up says pending; give each a moment to settle.
-		let seen = [];
+		// The built-in list reads "<name> <state>" per extension, between its
+		// BUILT-IN and CUSTOM headings.
+		const builtIns = async () => {
+			const text = await settings.locator('body').innerText();
+			const start = text.indexOf('BUILT-IN');
+			const end = text.indexOf('CUSTOM', start);
+			return start < 0 || end < 0 ? undefined : text.slice(start + 'BUILT-IN'.length, end).trim();
+		};
+		let listed;
 		await until(async () => {
-			seen = await states.allInnerTexts();
-			return !seen.includes('pending');
-		}, 'a built-in extension never finished starting');
-		const installed = seen.filter((state) => state !== 'available');
-		const unhealthy = installed.filter((state) => state !== 'installed' && state !== 'disabled');
+			listed = await builtIns();
+			return listed !== undefined && !/\b(Starting|Pending|Installing)\b/u.test(listed);
+		}, 'the built-in extensions never settled');
 		if (settings !== window) await settings.close();
-		assert.ok(installed.length > 0, 'no extension is installed');
-		assert.deepEqual(unhealthy, [], `extension states: ${seen.join(', ')}`);
-		return { states: seen };
+		const lines = listed.split('\n').map((line) => line.trim()).filter(Boolean);
+		if (lines.includes('Failed'))
+			throw new Error(`a built-in extension failed (${lines.join(' | ')}): ${await registryFailures()}`);
+		assert.ok(lines.includes('On'), `no built-in extension is on: ${lines.join(' | ')}`);
+		return { builtIns: lines };
 	});
 
 	await check('git worktree add moves its terminal into the new folder', async () => {
