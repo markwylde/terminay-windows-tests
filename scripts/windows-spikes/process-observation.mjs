@@ -66,4 +66,38 @@ result.protect = core.protectWindowsDirectory(protectedDirectory, result.sid ?? 
 result.protectedAcl = execFileSync('icacls.exe', [protectedDirectory], { encoding: 'utf8' }).trim();
 
 for (const child of [cmd64, cmd32, pwshSetLocation, pwshEnvironment]) child.kill();
+// ADR-0082: an interactive PowerShell in a ConPTY, started with the arguments
+// Terminay adds, keeps its process directory in step after `Set-Location`.
+async function hookedPowerShell(shell) {
+	const { createRequire } = await import('node:module');
+	const pty = createRequire(import.meta.url)('node-pty');
+	const term = pty.spawn(shell, core.shellLaunchArgs(shell, ['-NoLogo', '-NoProfile'], 'win32'), {
+		cwd: 'C:\\',
+		cols: 120,
+		rows: 30,
+	});
+	let output = '';
+	term.onData((data) => {
+		output += data;
+	});
+	await wait(5_000);
+	term.write(`Set-Location '${target}'\r`);
+	await wait(3_000);
+	const cwd = core.readWindowsProcessCwd(term.pid);
+	term.write(`Set-Location 'HKCU:\\Software'\r`);
+	await wait(2_000);
+	const afterRegistry = core.readWindowsProcessCwd(term.pid);
+	term.kill();
+	return { cwd, afterRegistry, promptStillDrawn: /PS .*drivers>/u.test(output) };
+}
+try {
+	result.powershellHook = {
+		windowsPowerShell: await hookedPowerShell('powershell.exe'),
+		pwsh: await hookedPowerShell('pwsh.exe'),
+	};
+} catch (error) {
+	result.powershellHook = `error: ${String(error?.stack ?? error).slice(0, 600)}`;
+}
+
 console.log(JSON.stringify(result, null, 2));
+process.exit(0);

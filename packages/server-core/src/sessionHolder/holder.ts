@@ -16,9 +16,10 @@ import { writeHolderCloseRecord } from './closeRecord.js';
 import {
 	isHolderSessionId,
 	sessionHolderDirectory,
+	type SessionHolderAddressing,
+	sessionHolderAddress,
+	sessionHolderAddressFits,
 	sessionHolderRecordPath,
-	sessionHolderSocketPath,
-	socketPathFits,
 } from './paths.js';
 import {
 	encodeHolderFrame,
@@ -85,6 +86,11 @@ export interface SessionHolderOptions {
 	 * another user first, which is Windows (ADR-0078 §3).
 	 */
 	readonly requireMutualProof?: boolean;
+	/**
+	 * Where the holder runs. Defaults to this process's platform; on Windows it
+	 * carries the user's SID, which names the pipe.
+	 */
+	readonly addressing?: SessionHolderAddressing;
 	readonly killGraceMs?: number;
 	readonly firstAttachTimeoutMs?: number;
 	readonly now?: () => number;
@@ -159,6 +165,7 @@ export class SessionHolder {
 	readonly credential: string;
 
 	private readonly dataRoot: string;
+	private readonly addressing: SessionHolderAddressing;
 	private readonly nodePty: NodePtyModuleLike;
 	private readonly maxBufferBytes: number;
 	private readonly versions: readonly number[];
@@ -201,10 +208,12 @@ export class SessionHolder {
 		this.timers = options.timers ?? defaultTimers;
 		this.startedAt = this.now();
 		this.onClosed = options.onClosed;
-		this.socketPath = sessionHolderSocketPath(
-			options.dataRoot,
-			options.generation,
-		);
+		this.addressing = options.addressing ?? { platform: process.platform };
+		this.socketPath = sessionHolderAddress({
+			...this.addressing,
+			dataRoot: options.dataRoot,
+			generation: options.generation,
+		});
 		this.credential = randomBytes(32).toString('hex');
 		this.server = server;
 	}
@@ -217,9 +226,12 @@ export class SessionHolder {
 		chmodSync(directory, 0o700);
 		const server = createServer();
 		const holder = new SessionHolder(options, server);
-		if (!socketPathFits(holder.socketPath))
+		// On Windows the launching server has already closed the directory to
+		// other users; modes mean nothing there.
+		const windows = holder.addressing.platform === 'win32';
+		if (!sessionHolderAddressFits(options.dataRoot, options.generation, holder.addressing))
 			throw new Error('session holder socket path is too long');
-		rmSync(holder.socketPath, { force: true });
+		if (!windows) rmSync(holder.socketPath, { force: true });
 		server.on('connection', (socket) => holder.accept(socket));
 		await new Promise<void>((resolve, reject) => {
 			server.once('error', reject);
@@ -228,7 +240,7 @@ export class SessionHolder {
 				resolve();
 			});
 		});
-		chmodSync(holder.socketPath, 0o600);
+		if (!windows) chmodSync(holder.socketPath, 0o600);
 		holder.writeRecord();
 		// A holder nobody ever attaches to must not wait forever.
 		holder.limitTimer = holder.timers.setTimeout(
@@ -289,7 +301,9 @@ export class SessionHolder {
 			this.attached = undefined;
 			this.pending.clear();
 			await new Promise<void>((resolve) => this.server.close(() => resolve()));
-			rmSync(this.socketPath, { force: true });
+			// A pipe goes when its server closes; a socket file stays behind.
+			if (this.addressing.platform !== 'win32')
+				rmSync(this.socketPath, { force: true });
 			rmSync(sessionHolderRecordPath(this.dataRoot, this.generation), {
 				force: true,
 			});

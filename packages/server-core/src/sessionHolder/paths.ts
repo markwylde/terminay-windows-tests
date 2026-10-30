@@ -54,6 +54,28 @@ export interface SessionHolderAddressOptions {
 	readonly userSid?: string;
 }
 
+/** The platform facts a holder's address depends on. */
+export interface SessionHolderAddressing {
+	readonly platform: string;
+	/** The current user's SID. Required on Windows. */
+	readonly userSid?: string;
+}
+
+/**
+ * Whether a generation's address can be listened on. A Unix socket path has a
+ * length limit; a pipe name does not.
+ */
+export function sessionHolderAddressFits(
+	dataRoot: string,
+	generation: string,
+	addressing: SessionHolderAddressing,
+): boolean {
+	return (
+		addressing.platform === 'win32' ||
+		socketPathFits(sessionHolderSocketPath(dataRoot, generation))
+	);
+}
+
 /** Where a holder generation listens: a Unix socket, or a named pipe on Windows. */
 export function sessionHolderAddress(
 	options: SessionHolderAddressOptions,
@@ -133,18 +155,18 @@ export interface SessionHolderEnablement {
  * started it and a test harness that did not ask for one would leave shells
  * running after it finished.
  *
- * It is also off, whatever was asked, where it cannot work: on Windows, and for
- * a data root too deep for the holder's socket path. Terminals then live and
- * end with the server, which is better than terminals that cannot start.
+ * It is also off, whatever was asked, where it cannot work: on Windows without
+ * the user's SID, which names the holder's pipe, and for a data root too deep
+ * for the holder's socket path. Terminals then live and end with the server,
+ * which is better than terminals that cannot start.
  */
 export function sessionHolderEnabled(options: SessionHolderEnablement): boolean {
-	if (options.platform === 'win32') return false;
+	if (options.platform === 'win32' && options.userSid === undefined)
+		return false;
 	const requested = options.env.TERMINAY_SESSION_HOLDER;
 	if (requested === '0') return false;
 	if (requested !== '1' && options.env.TERMINAY_TEST === '1') return false;
-	return socketPathFits(
-		sessionHolderSocketPath(options.dataRoot, '0'.repeat(16)),
-	);
+	return sessionHolderAddressFits(options.dataRoot, '0'.repeat(16), options);
 }
 
 function assertGeneration(generation: string): void {
