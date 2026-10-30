@@ -64,8 +64,13 @@ try {
 	}
 
 	Invoke-Step 'journey' {
-		node (Join-Path $PSScriptRoot 'probe-windows-desktop.mjs') --executable (Join-Path $installDir 'Terminay.exe') --data-dir $dataDir --record $journeyRecord
-		$exit = $LASTEXITCODE
+		# Started rather than piped: a held terminal's holder inherits the
+		# journey's handles, so its output pipe would never reach end of file.
+		$journeyArgs = @((Join-Path $PSScriptRoot 'probe-windows-desktop.mjs'), '--executable', (Join-Path $installDir 'Terminay.exe'), '--data-dir', $dataDir, '--record', $journeyRecord) |
+			ForEach-Object { '"{0}"' -f $_ }
+		$process = Start-Process -FilePath (Get-Command node).Source -ArgumentList $journeyArgs -NoNewWindow -PassThru
+		if (-not $process.WaitForExit(900000)) { $process.Kill($true); throw 'journey did not finish within 15 minutes' }
+		$exit = $process.ExitCode
 		if (Test-Path $journeyRecord) {
 			$journey = Get-Content -Raw $journeyRecord | ConvertFrom-Json
 			$result.journey = $journey
