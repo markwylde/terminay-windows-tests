@@ -156,13 +156,17 @@ async function printed(window, label, sessionId) {
 	return pattern.exec((await line.innerText()).trim())[1];
 }
 
-/** Has PowerShell print `<label>-<expression>`, and reads the number back. */
+/**
+ * Has PowerShell print `<label>-<expression>`, and reads the number back. The
+ * number is matched anywhere in a row: ConPTY repaints the screen on a resize,
+ * and can leave the tail of an older row beside it.
+ */
 async function answer(window, label, expression) {
 	await type(window, `Write-Output "${label}-${expression}"`);
-	const pattern = new RegExp(`^${label}-(\\d+)$`, 'u');
+	const pattern = new RegExp(`(?:^|\\s)${label}-(\\d+)`, 'u');
 	const line = terminal(window).locator('.xterm-rows > div').filter({ hasText: pattern }).first();
 	await line.waitFor();
-	return Number(pattern.exec((await line.innerText()).trim())[1]);
+	return Number(pattern.exec(await line.innerText())[1]);
 }
 
 /** Runs an application command the way its menu item does. */
@@ -257,6 +261,8 @@ try {
 			const [width, height] = window.getSize();
 			window.setSize(Math.max(800, width - 240), height);
 		});
+		// Let the resize reach the PTY before asking again.
+		await new Promise((resolve) => setTimeout(resolve, 1000));
 		let after = before;
 		for (let attempt = 0; attempt < 20 && after === before; attempt += 1)
 			after = await answer(session.window, `cols-after-${attempt}`, '$([Console]::WindowWidth)');
