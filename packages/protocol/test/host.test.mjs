@@ -1,0 +1,1089 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import {
+	authorizeTerminayHostActionRequest,
+	createTerminayHostBytePacket,
+	evaluateTerminayBundleCompatibility,
+	evaluateTerminayHostCompatibility,
+	parseTerminayHostAction,
+	parseTerminayHostActionRequest,
+	parseTerminayHostBytePacket,
+	parseTerminayHostCompatibilityRequirements,
+	parseTerminayHostContext,
+	parseTerminayHostEvent,
+	requiredTerminayHostCapability,
+} from '../dist/index.js';
+
+const requirements = {
+	bootstrap: { minimum: 1, maximum: 1 },
+	bundleFormat: { minimum: 1, maximum: 1 },
+	hostBridge: { minimum: 1, maximum: 2 },
+	byteEndpoint: { minimum: 1, maximum: 1 },
+	requiredCapabilities: { clipboardWrite: { minimum: 1, maximum: 1 } },
+	optionalCapabilities: { nativeWindows: { minimum: 1, maximum: 2 } },
+};
+
+test('host context is closed, immutable, and cannot select Electron mode', () => {
+	const context = parseTerminayHostContext({
+		schemaVersion: 1,
+		bootstrapVersion: 1,
+		sourceId: 'source-a',
+		windowId: 'window-a',
+		serverId: 'server-a',
+		profileId: 'profile-a',
+		bundleId: 'bundle_12345678',
+		applicationProtocolVersion: '1',
+		hostKind: 'desktop',
+		hostBridgeVersion: 1,
+		byteEndpointVersion: 1,
+		capabilities: { nativeWindows: 1, clipboardWrite: 1 },
+	});
+	assert.equal(context.hostKind, 'desktop');
+	assert.equal(context.capabilities.nativeWindows, 1);
+	assert.equal(Object.isFrozen(context), true);
+	assert.equal(Object.isFrozen(context.capabilities), true);
+	assert.throws(
+		() => parseTerminayHostContext({ ...context, mode: 'electron' }),
+		/fields are invalid/u,
+	);
+	assert.throws(
+		() => parseTerminayHostContext({ ...context, hostName: 'Studio-Mac' }),
+		/fields are invalid/u,
+	);
+	assert.throws(
+		() =>
+			parseTerminayHostContext({ ...context, capabilities: { rootShell: 1 } }),
+		/unknown capability/u,
+	);
+});
+
+test('host menu events are closed and bound to their negotiated context', () => {
+	const context = parseTerminayHostContext({
+		schemaVersion: 1,
+		bootstrapVersion: 1,
+		sourceId: 'source-a',
+		windowId: 'window-a',
+		serverId: 'server-a',
+		profileId: 'profile-a',
+		bundleId: 'bundle_12345678',
+		applicationProtocolVersion: '1',
+		hostKind: 'desktop',
+		hostBridgeVersion: 1,
+		byteEndpointVersion: 1,
+		capabilities: { nativeMenus: 1 },
+	});
+	const event = parseTerminayHostEvent(
+		{
+			schemaVersion: 1,
+			bridgeVersion: 1,
+			sourceId: 'source-a',
+			windowId: 'window-a',
+			profileId: 'profile-a',
+			serverId: 'server-a',
+			event: { type: 'menu.command', command: 'open-settings' },
+		},
+		context,
+	);
+	assert.equal(event.event.command, 'open-settings');
+	assert.equal(Object.isFrozen(event), true);
+	assert.equal(Object.isFrozen(event.event), true);
+	assert.throws(
+		() => parseTerminayHostEvent({ ...event, windowId: 'window-b' }, context),
+		/outside its binding/u,
+	);
+	assert.throws(
+		() =>
+			parseTerminayHostEvent(
+				{ ...event, event: { type: 'menu.command', command: 'open-devtools' } },
+				context,
+			),
+		/menu command is invalid/u,
+	);
+	const zoom = parseTerminayHostEvent(
+		{
+			...event,
+			event: { type: 'terminal.zoom', zoomLevel: 3 },
+		},
+		context,
+	);
+	assert.deepEqual(zoom.event, { type: 'terminal.zoom', zoomLevel: 3 });
+	for (const zoomLevel of [-6, 1.5, 11, '3']) {
+		assert.throws(
+			() =>
+				parseTerminayHostEvent(
+					{
+						...event,
+						event: { type: 'terminal.zoom', zoomLevel },
+					},
+					context,
+				),
+			/zoom level is invalid/u,
+		);
+	}
+});
+
+test('host compatibility separates required failures from optional degradation', () => {
+	const compatible = evaluateTerminayHostCompatibility(requirements, {
+		bootstrapVersion: 1,
+		bundleFormatVersion: 1,
+		hostBridgeVersion: 1,
+		byteEndpointVersion: 1,
+		capabilities: { clipboardWrite: 1 },
+	});
+	assert.deepEqual(compatible, {
+		compatible: true,
+		unavailableOptionalCapabilities: ['nativeWindows'],
+	});
+
+	const missing = evaluateTerminayHostCompatibility(requirements, {
+		bootstrapVersion: 1,
+		bundleFormatVersion: 1,
+		hostBridgeVersion: 1,
+		byteEndpointVersion: 1,
+		capabilities: {},
+	});
+	assert.deepEqual(missing, {
+		compatible: false,
+		component: 'host-capability',
+		code: 'missing-capability',
+		capability: 'clipboardWrite',
+		required: { minimum: 1, maximum: 1 },
+	});
+
+	assert.throws(
+		() =>
+			parseTerminayHostCompatibilityRequirements({
+				...requirements,
+				executionRuntime: { minimum: 1, maximum: 1 },
+			}),
+		/fields are invalid/u,
+	);
+});
+
+test('workspace drag actions and state are closed logical-view contracts', () => {
+	const context = parseTerminayHostContext({
+		schemaVersion: 1,
+		bootstrapVersion: 1,
+		sourceId: 'source-a',
+		windowId: 'window-a',
+		serverId: 'server-a',
+		profileId: 'profile-a',
+		bundleId: 'bundle_12345678',
+		applicationProtocolVersion: '1',
+		hostKind: 'desktop',
+		hostBridgeVersion: 1,
+		byteEndpointVersion: 1,
+		capabilities: { nativeWindows: 1 },
+	});
+	assert.deepEqual(
+		parseTerminayHostAction({
+			type: 'workspace.drag.start',
+			viewId: 'view-a',
+			projectId: 'project-a',
+			preview: { title: 'Project', emoji: '', color: '#123abc', width: 160 },
+		}),
+		{
+			type: 'workspace.drag.start',
+			viewId: 'view-a',
+			projectId: 'project-a',
+			preview: { title: 'Project', emoji: '', color: '#123abc', width: 160 },
+		},
+	);
+	assert.deepEqual(parseTerminayHostAction({ type: 'workspace.drag.end' }), {
+		type: 'workspace.drag.end',
+	});
+	const envelope = {
+		schemaVersion: 1,
+		bridgeVersion: 1,
+		sourceId: 'source-a',
+		windowId: 'window-a',
+		profileId: 'profile-a',
+		serverId: 'server-a',
+		event: { type: 'workspace.drag-state', active: true },
+	};
+	assert.deepEqual(
+		parseTerminayHostEvent(envelope, context).event,
+		envelope.event,
+	);
+	const fullScreenEvent = { type: 'window.fullscreen-state', fullScreen: true };
+	assert.deepEqual(
+		parseTerminayHostEvent({ ...envelope, event: fullScreenEvent }, context)
+			.event,
+		fullScreenEvent,
+	);
+	assert.throws(() =>
+		parseTerminayHostEvent(
+			{
+				...envelope,
+				event: { type: 'window.fullscreen-state', fullScreen: 'yes' },
+			},
+			context,
+		),
+	);
+	assert.throws(
+		() =>
+			parseTerminayHostAction({
+				type: 'workspace.drag.start',
+				viewId: 'view-a',
+				projectId: 'project-a',
+				targetWindowId: 42,
+				preview: { title: 'Project', emoji: '', color: '#123abc', width: 160 },
+			}),
+		/fields are invalid/u,
+	);
+	assert.throws(
+		() =>
+			parseTerminayHostAction({
+				type: 'workspace.drag.start',
+				viewId: 'view-a',
+				projectId: 'project-a',
+				preview: { title: 'Project', emoji: '', color: '#123abc', width: 79 },
+			}),
+		/preview is invalid/u,
+	);
+	assert.throws(
+		() =>
+			parseTerminayHostEvent(
+				{
+					...envelope,
+					event: { ...envelope.event, geometry: { x: 0, y: 0 } },
+				},
+				context,
+			),
+		/fields are invalid/u,
+	);
+	assert.throws(
+		() =>
+			parseTerminayHostAction({
+				type: 'workspace.drag.start',
+				viewId: 'view-a',
+				preview: { title: 'Project', emoji: '', color: '#123abc', width: 160 },
+			}),
+		/fields are invalid/u,
+	);
+	const dropTarget = {
+		type: 'workspace.drop-target',
+		phase: 'hover',
+		x: 240,
+		serverId: 'server-a',
+		projectId: 'project-a',
+		title: 'Project',
+		emoji: '',
+		color: '#123abc',
+	};
+	for (const phase of ['hover', 'leave', 'drop']) {
+		assert.deepEqual(
+			parseTerminayHostEvent(
+				{ ...envelope, event: { ...dropTarget, phase } },
+				context,
+			).event,
+			{ ...dropTarget, phase },
+		);
+	}
+	for (const invalid of [
+		{ phase: 'attach' },
+		{ x: 12.5 },
+		{ x: -1 },
+		{ color: 'red' },
+		{ projectId: '' },
+	]) {
+		assert.throws(() =>
+			parseTerminayHostEvent(
+				{ ...envelope, event: { ...dropTarget, ...invalid } },
+				context,
+			),
+		);
+	}
+	assert.throws(
+		() =>
+			parseTerminayHostEvent(
+				{ ...envelope, event: { ...dropTarget, targetViewId: 'view-b' } },
+				context,
+			),
+		/fields are invalid/u,
+	);
+});
+
+test('semantic host actions are closed and exact-binding/gesture checked', () => {
+	const context = parseTerminayHostContext({
+		schemaVersion: 1,
+		bootstrapVersion: 1,
+		sourceId: 'source-a',
+		windowId: 'window-a',
+		serverId: 'server-a',
+		profileId: 'profile-a',
+		bundleId: 'bundle_12345678',
+		applicationProtocolVersion: '1',
+		hostKind: 'desktop',
+		hostBridgeVersion: 1,
+		byteEndpointVersion: 1,
+		capabilities: { nativeWindows: 1, clipboardWrite: 1 },
+	});
+	const request = parseTerminayHostActionRequest(
+		{
+			schemaVersion: 1,
+			bridgeVersion: 1,
+			sourceId: 'source-a',
+			windowId: 'window-a',
+			profileId: 'profile-a',
+			serverId: 'server-a',
+			userGesture: true,
+			action: {
+				type: 'route.present',
+				route: '/settings?section=terminal',
+				disposition: 'native-window',
+			},
+		},
+		context,
+	);
+	assert.equal(request.action.type, 'route.present');
+	assert.throws(
+		() => parseTerminayHostAction({ type: 'clipboard.read' }),
+		/not allowed/u,
+	);
+	assert.throws(
+		() =>
+			parseTerminayHostAction({
+				type: 'route.present',
+				route: '/settings',
+				disposition: 'native-window',
+				browserWindow: {},
+			}),
+		/fields are invalid/u,
+	);
+	assert.throws(
+		() =>
+			parseTerminayHostActionRequest(
+				{ ...request, userGesture: false },
+				context,
+			),
+		/user gesture/u,
+	);
+	assert.throws(
+		() =>
+			parseTerminayHostActionRequest(
+				{ ...request, serverId: 'server-b' },
+				context,
+			),
+		/outside its binding/u,
+	);
+	assert.throws(
+		() =>
+			authorizeTerminayHostActionRequest(
+				{ ...request, action: { type: 'clipboard.write', text: 'hello' } },
+				{ ...context, capabilities: {} },
+			),
+		/capability is unavailable/u,
+	);
+	assert.equal(
+		authorizeTerminayHostActionRequest(
+			{ ...request, action: { type: 'clipboard.write', text: 'hello' } },
+			context,
+		).action.type,
+		'clipboard.write',
+	);
+});
+
+test('external URL actions accept credential-free HTTP and HTTPS only', () => {
+	assert.deepEqual(
+		parseTerminayHostAction({
+			type: 'os.open-external',
+			url: 'http://127.0.0.1:8080/status',
+		}),
+		{ type: 'os.open-external', url: 'http://127.0.0.1:8080/status' },
+	);
+	assert.deepEqual(
+		parseTerminayHostAction({
+			type: 'os.open-external',
+			url: 'https://example.com/docs',
+		}),
+		{ type: 'os.open-external', url: 'https://example.com/docs' },
+	);
+	assert.deepEqual(
+		parseTerminayHostAction({
+			type: 'os.open-external',
+			url: 'HTTP://EXAMPLE.COM/docs',
+		}),
+		{ type: 'os.open-external', url: 'http://example.com/docs' },
+	);
+	for (const url of [
+		'javascript:alert(1)',
+		'file:///etc/passwd',
+		'ftp://example.com/file',
+		'mailto:user@example.com',
+		'http://user:pass@example.com/',
+		'https://user@example.com/',
+	]) {
+		assert.throws(
+			() => parseTerminayHostAction({ type: 'os.open-external', url }),
+			/external URL is invalid/u,
+		);
+	}
+});
+
+test('preview downloads are bounded opaque host payloads', () => {
+	assert.deepEqual(
+		parseTerminayHostAction({
+			type: 'preview.download',
+			filename: 'diagram.png',
+			mimeType: 'image/png',
+			bytesBase64: 'AAE=',
+		}),
+		{
+			type: 'preview.download',
+			filename: 'diagram.png',
+			mimeType: 'image/png',
+			bytesBase64: 'AAE=',
+		},
+	);
+	for (const action of [
+		{
+			type: 'preview.download',
+			filename: 'x',
+			mimeType: 'text/plain; charset=utf-8',
+			bytesBase64: 'AA==',
+		},
+		{
+			type: 'preview.download',
+			filename: 'x',
+			mimeType: 'text/plain',
+			bytesBase64: '',
+		},
+		{
+			type: 'preview.download',
+			filename: 'x',
+			mimeType: 'text/plain',
+			bytesBase64: 'not base64!',
+		},
+	])
+		assert.throws(
+			() => parseTerminayHostAction(action),
+			/preview (MIME type|download payload) is invalid/u,
+		);
+});
+
+test('native menu accelerator updates are bounded and immutable', () => {
+	const action = parseTerminayHostAction({
+		type: 'menu.accelerators.update',
+		accelerators: [
+			{ command: 'new-terminal', accelerator: 'CmdOrCtrl+Y' },
+			{ command: 'open-settings', accelerator: '' },
+		],
+	});
+	assert.deepEqual(action, {
+		type: 'menu.accelerators.update',
+		accelerators: [
+			{ command: 'new-terminal', accelerator: 'CmdOrCtrl+Y' },
+			{ command: 'open-settings', accelerator: '' },
+		],
+	});
+	assert.equal(Object.isFrozen(action.accelerators), true);
+	assert.throws(
+		() =>
+			parseTerminayHostAction({
+				type: 'menu.accelerators.update',
+				accelerators: [
+					{ command: 'new-terminal', accelerator: 'CmdOrCtrl+Y' },
+					{ command: 'new-terminal', accelerator: 'CmdOrCtrl+T' },
+				],
+			}),
+		/unique/u,
+	);
+});
+
+test('application badge counts are bounded non-negative integers', () => {
+	for (const count of [0, 3, 9_999])
+		assert.deepEqual(
+			parseTerminayHostAction({ type: 'badge.count.set', count }),
+			{ type: 'badge.count.set', count },
+		);
+	for (const count of [-1, 1.5, 10_000, '3', null, Number.NaN, Infinity])
+		assert.throws(
+			() => parseTerminayHostAction({ type: 'badge.count.set', count }),
+			/badge count is invalid/u,
+		);
+	assert.throws(() => parseTerminayHostAction({ type: 'badge.count.set' }));
+	assert.throws(() =>
+		parseTerminayHostAction({
+			type: 'badge.count.set',
+			count: 1,
+			title: 'build finished',
+		}),
+	);
+	assert.equal(
+		requiredTerminayHostCapability({ type: 'badge.count.set', count: 1 }),
+		'notifications',
+	);
+});
+
+test('performance logging is a closed Desktop host action and bound event', () => {
+	assert.deepEqual(
+		parseTerminayHostAction({
+			type: 'diagnostics.performance-logging.set',
+			enabled: true,
+		}),
+		{ type: 'diagnostics.performance-logging.set', enabled: true },
+	);
+	assert.throws(
+		() =>
+			parseTerminayHostAction({
+				type: 'diagnostics.performance-logging.set',
+				enabled: 'true',
+			}),
+		/performance logging/u,
+	);
+	const context = parseTerminayHostContext({
+		schemaVersion: 1,
+		bootstrapVersion: 1,
+		sourceId: 'source-a',
+		windowId: 'window-a',
+		serverId: 'server-a',
+		profileId: 'profile-a',
+		bundleId: 'bundle_12345678',
+		applicationProtocolVersion: '1',
+		hostKind: 'desktop',
+		hostBridgeVersion: 1,
+		byteEndpointVersion: 1,
+		capabilities: { nativeMenus: 1 },
+	});
+	assert.deepEqual(
+		parseTerminayHostEvent(
+			{
+				schemaVersion: 1,
+				bridgeVersion: 1,
+				sourceId: 'source-a',
+				windowId: 'window-a',
+				serverId: 'server-a',
+				profileId: 'profile-a',
+				event: {
+					type: 'diagnostics.performance-logging.changed',
+					enabled: false,
+				},
+			},
+			context,
+		).event,
+		{ type: 'diagnostics.performance-logging.changed', enabled: false },
+	);
+	assert.deepEqual(
+		parseTerminayHostEvent(
+			{
+				schemaVersion: 1,
+				bridgeVersion: 1,
+				sourceId: 'source-a',
+				windowId: 'window-a',
+				serverId: 'server-a',
+				profileId: 'profile-a',
+				event: { type: 'updater.status.changed' },
+			},
+			context,
+		).event,
+		{ type: 'updater.status.changed' },
+	);
+	assert.equal(
+		requiredTerminayHostCapability({
+			type: 'diagnostics.performance-logging.set',
+			enabled: false,
+		}),
+		'nativeMenus',
+	);
+});
+
+test('the performance snapshot is a closed Desktop host action and bound event', () => {
+	assert.deepEqual(
+		parseTerminayHostAction({ type: 'diagnostics.performance-snapshot.read' }),
+		{ type: 'diagnostics.performance-snapshot.read' },
+	);
+	// The read carries no parameters: a window cannot ask for anything else.
+	assert.throws(
+		() =>
+			parseTerminayHostAction({
+				type: 'diagnostics.performance-snapshot.read',
+				path: '/var/log/terminay',
+			}),
+		/performance snapshot action/u,
+	);
+	assert.throws(
+		() =>
+			parseTerminayHostAction({
+				type: 'diagnostics.performance-snapshot.read',
+				sessionId: 'session-a',
+			}),
+		/performance snapshot action/u,
+	);
+	const context = parseTerminayHostContext({
+		schemaVersion: 1,
+		bootstrapVersion: 1,
+		sourceId: 'source-a',
+		windowId: 'window-a',
+		serverId: 'server-a',
+		profileId: 'profile-a',
+		bundleId: 'bundle_12345678',
+		applicationProtocolVersion: '1',
+		hostKind: 'desktop',
+		hostBridgeVersion: 1,
+		byteEndpointVersion: 1,
+		capabilities: { nativeMenus: 1 },
+	});
+	const snapshot = { timeline: { phases: [] }, samples: [], terminals: {} };
+	assert.deepEqual(
+		parseTerminayHostEvent(
+			{
+				schemaVersion: 1,
+				bridgeVersion: 1,
+				sourceId: 'source-a',
+				windowId: 'window-a',
+				serverId: 'server-a',
+				profileId: 'profile-a',
+				event: { type: 'diagnostics.performance-snapshot.changed', snapshot },
+			},
+			context,
+		).event,
+		{ type: 'diagnostics.performance-snapshot.changed', snapshot },
+	);
+	assert.throws(
+		() =>
+			parseTerminayHostEvent(
+				{
+					schemaVersion: 1,
+					bridgeVersion: 1,
+					sourceId: 'source-a',
+					windowId: 'window-a',
+					serverId: 'server-a',
+					profileId: 'profile-a',
+					event: {
+						type: 'diagnostics.performance-snapshot.changed',
+						snapshot,
+						directory: '/var/log/terminay',
+					},
+				},
+				context,
+			),
+		/host performance snapshot event/u,
+	);
+	assert.equal(
+		requiredTerminayHostCapability({
+			type: 'diagnostics.performance-snapshot.read',
+		}),
+		'nativeMenus',
+	);
+});
+
+test('updater install is a closed, capability-gated host action', () => {
+	assert.deepEqual(parseTerminayHostAction({ type: 'updater.install' }), {
+		type: 'updater.install',
+	});
+	assert.throws(
+		() =>
+			parseTerminayHostAction({
+				type: 'updater.install',
+				url: 'https://example.com/evil.zip',
+			}),
+		/updater action/u,
+	);
+	assert.equal(
+		requiredTerminayHostCapability({ type: 'updater.install' }),
+		'updater',
+	);
+});
+
+test('device settings use a closed host action and bound event snapshot', () => {
+	const settings = { keyboardShortcuts: { 'new-terminal': 'CmdOrCtrl+Y' } };
+	assert.deepEqual(
+		parseTerminayHostAction({
+			type: 'device.settings.update',
+			settings,
+		}),
+		{ type: 'device.settings.update', settings },
+	);
+	assert.throws(
+		() =>
+			parseTerminayHostAction({ type: 'device.settings.update', settings: [] }),
+		/device settings/u,
+	);
+	const context = parseTerminayHostContext({
+		schemaVersion: 1,
+		bootstrapVersion: 1,
+		sourceId: 'source-a',
+		windowId: 'window-a',
+		serverId: 'server-a',
+		profileId: 'profile-a',
+		bundleId: 'bundle_12345678',
+		applicationProtocolVersion: '1',
+		hostKind: 'desktop',
+		hostBridgeVersion: 1,
+		byteEndpointVersion: 1,
+		capabilities: { nativeMenus: 1 },
+	});
+	assert.deepEqual(
+		parseTerminayHostEvent(
+			{
+				schemaVersion: 1,
+				bridgeVersion: 1,
+				sourceId: 'source-a',
+				windowId: 'window-a',
+				serverId: 'server-a',
+				profileId: 'profile-a',
+				event: { type: 'device.settings.changed', settings },
+			},
+			context,
+		).event,
+		{ type: 'device.settings.changed', settings },
+	);
+});
+
+test('pairing progress events accept only the closed lifecycle states', () => {
+	const context = parseTerminayHostContext({
+		schemaVersion: 1,
+		bootstrapVersion: 1,
+		sourceId: 'source-a',
+		windowId: 'window-a',
+		serverId: 'server-a',
+		profileId: 'profile-a',
+		bundleId: 'bundle_12345678',
+		applicationProtocolVersion: '1',
+		hostKind: 'desktop',
+		hostBridgeVersion: 1,
+		byteEndpointVersion: 1,
+		capabilities: { nativeMenus: 1 },
+	});
+	const envelope = {
+		schemaVersion: 1,
+		bridgeVersion: 1,
+		sourceId: 'source-a',
+		windowId: 'window-a',
+		serverId: 'server-a',
+		profileId: 'profile-a',
+	};
+	const attemptId = 'pair-abc-1';
+	for (const state of [
+		'connecting',
+		'connected',
+		'connection-degraded',
+		'connection-recovered',
+		'connection-lost',
+	]) {
+		assert.deepEqual(
+			parseTerminayHostEvent(
+				{
+					...envelope,
+					event: { type: 'connection.pairing-progress', attemptId, state },
+				},
+				context,
+			).event,
+			{ type: 'connection.pairing-progress', attemptId, state },
+		);
+	}
+	for (const state of [['connected'], 7, null]) {
+		assert.throws(
+			() =>
+				parseTerminayHostEvent(
+					{
+						...envelope,
+						event: {
+							type: 'connection.pairing-progress',
+							attemptId,
+							state,
+						},
+					},
+					context,
+				),
+			/host pairing progress event is invalid/u,
+		);
+	}
+	assert.deepEqual(
+		parseTerminayHostAction({
+			type: 'connection.pair',
+			pairingUrl: 'https://box.example/v1/#secret',
+			attemptId,
+		}),
+		{
+			type: 'connection.pair',
+			pairingUrl: 'https://box.example/v1/#secret',
+			attemptId,
+		},
+	);
+	assert.throws(
+		() =>
+			parseTerminayHostAction({
+				type: 'connection.pair',
+				pairingUrl: 'https://box.example/v1/#secret',
+				attemptId: 'invalid id',
+			}),
+		/pairing attempt id/u,
+	);
+	assert.deepEqual(
+		parseTerminayHostAction({ type: 'connection.pair-cancel', attemptId }),
+		{ type: 'connection.pair-cancel', attemptId },
+	);
+	assert.throws(
+		() =>
+			parseTerminayHostAction({
+				type: 'connection.pair-cancel',
+				attemptId,
+				pairingUrl: 'https://box.example/v1/#secret',
+			}),
+		/connection pairing cancellation/u,
+	);
+	assert.throws(
+		() =>
+			parseTerminayHostAction({
+				type: 'connection.pair-cancel',
+				attemptId: 'invalid id',
+			}),
+		/pairing attempt id/u,
+	);
+	assert.deepEqual(
+		parseTerminayHostEvent(
+			{
+				...envelope,
+				event: {
+					type: 'connection.pairing-approval',
+					attemptId,
+					deviceName: 'Terminay Desktop',
+					matchCode: 'K7Q2M',
+					expiresAt: '2026-10-02T07:30:00.000Z',
+				},
+			},
+			context,
+		).event,
+		{
+			type: 'connection.pairing-approval',
+			attemptId,
+			deviceName: 'Terminay Desktop',
+			matchCode: 'K7Q2M',
+			expiresAt: '2026-10-02T07:30:00.000Z',
+		},
+	);
+});
+
+test('host compatibility rejects ambiguous and unknown capability requirements', () => {
+	assert.throws(
+		() =>
+			parseTerminayHostCompatibilityRequirements({
+				...requirements,
+				optionalCapabilities: { clipboardWrite: { minimum: 1, maximum: 1 } },
+			}),
+		/both required and optional/u,
+	);
+	assert.throws(
+		() =>
+			parseTerminayHostCompatibilityRequirements({
+				...requirements,
+				requiredCapabilities: { arbitraryIpc: { minimum: 1, maximum: 1 } },
+			}),
+		/unknown capability/u,
+	);
+});
+
+test('opaque host byte packets bind immutable bytes to one exact server', () => {
+	const source = new Uint8Array([1, 2, 3]);
+	const packet = createTerminayHostBytePacket('server-a', source);
+	source[0] = 9;
+	assert.deepEqual([...packet.frame], [1, 2, 3]);
+	const parsed = parseTerminayHostBytePacket(packet, 'server-a');
+	packet.frame[1] = 8;
+	assert.deepEqual([...parsed.frame], [1, 2, 3]);
+	assert.throws(
+		() => parseTerminayHostBytePacket(packet, 'server-b'),
+		/another server/u,
+	);
+	assert.throws(
+		() =>
+			parseTerminayHostBytePacket(
+				{ ...packet, operation: 'workspace.create' },
+				'server-a',
+			),
+		/fields are invalid/u,
+	);
+});
+
+test('opaque byte packets preserve unknown future application operations unchanged', () => {
+	const futureFrame = new TextEncoder().encode(
+		JSON.stringify({
+			operation: 'future.workspace.teleport',
+			payload: { revision: 9001, destination: 'unknown-to-this-host' },
+		}),
+	);
+	const packet = parseTerminayHostBytePacket(
+		createTerminayHostBytePacket('server-a', futureFrame),
+		'server-a',
+	);
+	assert.deepEqual(packet.frame, futureFrame);
+});
+
+test('one bundle serves many servers: host bootstrap identity no longer binds the bundle', () => {
+	const manifest = {
+		schemaVersion: 1,
+		bundleId: 'bundle_12345678',
+		entryPath: '/remote-app/bundle_12345678/index.html',
+		protocolVersion: '1',
+		serverVersion: '3.0.0',
+		contentSecurityPolicy: "default-src 'self'",
+		bundleFormatVersion: 1,
+		hostCompatibility: requirements,
+		assets: [
+			{
+				path: '/remote-app/bundle_12345678/index.html',
+				size: 1,
+				hash: 'x',
+				contentType: 'text/html',
+			},
+		],
+	};
+	// Another server's bundle id and another application-protocol version. The
+	// bundle is judged against its host only; server compatibility belongs to
+	// the bundle client's hello, once per connection.
+	const bootstrap = {
+		schemaVersion: 1,
+		bootstrapVersion: 1,
+		sourceId: 'source-a',
+		windowId: 'window-a',
+		serverId: 'server-b',
+		profileId: 'profile-b',
+		bundleId: 'bundle_87654321',
+		applicationProtocolVersion: '2',
+		hostKind: 'desktop',
+		hostBridgeVersion: 1,
+		byteEndpointVersion: 1,
+		capabilities: { clipboardWrite: 1 },
+	};
+	assert.deepEqual(
+		evaluateTerminayBundleCompatibility(manifest, bootstrap, {
+			bootstrapVersion: 1,
+			bundleFormatVersion: 1,
+			hostBridgeVersion: 1,
+			byteEndpointVersion: 1,
+			capabilities: { clipboardWrite: 1 },
+		}),
+		{ compatible: true, unavailableOptionalCapabilities: ['nativeWindows'] },
+	);
+});
+
+test('an unparseable host bootstrap is still refused', () => {
+	const manifest = {
+		schemaVersion: 1,
+		bundleId: 'bundle_12345678',
+		entryPath: '/remote-app/bundle_12345678/index.html',
+		protocolVersion: '1',
+		serverVersion: '3.0.0',
+		contentSecurityPolicy: "default-src 'self'",
+		bundleFormatVersion: 1,
+		hostCompatibility: requirements,
+		assets: [
+			{
+				path: '/remote-app/bundle_12345678/index.html',
+				size: 1,
+				hash: 'x',
+				contentType: 'text/html',
+			},
+		],
+	};
+	const result = evaluateTerminayBundleCompatibility(
+		manifest,
+		{ schemaVersion: 2 },
+		{
+			bootstrapVersion: 1,
+			bundleFormatVersion: 1,
+			hostBridgeVersion: 1,
+			byteEndpointVersion: 1,
+			capabilities: { clipboardWrite: 1 },
+		},
+	);
+	assert.equal(result.compatible, false);
+	assert.equal(result.component, 'bundle-binding');
+});
+
+test('browser-safe bundle compatibility accepts the canonical manifest wire shape', () => {
+	const manifest = {
+		schemaVersion: 1,
+		bundleId: 'bundle_12345678',
+		entryPath: '/remote-app/bundle_12345678/index.html',
+		protocolVersion: '1',
+		serverVersion: '3.0.0',
+		contentSecurityPolicy: "default-src 'self'",
+		bundleFormatVersion: 1,
+		hostCompatibility: requirements,
+		assets: [
+			{
+				path: '/remote-app/bundle_12345678/index.html',
+				size: 1,
+				hash: 'x',
+				contentType: 'text/html',
+			},
+		],
+	};
+	const bootstrap = {
+		schemaVersion: 1,
+		bootstrapVersion: 1,
+		sourceId: 'source-a',
+		windowId: 'window-a',
+		serverId: 'server-a',
+		profileId: 'profile-a',
+		bundleId: manifest.bundleId,
+		applicationProtocolVersion: '1',
+		hostKind: 'browser',
+		hostBridgeVersion: 1,
+		byteEndpointVersion: 1,
+		capabilities: { clipboardWrite: 1 },
+	};
+	assert.deepEqual(
+		evaluateTerminayBundleCompatibility(manifest, bootstrap, {
+			bootstrapVersion: 1,
+			bundleFormatVersion: 1,
+			hostBridgeVersion: 1,
+			byteEndpointVersion: 1,
+			capabilities: { clipboardWrite: 1 },
+		}),
+		{ compatible: true, unavailableOptionalCapabilities: ['nativeWindows'] },
+	);
+});
+
+test('rename and forget of a remembered connection are closed host actions', () => {
+	assert.deepEqual(
+		parseTerminayHostAction({
+			type: 'connections.rename',
+			profileId: 'remote:abc',
+			label: '  Build box  ',
+		}),
+		{ type: 'connections.rename', profileId: 'remote:abc', label: 'Build box' },
+	);
+	assert.deepEqual(
+		parseTerminayHostAction({
+			type: 'connections.forget',
+			profileId: 'remote:abc',
+		}),
+		{ type: 'connections.forget', profileId: 'remote:abc' },
+	);
+	for (const action of [
+		{ type: 'connections.rename', profileId: 'remote:abc', label: '   ' },
+		{ type: 'connections.rename', profileId: 'remote:abc', label: 'a\nb' },
+		{ type: 'connections.rename', profileId: 'remote:abc', label: 'x'.repeat(257) },
+		{ type: 'connections.rename', profileId: 'remote:abc' },
+		{ type: 'connections.rename', profileId: '../x', label: 'ok' },
+		{ type: 'connections.rename', profileId: 'remote:abc', label: 'ok', origin: 'https://x' },
+		{ type: 'connections.forget', profileId: '' },
+		{ type: 'connections.forget', profileId: 'remote:abc', revoke: true },
+	])
+		assert.throws(() => parseTerminayHostAction(action), TypeError);
+});
+
+test('switching a window to a server and opening one in a new window are closed host actions', () => {
+	for (const type of ['connections.select', 'connections.open-window']) {
+		assert.deepEqual(parseTerminayHostAction({ type, profileId: 'remote:abc' }), {
+			type,
+			profileId: 'remote:abc',
+		});
+		for (const action of [
+			{ type },
+			{ type, profileId: '' },
+			{ type, profileId: '../x' },
+			{ type, profileId: 'remote:abc', origin: 'https://x' },
+			{ type, profileId: 'remote:abc', credential: 'secret' },
+		])
+			assert.throws(() => parseTerminayHostAction(action), TypeError);
+		assert.equal(
+			requiredTerminayHostCapability({ type, profileId: 'remote:abc' }),
+			'connections',
+		);
+	}
+});

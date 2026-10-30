@@ -1,0 +1,522 @@
+export type ServerWorkspacePanel = Readonly<{
+	id: string;
+	projectId: string;
+	/** The folder of the panel's project that holds it. */
+	folderId: string;
+	type: 'terminal' | 'file' | 'folder';
+	/** The title workspace state holds. For a terminal that is its named
+	 * title, else its default name; what its tab displays may instead be a
+	 * title its program set, which the server publishes live beside the
+	 * workspace (see `TerminalTitleStore`). */
+	title?: string;
+	defaultTitle?: string;
+	namedTitle?: string;
+	emoji?: string;
+	color?: string;
+	inheritsProjectColor?: boolean;
+	activityIndicatorsEnabled?: boolean;
+	sessionId?: string;
+	cwd?: string;
+	path?: string;
+	/** A terminal's server-owned note. Absent means the terminal has none. */
+	note?: string;
+}>;
+
+/** A group of a project's panels with its own layout. `general` is the one
+ * every project has; `linked` stands for one Git worktree; `plain` is a group
+ * the user made. A folder carries no authority. */
+export type ServerWorkspaceFolder = Readonly<{
+	id: string;
+	projectId: string;
+	name: string;
+	kind: 'general' | 'plain' | 'linked';
+	/** Present exactly when the kind is `linked`. Written only by the server. */
+	worktree?: Readonly<{ repositoryId: string; path: string }>;
+	panelIds: readonly string[];
+	activePanelId?: string;
+	/** The panel whose terminal created this folder's worktree. */
+	createdByPanelId?: string;
+	/** An unanswered offer to move a panel into this folder. */
+	captureOffer?: Readonly<{ panelId: string }>;
+}>;
+
+export type ServerWorkspaceProject = Readonly<{
+	id: string;
+	/** Absent for an ordinary project. Any kind (today only `automations`, the
+	 * automation terminal space of ADR-0030) is a reserved, server-owned
+	 * project that is never presented, ordered, or selected as a project. */
+	kind?: string;
+	serverId: string;
+	name: string;
+	/** Empty when `rootOrigin` is `none`: the project has no root folder. */
+	root: string;
+	rootOrigin: 'explicit' | 'server-default' | 'legacy-unverified' | 'none';
+	/** Present while the project awaits its start choice. Only a connection
+	 * that negotiated `project-start-choice.v1` is ever sent it. */
+	start?: 'awaiting-choice';
+	color?: string;
+	icon?: string;
+	viewId: string;
+	/** The project's folders in order. Exactly one of them is General. */
+	folderIds: readonly string[];
+	/** Every panel of the project, in folder order. */
+	panelIds: readonly string[];
+	activePanelId?: string;
+	defaultShellProfileId?: string;
+	sidebar: ServerWorkspaceSidebarState;
+}>;
+
+export type ServerWorkspaceSidebarState = Readonly<{
+	isFileExplorerOpen: boolean;
+	isExplorerPaneCollapsed: boolean;
+	isAgentsPaneCollapsed: boolean;
+	isGitPaneCollapsed: boolean;
+	isDocumentationPaneCollapsed: boolean;
+	expandedAgentEntryIds: readonly string[];
+	expandedDocumentationFolderIds: readonly string[];
+	sidebarAgentsHeight: number;
+	sidebarExplorerHeight: number;
+	sidebarGitHeight: number;
+	sidebarDocumentationHeight: number;
+	sidebarPanelOrder: readonly ('explorer' | 'agents' | 'git' | 'documentation')[];
+}>;
+
+export type ServerWorkspaceView = Readonly<{
+	id: string;
+	name: string;
+	serverId: string;
+	projectIds: readonly string[];
+	activeProjectId?: string;
+}>;
+
+export type ServerWorkspaceSnapshot = Readonly<{
+	schemaVersion: number;
+	cursor: string;
+	revision: number;
+	serverId: string;
+	viewOrder: readonly string[];
+	views: Readonly<Record<string, ServerWorkspaceView>>;
+	projects: Readonly<Record<string, ServerWorkspaceProject>>;
+	folders: Readonly<Record<string, ServerWorkspaceFolder>>;
+	panels: Readonly<Record<string, ServerWorkspacePanel>>;
+	terminalSessions: Readonly<
+		Record<
+			string,
+			Readonly<{
+				id: string;
+				serverId: string;
+				projectId: string;
+				status: 'running' | 'exited' | 'interrupted';
+			}>
+		>
+	>;
+	/** The server's recent project folders, most recent first. A
+	 * project-scoped snapshot carries none. */
+	recentProjectFolders?: readonly Readonly<{ path: string; usedAt: number }>[];
+}>;
+
+export type ServerWorkspaceSelection = Readonly<{
+	viewId: string | null;
+	projectId: string | null;
+	panelId: string | null;
+}>;
+
+export type ServerWorkspaceDelta = Readonly<{
+	state: ServerWorkspaceSnapshot;
+	events: WorkspaceDeltaDto['events'];
+}>;
+
+/** Whether a projected project is a reserved server-owned space rather than a
+ * user project. Every project list, ordering, switcher, tab bar, and
+ * inventory excludes these; Tabs lists their terminals apart, after the
+ * window's projects (ADR-0071). */
+export function isReservedWorkspaceProject(
+	project: Pick<ServerWorkspaceProject, 'kind'> | undefined,
+): boolean {
+	return project?.kind !== undefined;
+}
+
+/** The user projects a view presents, in its order, without reserved kinds. */
+export function presentableViewProjects(
+	snapshot: Pick<ServerWorkspaceSnapshot, 'projects'>,
+	view: Pick<ServerWorkspaceView, 'projectIds'> | undefined,
+): readonly ServerWorkspaceProject[] {
+	if (view === undefined) return [];
+	return view.projectIds
+		.map((projectId) => snapshot.projects[projectId])
+		.filter(
+			(project): project is ServerWorkspaceProject =>
+				project !== undefined && !isReservedWorkspaceProject(project),
+		);
+}
+
+/**
+ * The projects a presentation holds. A Desktop window presents one view. A
+ * browser has one window, so it holds the projects of every view of its
+ * server, in view order.
+ */
+export function presentedProjects(
+	snapshot: Pick<ServerWorkspaceSnapshot, 'projects' | 'views' | 'viewOrder'>,
+	viewId: string | null | undefined,
+	presentsEveryView: boolean,
+): readonly ServerWorkspaceProject[] {
+	if (!presentsEveryView)
+		return presentableViewProjects(
+			snapshot,
+			viewId == null ? undefined : snapshot.views[viewId],
+		);
+	return snapshot.viewOrder.flatMap((id) =>
+		presentableViewProjects(snapshot, snapshot.views[id]),
+	);
+}
+
+/**
+ * Where a project dropped at a new place in a presentation's strip now sits
+ * in its own view, or null when its view's order is unchanged. A project is
+ * reordered within the view that holds it, so a strip holding several views
+ * never moves one between them.
+ */
+export function projectReorderInOwnView(
+	snapshot: Pick<ServerWorkspaceSnapshot, 'projects' | 'views'>,
+	presentedProjectIds: readonly string[],
+	projectId: string,
+): Readonly<{ targetViewId: string; index: number }> | null {
+	const targetViewId = snapshot.projects[projectId]?.viewId;
+	const current =
+		targetViewId === undefined
+			? undefined
+			: snapshot.views[targetViewId]?.projectIds;
+	if (targetViewId === undefined || current === undefined) return null;
+	const next = presentedProjectIds.filter((id) => current.includes(id));
+	const index = next.indexOf(projectId);
+	if (
+		index < 0 ||
+		(current.length === next.length &&
+			current.every((id, position) => id === next[position]))
+	)
+		return null;
+	return { targetViewId, index };
+}
+
+/**
+ * Keep presentation selection constrained to the latest authenticated server
+ * snapshot. A still-valid local project or panel is preserved when another
+ * client changes snapshot active ids. A closed/moved panel therefore cannot
+ * leave a browser pointing at an invented terminal identity.
+ */
+export function reconcileServerWorkspaceSelection(
+	snapshot: ServerWorkspaceSnapshot,
+	previous: ServerWorkspaceSelection,
+): ServerWorkspaceSelection {
+	const view =
+		snapshot.views[previous.viewId ?? ''] ??
+		snapshot.views[snapshot.viewOrder[0] ?? ''];
+	if (view === undefined)
+		return { viewId: null, projectId: null, panelId: null };
+	const presentable = presentableViewProjects(snapshot, view);
+	const project =
+		presentable.find((candidate) => candidate.id === previous.projectId) ??
+		presentable.find((candidate) => candidate.id === view.activeProjectId) ??
+		presentable[0];
+	if (project === undefined)
+		return { viewId: view.id, projectId: null, panelId: null };
+	const panel =
+		project.panelIds
+			.map((id) => snapshot.panels[id])
+			.find((candidate) => candidate?.id === previous.panelId) ??
+		snapshot.panels[project.activePanelId ?? ''] ??
+		project.panelIds
+			.map((id) => snapshot.panels[id])
+			.find((candidate) => candidate !== undefined);
+	return { viewId: view.id, projectId: project.id, panelId: panel?.id ?? null };
+}
+
+/** The one workspace snapshot shape this bundle reads. */
+export const WORKSPACE_SCHEMA_VERSION = 7;
+
+/**
+ * The server answered in a workspace shape from another release. The hello
+ * does not carry the snapshot's schema, so this is where a version mismatch
+ * first shows; asking again gets the same answer until one side is updated.
+ */
+export class WorkspaceSchemaIncompatibleError extends Error {
+	readonly code = 'workspace_schema_incompatible';
+	readonly upgrade: 'server' | 'client';
+
+	constructor(serverSchemaVersion: number) {
+		const upgrade =
+			serverSchemaVersion < WORKSPACE_SCHEMA_VERSION ? 'server' : 'client';
+		super(
+			upgrade === 'server'
+				? `This server keeps its workspace in an older format (${serverSchemaVersion}); this Terminay needs ${WORKSPACE_SCHEMA_VERSION}. Update the server.`
+				: `This server keeps its workspace in a newer format (${serverSchemaVersion}); this Terminay reads ${WORKSPACE_SCHEMA_VERSION}. Update Terminay.`,
+		);
+		this.name = 'WorkspaceSchemaIncompatibleError';
+		this.upgrade = upgrade;
+	}
+}
+
+export function parseServerWorkspaceSnapshot(
+	value: unknown,
+	expectedServerId: string,
+	previous?: ServerWorkspaceSnapshot | null,
+): ServerWorkspaceSnapshot {
+	if (!isRecord(value))
+		throw new Error('The server returned an incompatible workspace snapshot.');
+	if (
+		typeof value.schemaVersion === 'number' &&
+		value.schemaVersion !== WORKSPACE_SCHEMA_VERSION
+	)
+		throw new WorkspaceSchemaIncompatibleError(value.schemaVersion);
+	const {
+		schemaVersion,
+		serverId,
+		revision,
+		cursor,
+		viewOrder,
+		views,
+		projects,
+		folders,
+		panels,
+		terminalSessions,
+	} = value;
+	if (
+		schemaVersion !== WORKSPACE_SCHEMA_VERSION ||
+		serverId !== expectedServerId ||
+		typeof revision !== 'number' ||
+		!Number.isSafeInteger(revision) ||
+		revision < 0 ||
+		typeof cursor !== 'string' ||
+		cursor !== String(revision) ||
+		!isStringArray(viewOrder) ||
+		!isRecord(views) ||
+		!isRecord(projects) ||
+		!isRecord(folders) ||
+		!isRecord(panels) ||
+		!isRecord(terminalSessions)
+	)
+		throw new Error('The server returned an incompatible workspace snapshot.');
+	const snapshot = value as unknown as ServerWorkspaceSnapshot;
+	if (
+		previous !== undefined &&
+		previous !== null &&
+		(snapshot.revision < previous.revision ||
+			(snapshot.revision === previous.revision &&
+				snapshot.cursor !== previous.cursor))
+	)
+		throw new Error('The server returned a stale workspace snapshot.');
+	if (
+		new Set(snapshot.viewOrder).size !== snapshot.viewOrder.length ||
+		snapshot.viewOrder.some((id) => snapshot.views[id]?.id !== id)
+	)
+		throw new Error('The server returned invalid workspace view references.');
+	for (const [id, view] of Object.entries(snapshot.views)) {
+		if (
+			view.id !== id ||
+			view.serverId !== expectedServerId ||
+			!isStringArray(view.projectIds) ||
+			new Set(view.projectIds).size !== view.projectIds.length ||
+			view.projectIds.some(
+				(projectId) =>
+					snapshot.projects[projectId]?.id !== projectId ||
+					snapshot.projects[projectId]?.viewId !== id,
+			)
+		)
+			throw new Error(
+				'The server returned invalid workspace project references.',
+			);
+		if (
+			view.activeProjectId !== undefined &&
+			!view.projectIds.includes(view.activeProjectId)
+		)
+			throw new Error('The server returned an invalid active project.');
+	}
+	for (const [id, project] of Object.entries(snapshot.projects)) {
+		if (
+			project.id !== id ||
+			project.serverId !== expectedServerId ||
+			typeof project.name !== 'string' ||
+			typeof project.root !== 'string' ||
+			![
+				'explicit',
+				'server-default',
+				'legacy-unverified',
+				'none',
+			].includes(project.rootOrigin) ||
+			(project.start !== undefined && project.start !== 'awaiting-choice') ||
+			(project.color !== undefined && typeof project.color !== 'string') ||
+			(project.icon !== undefined && typeof project.icon !== 'string') ||
+			(project.defaultShellProfileId !== undefined &&
+				typeof project.defaultShellProfileId !== 'string') ||
+			!isWorkspaceSidebarState(project.sidebar) ||
+			(project.kind !== undefined && typeof project.kind !== 'string') ||
+			snapshot.views[project.viewId] === undefined ||
+			// A reserved project is homed in a view but never listed in it.
+			snapshot.views[project.viewId]?.projectIds.includes(project.id) !==
+				!isReservedWorkspaceProject(project) ||
+			!isStringArray(project.panelIds) ||
+			new Set(project.panelIds).size !== project.panelIds.length ||
+			project.panelIds.some(
+				(panelId) =>
+					snapshot.panels[panelId]?.id !== panelId ||
+					snapshot.panels[panelId]?.projectId !== project.id,
+			)
+		)
+			throw new Error(
+				'The server returned invalid workspace panel references.',
+			);
+		if (
+			project.activePanelId !== undefined &&
+			!project.panelIds.includes(project.activePanelId)
+		)
+			throw new Error('The server returned an invalid active panel.');
+		if (
+			!isStringArray(project.folderIds) ||
+			new Set(project.folderIds).size !== project.folderIds.length ||
+			project.folderIds.filter(
+				(folderId) => snapshot.folders[folderId]?.kind === 'general',
+			).length !== 1 ||
+			project.folderIds.some(
+				(folderId) =>
+					snapshot.folders[folderId]?.id !== folderId ||
+					snapshot.folders[folderId]?.projectId !== project.id,
+			)
+		)
+			throw new Error(
+				'The server returned invalid workspace folder references.',
+			);
+	}
+	for (const [id, folder] of Object.entries(snapshot.folders)) {
+		if (
+			folder.id !== id ||
+			typeof folder.name !== 'string' ||
+			!['general', 'plain', 'linked'].includes(folder.kind) ||
+			snapshot.projects[folder.projectId]?.folderIds.includes(id) !== true ||
+			(folder.kind === 'linked') !==
+				(isRecord(folder.worktree) &&
+					typeof folder.worktree.repositoryId === 'string' &&
+					typeof folder.worktree.path === 'string') ||
+			!isStringArray(folder.panelIds) ||
+			new Set(folder.panelIds).size !== folder.panelIds.length ||
+			folder.panelIds.some(
+				(panelId) => snapshot.panels[panelId]?.folderId !== id,
+			) ||
+			(folder.activePanelId !== undefined &&
+				!folder.panelIds.includes(folder.activePanelId)) ||
+			(folder.createdByPanelId !== undefined &&
+				snapshot.panels[folder.createdByPanelId]?.projectId !==
+					folder.projectId) ||
+			(folder.captureOffer !== undefined &&
+				(!isRecord(folder.captureOffer) ||
+					snapshot.panels[folder.captureOffer.panelId]?.projectId !==
+						folder.projectId))
+		)
+			throw new Error('The server returned an invalid workspace folder.');
+	}
+	for (const [id, panel] of Object.entries(snapshot.panels)) {
+		if (
+			panel.id !== id ||
+			!['terminal', 'file', 'folder'].includes(panel.type) ||
+			snapshot.projects[panel.projectId] === undefined ||
+			snapshot.folders[panel.folderId]?.projectId !== panel.projectId ||
+			snapshot.folders[panel.folderId]?.panelIds.includes(id) !== true ||
+			(panel.title !== undefined && typeof panel.title !== 'string') ||
+			(panel.emoji !== undefined && typeof panel.emoji !== 'string') ||
+			(panel.color !== undefined && typeof panel.color !== 'string') ||
+			(panel.note !== undefined && typeof panel.note !== 'string') ||
+			(panel.inheritsProjectColor !== undefined &&
+				typeof panel.inheritsProjectColor !== 'boolean') ||
+			(panel.activityIndicatorsEnabled !== undefined &&
+				typeof panel.activityIndicatorsEnabled !== 'boolean') ||
+			(panel.type === 'terminal' &&
+				(panel.sessionId === undefined ||
+					snapshot.terminalSessions[panel.sessionId]?.projectId !==
+						panel.projectId))
+		)
+			throw new Error('The server returned an invalid workspace panel.');
+	}
+	for (const [id, session] of Object.entries(snapshot.terminalSessions)) {
+		const project = snapshot.projects[session.projectId];
+		if (
+			session.id !== id ||
+			session.serverId !== expectedServerId ||
+			project === undefined ||
+			!['running', 'exited', 'interrupted'].includes(session.status)
+		)
+			throw new Error('The server returned an invalid terminal session.');
+	}
+	return snapshot;
+}
+
+export function parseServerWorkspaceDelta(
+	value: unknown,
+	expectedServerId: string,
+	previous: ServerWorkspaceSnapshot,
+): ServerWorkspaceDelta {
+	const delta = parseWorkspaceDeltaDto(value, {
+		serverId: expectedServerId,
+		revision: previous.revision,
+		cursor: previous.cursor,
+	});
+	const state = parseServerWorkspaceSnapshot(
+		delta.state,
+		expectedServerId,
+		previous,
+	);
+	if (delta.revision !== state.revision || delta.cursor !== state.cursor) {
+		throw new Error(
+			'The server returned a workspace delta that disagrees with its state.',
+		);
+	}
+	for (const event of delta.events) {
+		if (
+			event.revision <= previous.revision ||
+			event.revision > state.revision
+		) {
+			throw new Error('The server returned an out-of-bounds workspace change.');
+		}
+	}
+	return { state, events: delta.events };
+}
+
+/** A created terminal is presentable only when the same atomic workspace
+ * projection owns both its session and its terminal panel. */
+export function hasTerminalPresentation(
+	snapshot: ServerWorkspaceSnapshot,
+	sessionId: string,
+): boolean {
+	return (
+		snapshot.terminalSessions[sessionId] !== undefined &&
+		Object.values(snapshot.panels).some(
+			(panel) => panel.type === 'terminal' && panel.sessionId === sessionId,
+		)
+	);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+function isStringArray(value: unknown): value is readonly string[] {
+	return (
+		Array.isArray(value) && value.every((entry) => typeof entry === 'string')
+	);
+}
+function isWorkspaceSidebarState(value: unknown): value is ServerWorkspaceSidebarState {
+	if (!isRecord(value)) return false;
+	const booleans = ['isFileExplorerOpen', 'isExplorerPaneCollapsed', 'isAgentsPaneCollapsed', 'isGitPaneCollapsed', 'isDocumentationPaneCollapsed'];
+	if (booleans.some((key) => typeof value[key] !== 'boolean')) return false;
+	const dimensions = ['sidebarAgentsHeight', 'sidebarExplorerHeight', 'sidebarGitHeight', 'sidebarDocumentationHeight'];
+	if (dimensions.some((key) => !Number.isSafeInteger(value[key]) || (value[key] as number) < 30 || (value[key] as number) > 2_000)) return false;
+	for (const key of ['expandedAgentEntryIds', 'expandedDocumentationFolderIds']) {
+		const entries = value[key];
+		if (!isStringArray(entries) || entries.length > 256 || entries.some((entry) => entry.length === 0 || entry.length > 4_096 || entry.includes('\0'))) return false;
+	}
+	const order = value.sidebarPanelOrder;
+	const ids = ['explorer', 'agents', 'git', 'documentation'];
+	return isStringArray(order) && order.length === ids.length && new Set(order).size === ids.length && ids.every((id) => order.includes(id));
+}
+
+import {
+	parseWorkspaceDeltaDto,
+	type WorkspaceDeltaDto,
+} from '@terminay/protocol';

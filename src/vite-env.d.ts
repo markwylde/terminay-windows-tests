@@ -1,0 +1,91 @@
+/// <reference types="vite/client" />
+
+import type { HostCapabilitySet } from '@terminay/client-core';
+import type { TerminayTestApi } from './types/terminay';
+
+declare global {
+	/** The package version, defined by the server UI build. */
+	const __TERMINAY_VERSION__: string | undefined;
+	interface Window {
+		terminayHost?: {
+			getContext(): Promise<{
+				version: number;
+				hostKind?: string;
+				windowId: string;
+				connectionId: string;
+				profileLabel: string;
+				capabilities: HostCapabilitySet;
+				presentation: unknown;
+				profile?: { id: string; label: string };
+				profiles?: readonly {
+					id: string;
+					isLocal?: boolean;
+					label: string;
+					serverId: string;
+					status: string;
+				}[];
+			}>;
+			requestAction(
+				action: unknown,
+				options?: { readonly userGesture?: boolean },
+			): Promise<unknown>;
+			resolveDroppedFilePath?(file: File): string | undefined;
+			readTerminalClipboard?(): Promise<string>;
+		};
+		terminayBytes?: {
+			/** Version 2 adds `openConnection`; a version 1 preload carries the
+			 * window's primary endpoint only and can reach no attached server. */
+			readonly version: 1 | 2;
+			replaceEndpoint(): Promise<void>;
+			send(frame: Uint8Array): Promise<void>;
+			subscribe(listener: (frame: Uint8Array | null) => void): () => void;
+			openConnection?(connectionId: string): Promise<{
+				send(frame: Uint8Array): Promise<void>;
+				subscribe(listener: (frame: Uint8Array | null) => void): () => void;
+				close?(): void;
+			}>;
+		};
+		terminayTest?: TerminayTestApi;
+		terminayWorkspaceTest?: {
+			resetCommandRecords(): Promise<void>;
+			getCommandRecords(): Promise<
+				readonly {
+					operation: string;
+					command?: {
+						type: string;
+						projectId?: string;
+						sidebar?: Readonly<Record<string, unknown>>;
+					};
+				}[]
+			>;
+		};
+		terminayLocalConnectionFaultTest?: {
+			failActiveConnection: () => Promise<{ connectionId: string }>;
+			closeServerConnection: () => Promise<number>;
+			refuseProjectCreations: (count: number) => Promise<void>;
+		};
+		terminayAgentStatusTest?: {
+			publishSessions: (payload: {
+				sourceId?: string;
+				harnesses?: ReadonlyArray<{ id: string; displayName: string }>;
+				publication: {
+					reset?: ReadonlyArray<Record<string, unknown>>;
+					upserts?: ReadonlyArray<Record<string, unknown>>;
+					removals?: readonly string[];
+				};
+			}) => Promise<boolean>;
+			terminalShellPid: (terminalSessionId: string) => Promise<number | null>;
+		};
+		terminayAiMetadataTest?: {
+			setMock: (mock: {
+				error?: string | null;
+				models?: readonly Readonly<{ id: string; label: string }>[];
+				hold?: boolean;
+				noteResult?: string;
+				titleResult?: string;
+			}) => Promise<void>;
+		};
+	}
+}
+
+export {};

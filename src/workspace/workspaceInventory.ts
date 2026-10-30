@@ -1,0 +1,323 @@
+/**
+ * The workspace panel inventory.
+ *
+ * Every project publishes one entry per panel it holds — terminal, file, and
+ * folder alike — whether or not that panel is currently doing anything. The
+ * dashboard reads the whole list; the header activity menu and the per-project
+ * tab badges read `selectNotableEntries` over the same list, so a panel can
+ * never read one way on one surface and another way on another.
+ *
+ * Status here is already canonical: the builder applies the authority order
+ * from the terminal-activity-signals spec, where a terminal under agent
+ * authority reports its agent state and raw output never competes with it.
+ * `idle` is the resting value that no earlier surface needed.
+ */
+
+import type { TerminalActivityState } from '../components/TerminalTab';
+import type { AgentState } from '../types/agentStatus';
+import type {
+	TerminalActivityOverviewItem,
+	TerminalActivityOverviewState,
+	TerminalPresentationActivityState,
+} from './activityStates';
+
+export type PanelTabAppearance = {
+	activityIndicatorsEnabled?: boolean;
+	agentNeedsAttention?: boolean;
+	agentState?: AgentState;
+	/** When the agent entered `agentState`, in epoch milliseconds. */
+	agentStateSince?: number;
+	agentUnread?: boolean;
+	color?: string;
+	emoji?: string;
+	inheritsProjectColor?: boolean;
+	projectColor?: string;
+	showActiveTabActivityIndicator?: boolean;
+	showFinishedTabActivityIndicator?: boolean;
+	terminalNote?: string;
+};
+
+export function getEffectiveTerminalTabColor(
+	params: PanelTabAppearance | undefined,
+	fallbackProjectColor: string,
+): string {
+	if (params?.inheritsProjectColor) {
+		return params.projectColor ?? fallbackProjectColor;
+	}
+
+	return params?.color ?? fallbackProjectColor;
+}
+
+export function areTerminalActivityIndicatorsEnabled(
+	params: PanelTabAppearance | undefined,
+): boolean {
+	return params?.activityIndicatorsEnabled !== false;
+}
+
+export function isTerminalActivityIndicatorStateVisible(
+	state: TerminalActivityState | undefined,
+	params: PanelTabAppearance | undefined,
+): state is TerminalPresentationActivityState {
+	if (!areTerminalActivityIndicatorsEnabled(params)) {
+		return false;
+	}
+
+	if (state === 'attention') {
+		return true;
+	}
+
+	if (state === 'recent') {
+		return params?.showActiveTabActivityIndicator === true;
+	}
+
+	if (state === 'unviewed') {
+		return params?.showFinishedTabActivityIndicator !== false;
+	}
+
+	return false;
+}
+
+/**
+ * An agent's state in the tab-activity vocabulary, so one set of indicator
+ * settings governs every terminal: working is active, done is finished, and
+ * waiting and blocked are attention.
+ */
+export function agentIndicatorActivityState(
+	state: AgentState,
+): TerminalActivityState | undefined {
+	if (state === 'working') return 'recent';
+	if (state === 'done') return 'unviewed';
+	if (state === 'waiting' || state === 'blocked') return 'attention';
+	return undefined;
+}
+
+export function isAgentIndicatorStateVisible(
+	state: AgentState,
+	params: PanelTabAppearance | undefined,
+): boolean {
+	return isTerminalActivityIndicatorStateVisible(
+		agentIndicatorActivityState(state),
+		params,
+	);
+}
+
+export type WorkspaceInventoryPanelKind = 'terminal' | 'file' | 'folder';
+
+export type WorkspaceInventoryStatus = 'idle' | TerminalActivityOverviewState;
+
+export type WorkspaceInventoryEntry = {
+	/** Set only when an agent-owned terminal has finished and stays unread. */
+	agentUnread?: boolean;
+	color: string;
+	emoji: string;
+	/** The folder of the project that holds the panel. Set by the folder's own
+	 * workspace; absent on an inventory that predates folders. */
+	folderId?: string;
+	/**
+	 * True when this panel's own appearance settings hide its raw-output
+	 * activity indicator. The dashboard still shows the canonical status; the
+	 * indicator-driven surfaces honour the setting. Always true when
+	 * `untracked` is.
+	 */
+	indicatorsSuppressed?: boolean;
+	isAgentStatus: boolean;
+	kind: WorkspaceInventoryPanelKind;
+	panelId: string;
+	projectEmoji: string;
+	projectId: string;
+	projectTitle: string;
+	/** True for the panel in front of its project, which is what the compact
+	 * breadcrumb names. Presentation only: it confers no authority. */
+	isActivePanel?: boolean;
+	/** Present for terminal panels; file and folder panels have no session. */
+	sessionId?: string;
+	/** When the panel entered `status`, in epoch milliseconds, when known. */
+	since?: number;
+	status: WorkspaceInventoryStatus;
+	title: string;
+	/**
+	 * Set when the person turned off Track activity for this terminal. Its
+	 * status is then `idle` whatever it is doing, agent state included, so no
+	 * surface that reads `status` can show its activity; only the Board and
+	 * the dashboard summary branch on this to place and count it.
+	 */
+	untracked?: true;
+};
+
+export type InventoryPanelParams = PanelTabAppearance & {
+	filePath?: string;
+	folderPath?: string;
+	sessionId?: string;
+	/** When `terminalActivityState` last changed, in epoch milliseconds. */
+	terminalActivitySince?: number;
+	terminalActivityState?: TerminalActivityState;
+};
+
+export type InventoryPanelSource = {
+	id: string;
+	params?: InventoryPanelParams;
+	title?: string;
+};
+
+export type InventoryProjectSource = {
+	color: string;
+	emoji: string;
+	id: string;
+	title: string;
+};
+
+function panelKind(
+	params: InventoryPanelParams | undefined,
+): WorkspaceInventoryPanelKind {
+	if (params?.sessionId) return 'terminal';
+	if (params?.folderPath !== undefined) return 'folder';
+	if (params?.filePath !== undefined) return 'file';
+	return 'terminal';
+}
+
+function defaultPanelTitle(kind: WorkspaceInventoryPanelKind): string {
+	if (kind === 'folder') return 'Folder';
+	if (kind === 'file') return 'File';
+	return 'Terminal';
+}
+
+/**
+ * One entry per panel, in the order the panels were given, with the canonical
+ * status already resolved.
+ */
+export function buildProjectInventoryEntries(options: {
+	/** The panel in front, of whatever kind. */
+	activePanelId?: string;
+	agentIntegrationEnabled: boolean;
+	panels: readonly InventoryPanelSource[];
+	project: InventoryProjectSource;
+}): WorkspaceInventoryEntry[] {
+	const { activePanelId, agentIntegrationEnabled, panels, project } = options;
+	const entries: WorkspaceInventoryEntry[] = [];
+
+	for (const panel of panels) {
+		const params = panel.params;
+		const kind = panelKind(params);
+		const sessionId = params?.sessionId;
+		const agentState = params?.agentState;
+		const base = {
+			color: getEffectiveTerminalTabColor(params, project.color),
+			emoji: params?.emoji ?? '',
+			kind,
+			panelId: panel.id,
+			projectEmoji: project.emoji,
+			projectId: project.id,
+			projectTitle: project.title,
+			title: panel.title ?? defaultPanelTitle(kind),
+			...(panel.id === activePanelId ? { isActivePanel: true } : {}),
+			...(sessionId === undefined ? {} : { sessionId }),
+		};
+
+		if (kind !== 'terminal') {
+			entries.push({ ...base, isAgentStatus: false, status: 'idle' });
+			continue;
+		}
+
+		if (!areTerminalActivityIndicatorsEnabled(params)) {
+			entries.push({
+				...base,
+				indicatorsSuppressed: true,
+				isAgentStatus: Boolean(
+					agentIntegrationEnabled && sessionId && agentState,
+				),
+				status: 'idle',
+				untracked: true,
+			});
+			continue;
+		}
+
+		if (agentIntegrationEnabled && sessionId && agentState) {
+			// Once a native lifecycle hook has claimed this terminal, raw output
+			// activity must never compete with that authority.
+			entries.push({
+				...base,
+				agentUnread: params?.agentUnread === true,
+				indicatorsSuppressed: !isAgentIndicatorStateVisible(agentState, params),
+				isAgentStatus: true,
+				...(params?.agentStateSince === undefined
+					? {}
+					: { since: params.agentStateSince }),
+				status: agentState,
+			});
+			continue;
+		}
+
+		const activityState = params?.terminalActivityState;
+		const status: WorkspaceInventoryStatus =
+			activityState === 'recent' ||
+			activityState === 'unviewed' ||
+			activityState === 'attention'
+				? activityState
+				: 'idle';
+		entries.push({
+			...base,
+			indicatorsSuppressed: !isTerminalActivityIndicatorStateVisible(
+				activityState,
+				params,
+			),
+			isAgentStatus: false,
+			...(status === 'idle' || params?.terminalActivitySince === undefined
+				? {}
+				: { since: params.terminalActivitySince }),
+			status,
+		});
+	}
+
+	return entries;
+}
+
+/**
+ * The predicate the header activity menu and the project tab badges use: an
+ * agent-owned terminal counts while it is working, while it needs attention,
+ * and once it is done but unread; every terminal counts only while its own
+ * indicator settings would show its state. File and folder panels have never
+ * had activity and never count. An untracked terminal is idle, so it never
+ * counts, whatever it or its agent is doing.
+ */
+export function isNotableInventoryEntry(
+	entry: WorkspaceInventoryEntry,
+): boolean {
+	if (entry.kind !== 'terminal') return false;
+	if (entry.sessionId === undefined) return false;
+	if (entry.status === 'idle') return false;
+	if (entry.indicatorsSuppressed === true) return false;
+	if (entry.isAgentStatus) {
+		if (entry.status === 'working') return true;
+		if (entry.status === 'waiting' || entry.status === 'blocked') return true;
+		return entry.status === 'done' && entry.agentUnread === true;
+	}
+	return true;
+}
+
+/**
+ * The notable entries, in inventory order, shaped for the surfaces that only
+ * ever knew about notable terminals.
+ */
+export function selectNotableEntries(
+	entries: readonly WorkspaceInventoryEntry[],
+): TerminalActivityOverviewItem[] {
+	const items: TerminalActivityOverviewItem[] = [];
+	for (const entry of entries) {
+		if (!isNotableInventoryEntry(entry)) continue;
+		if (entry.status === 'idle') continue;
+		items.push({
+			color: entry.color,
+			emoji: entry.emoji,
+			isAgentStatus: entry.isAgentStatus,
+			panelId: entry.panelId,
+			projectEmoji: entry.projectEmoji,
+			projectId: entry.projectId,
+			projectTitle: entry.projectTitle,
+			sessionId: entry.sessionId ?? '',
+			...(entry.since === undefined ? {} : { since: entry.since }),
+			state: entry.status,
+			title: entry.title,
+		});
+	}
+	return items;
+}

@@ -1,0 +1,1082 @@
+/* The tree is a size container so the facts can shorten where it is narrow
+   without anything measuring it. */
+.folders-tree {
+	container: folders-tree / inline-size;
+	display: flex;
+	flex-direction: column;
+	/* The gutter between folders is the column's own background showing
+	   through, so each folder reads as one group. */
+	gap: 6px;
+	min-height: 0;
+	padding-bottom: 6px;
+	overflow-y: auto;
+	font-size: 13px;
+	line-height: 1.4;
+	color: #dce2f0;
+	user-select: none;
+}
+
+.folders-tree::-webkit-scrollbar {
+	width: 6px;
+}
+
+.folders-tree::-webkit-scrollbar-thumb {
+	background: rgba(255, 255, 255, 0.1);
+	border-radius: 10px;
+}
+
+/* A folder is a block the full width of the column: its header band, then its
+   rows, then New terminal. Square, with no side margin. */
+.folders-tree__folder {
+	display: flex;
+	flex: none;
+	flex-direction: column;
+	overflow: hidden;
+	/* An outline is drawn only to say something: that a terminal can be dropped
+	   here, or that the block is in the hand. It takes no room, so nothing is
+	   inset to make way. */
+	padding-bottom: 2px;
+	background: rgba(255, 255, 255, 0.025);
+}
+
+.folders-tree__folder--drop-target {
+	outline: 1px solid rgba(87, 183, 255, 0.7);
+	outline-offset: -1px;
+	background: rgba(87, 183, 255, 0.08);
+}
+
+/* A card that is being carried, or is settling, is drawn over the others. */
+.folders-tree--tree .folders-tree__folder {
+	position: relative;
+}
+
+/* The card in the hand while its grip is dragged. */
+.folders-tree__folder--dragging {
+	z-index: 1;
+	outline: 1px solid rgba(220, 226, 240, 0.45);
+	outline-offset: -1px;
+	box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+}
+
+/* Every row is one line. A long name is cut with an ellipsis, never wrapped. */
+.folders-tree__row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	min-width: 0;
+	white-space: nowrap;
+	cursor: default;
+	outline: none;
+}
+
+.folders-tree__row:hover {
+	background: rgba(255, 255, 255, 0.05);
+}
+
+.folders-tree__row:focus-visible {
+	box-shadow: inset 0 0 0 1px rgba(87, 183, 255, 0.6);
+}
+
+/* The head of the block: a band a step lighter than the rows, in the manner of
+   the right sidebar's pane titles. Its lines start at the band's leading edge,
+   the title's with the collapse control. */
+.folders-tree__row--folder {
+	flex-direction: column;
+	align-items: stretch;
+	gap: 3px;
+	padding: 6px 6px 7px 8px;
+	background: rgba(255, 255, 255, 0.045);
+}
+
+.folders-tree__row--folder:hover {
+	background: rgba(255, 255, 255, 0.065);
+}
+
+/* The selected folder's header band is tinted: it is the folder in front. */
+.folders-tree__row--selected,
+.folders-tree__row--selected:hover {
+	background: color-mix(
+		in srgb,
+		var(--project-color, #57b7ff) 16%,
+		rgba(255, 255, 255, 0.045)
+	);
+}
+
+/* A row's status indicator, or the icon in its place, is centred under the
+   collapse control's chevron. */
+.folders-tree__row--panel {
+	height: 26px;
+	padding: 0 10px 0 8px;
+	color: rgba(220, 226, 240, 0.8);
+}
+
+.folders-tree__row--active,
+.folders-tree__row--active:hover {
+	background: color-mix(
+		in srgb,
+		var(--project-color, #57b7ff) 22%,
+		transparent
+	);
+	color: #fff;
+}
+
+.folders-tree__title {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	min-width: 0;
+	min-height: 22px;
+}
+
+/* How many tabs the folder holds, drawn as the right sidebar draws a pane's
+   count. */
+.folders-tree__count {
+	flex: none;
+	box-sizing: border-box;
+	min-width: 16px;
+	padding: 0 5px;
+	border-radius: 9px;
+	font-size: 11px;
+	line-height: 16px;
+	text-align: center;
+	font-variant-numeric: tabular-nums;
+	background: rgba(255, 255, 255, 0.16);
+	color: #ffffff;
+}
+
+/* Dragged to reorder the folders. */
+/* Closes the card to its title line and opens it again. It sits where the
+   eye starts the line, as a tree's disclosure does. */
+.folders-tree__toggle {
+	all: unset;
+	flex: none;
+	display: inline-flex;
+	align-items: center;
+	/* The chevron's left edge is the band's leading edge. */
+	margin: -4px 0 -4px -2px;
+	padding: 4px 2px;
+	border-radius: 3px;
+	color: rgba(255, 255, 255, 0.8);
+	cursor: pointer;
+}
+
+.folders-tree__toggle:hover,
+.folders-tree__toggle:focus-visible {
+	background: rgba(255, 255, 255, 0.1);
+	color: #fff;
+}
+
+/* The title line is what a card is carried by. */
+.folders-tree__folder--dragging [data-folder-drag-handle] {
+	cursor: grabbing;
+}
+
+/* The one state a collapsed folder shows for the terminals it hides. */
+.folders-tree__attention {
+	margin-inline: 2px;
+}
+
+.folders-tree__icon {
+	flex: none;
+	color: rgba(220, 226, 240, 0.7);
+}
+
+.folders-tree__text {
+	display: flex;
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.folders-tree__name {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+/* Set as the right sidebar sets a pane title. The text keeps its own case for
+   its accessible name and tooltip; only its drawing is upper case. */
+.folders-tree__row--folder .folders-tree__name {
+	font-size: 11px;
+	font-weight: 600;
+	letter-spacing: 0.05em;
+	text-transform: uppercase;
+	color: #fff;
+}
+
+.folders-tree__row--panel .folders-tree__name {
+	flex: 1 1 auto;
+}
+
+/* A terminal's name while it is being typed: on the row's own line, so the
+   row keeps its height. */
+.folders-tree__rename {
+	flex: 1 1 auto;
+	min-width: 0;
+	height: 20px;
+	margin: 0 -5px;
+	padding: 0 4px;
+	border: 1px solid var(--project-color, #57b7ff);
+	border-radius: 3px;
+	background: var(--terminal-panel-surface, #12161c);
+	color: #fff;
+	font: inherit;
+	outline: none;
+}
+
+/* The branch is the ordinary text colour. Only a checkout holding work the
+   default branch lacks takes the accent. */
+.folders-tree__branch {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	min-width: 0;
+	font-size: 11.5px;
+	color: #dce2f0;
+}
+
+.folders-tree__branch--dirty {
+	color: #e2a45f;
+}
+
+.folders-tree__branch > svg {
+	flex: none;
+}
+
+.folders-tree__branch > span {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+/* Commits the default branch lacks. Muted whether or not the branch is dirty,
+   and never the part that gives way to a long branch name. */
+.folders-tree__branch > .folders-tree__unmerged,
+.folders-tree__label > .folders-tree__unmerged {
+	flex: none;
+	overflow: visible;
+	color: rgba(220, 226, 240, 0.55);
+	font-variant-numeric: tabular-nums;
+}
+
+/* A linked folder is named by its branch: its title line is its branch line.
+   The name gives way to the mark after it, and takes the accent when dirty. */
+.folders-tree__label {
+	align-items: baseline;
+	gap: 4px;
+}
+
+.folders-tree__label > .folders-tree__unmerged {
+	font-size: 11.5px;
+	font-weight: 400;
+}
+
+.folders-tree__title--dirty .folders-tree__icon,
+.folders-tree__row--folder .folders-tree__title--dirty .folders-tree__name {
+	color: #e2a45f;
+}
+
+/* The worktree's directory, shown only when another checkout is on the same
+   branch. Muted whether or not the checkout is dirty. */
+.folders-tree__row--folder .folders-tree__name .folders-tree__label-suffix {
+	color: rgba(220, 226, 240, 0.55);
+	font-weight: 400;
+}
+
+/* A linked folder's worktree in three lines, shown after a rest on its card.
+   Fixed in the window so the column cannot clip it, and never in the way of
+   the pointer. */
+.folders-tree-details {
+	position: fixed;
+	z-index: 9000;
+	max-width: min(360px, calc(100vw - 16px));
+	padding: 7px 10px;
+	border: 1px solid rgba(255, 255, 255, 0.12);
+	border-radius: 6px;
+	background: #1b1f2a;
+	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+	color: #dce2f0;
+	font-size: 11.5px;
+	line-height: 1.5;
+	pointer-events: none;
+}
+
+.folders-tree-details__lines {
+	display: grid;
+	grid-template-columns: auto minmax(0, 1fr);
+	column-gap: 10px;
+	margin: 0;
+}
+
+.folders-tree-details__lines > dt {
+	color: rgba(220, 226, 240, 0.55);
+}
+
+.folders-tree-details__lines > dd {
+	min-width: 0;
+	margin: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+/* Laid out right to left so a path too long for the line loses its start, not
+   its end. The path itself is isolated and still reads left to right. */
+.folders-tree-details__lines > .folders-tree-details__location {
+	direction: rtl;
+	text-align: left;
+}
+
+/* Change size, pull request, and checks: one line of chips that never wraps
+   and never shrinks a chip. Where the tree is narrow the chips say less. */
+/* A worktree being removed: its whole card is dimmed, terminals and all, and
+   says so beneath its label until it is gone. */
+.folders-tree__folder--deleting {
+	opacity: 0.4;
+}
+
+.folders-tree__deleting {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 11px;
+	font-style: italic;
+	color: rgba(220, 226, 240, 0.72);
+}
+
+/* A worktree being pulled from origin: a turning spinner and a word in place
+   of its facts. The card stays bright; the folder is not going anywhere. */
+.folders-tree__pulling {
+	display: flex;
+	align-items: center;
+	gap: 5px;
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	font-size: 11px;
+	font-style: italic;
+	color: rgba(220, 226, 240, 0.72);
+}
+
+.folders-tree__pulling > span {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.folders-tree__pulling-spinner {
+	flex: none;
+	color: color-mix(in srgb, var(--project-color, #57b7ff) 70%, #ffffff);
+	animation: folders-tree-pulling-spin 900ms linear infinite;
+}
+
+@keyframes folders-tree-pulling-spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.folders-tree__pulling-spinner {
+		animation: none;
+	}
+}
+
+.folders-tree__facts {
+	display: flex;
+	flex-wrap: nowrap;
+	align-items: center;
+	gap: 5px;
+	min-width: 0;
+	overflow: hidden;
+	font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+	font-size: var(--folders-tree-chip-size, 9px);
+	font-variant-numeric: tabular-nums;
+	line-height: 1.5;
+}
+
+.folders-tree__chip {
+	appearance: none;
+	box-sizing: border-box;
+	display: inline-flex;
+	flex: none;
+	align-items: center;
+	gap: 5px;
+	margin: 0;
+	padding: 1px 6px;
+	border: 1px solid rgba(255, 255, 255, 0.08);
+	border-radius: 3px;
+	background: rgba(0, 0, 0, 0.22);
+	color: rgba(220, 226, 240, 0.62);
+	font: inherit;
+	white-space: nowrap;
+}
+
+.folders-tree__chip > svg {
+	flex: none;
+}
+
+.folders-tree__chip--quiet {
+	color: rgba(220, 226, 240, 0.4);
+}
+
+@container folders-tree (max-width: 300px) {
+	.folders-tree__chip-extra {
+		display: none;
+	}
+}
+
+/* A merged pull request reads as done, in the forges' merged purple. */
+.folders-tree__pr--merged {
+	border-color: rgba(163, 113, 247, 0.45);
+	background: rgba(163, 113, 247, 0.16);
+	color: #c4a5fa;
+}
+
+/* The pull request opens in the browser and the checks open their list. */
+.folders-tree__pr--link,
+.folders-tree__checks--link {
+	cursor: pointer;
+}
+
+.folders-tree__pr--link:hover,
+.folders-tree__checks--link:hover {
+	background: rgba(255, 255, 255, 0.1);
+}
+
+.folders-tree__pr--link:focus-visible,
+.folders-tree__checks--link:focus-visible,
+.folders-tree__check--link:focus-visible {
+	outline: 1px solid rgba(87, 183, 255, 0.5);
+}
+
+.folders-tree__change--changed,
+.folders-tree__change--missing {
+	color: #f14c4c;
+}
+
+.folders-tree__delta--additions {
+	color: #73c991;
+}
+
+.folders-tree__delta--deletions {
+	color: #f14c4c;
+}
+
+/* The checks of one folder, beneath its facts. One check to a line. */
+.folders-tree__checks-list {
+	margin: 0;
+	list-style: none;
+	display: flex;
+	flex-direction: column;
+	gap: 1px;
+	padding: 4px 6px 6px 8px;
+	border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+	font-size: 11px;
+	color: rgba(220, 226, 240, 0.72);
+}
+
+.folders-tree__check {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	min-width: 0;
+	padding: 2px 4px;
+	white-space: nowrap;
+}
+
+.folders-tree__check > svg {
+	flex: none;
+}
+
+.folders-tree__check > span {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.folders-tree__check-item {
+	display: flex;
+	min-width: 0;
+}
+
+.folders-tree__check--link {
+	appearance: none;
+	flex: 1 1 auto;
+	margin: 0;
+	border: 0;
+	border-radius: 4px;
+	background: none;
+	color: inherit;
+	font: inherit;
+	text-align: left;
+	cursor: pointer;
+}
+
+.folders-tree__check--link:hover {
+	background: rgba(255, 255, 255, 0.06);
+	color: #fff;
+}
+
+.folders-tree__check--note {
+	color: rgba(220, 226, 240, 0.4);
+}
+
+.folders-tree__check-icon--failed {
+	color: #f14c4c;
+}
+
+.folders-tree__check-icon--pending {
+	color: #cca700;
+}
+
+.folders-tree__check-icon--passed {
+	color: #73c991;
+}
+
+.folders-tree__check-icon--skipped {
+	color: rgba(220, 226, 240, 0.4);
+}
+
+.folders-tree__checks--passed {
+	color: #73c991;
+}
+
+.folders-tree__checks--failed {
+	color: #f14c4c;
+}
+
+.folders-tree__checks--pending {
+	color: #cca700;
+}
+
+.folders-tree__menu {
+	all: unset;
+	flex: none;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 22px;
+	height: 22px;
+	margin: -2px -2px -2px 0;
+	border-radius: 4px;
+	color: rgba(255, 255, 255, 0.72);
+}
+
+.folders-tree__menu:hover,
+.folders-tree__menu:focus-visible {
+	background: rgba(255, 255, 255, 0.1);
+	color: #fff;
+}
+
+.folders-tree__status {
+	flex: none;
+}
+
+/* A file or folder tab's icon, in the box a terminal's status takes. */
+.folders-tree__kind {
+	display: inline-grid;
+	flex: none;
+	width: 14px;
+	height: 14px;
+	place-items: center;
+	color: rgba(220, 226, 240, 0.55);
+}
+
+.folders-tree__tag {
+	flex: 0 1000 auto;
+	min-width: 40px;
+	max-width: 104px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	padding: 0 7px;
+	border-radius: 8px;
+	font-size: 10.5px;
+	line-height: 16px;
+	background: rgba(226, 164, 95, 0.15);
+	color: #e2a45f;
+}
+
+.folders-tree__offer {
+	display: flex;
+	flex-direction: column;
+	gap: 7px;
+	margin: 6px 8px;
+	padding: 8px 10px;
+	border: 1px dashed rgba(226, 164, 95, 0.6);
+	border-radius: 7px;
+	font-size: 11.5px;
+	white-space: normal;
+	color: rgba(220, 226, 240, 0.7);
+}
+
+.folders-tree__offer-text strong {
+	color: #dce2f0;
+	font-weight: 600;
+}
+
+.folders-tree__offer-actions {
+	display: flex;
+	gap: 6px;
+}
+
+.folders-tree__offer-button {
+	all: unset;
+	padding: 3px 9px;
+	border-radius: 5px;
+	font-weight: 600;
+	background: rgba(255, 255, 255, 0.09);
+	color: #dce2f0;
+}
+
+.folders-tree__offer-button:hover,
+.folders-tree__offer-button:focus-visible {
+	background: rgba(255, 255, 255, 0.16);
+}
+
+.folders-tree__offer-button--primary {
+	background: color-mix(in srgb, var(--project-color, #57b7ff) 60%, #0d1014);
+	color: #fff;
+}
+
+/* The last row of every open block: a terminal in this folder. Its label makes
+   one with the default shell; its trailing buttons, shown while the row is
+   hovered or holds focus, make one with the shell or with a launcher. */
+.folders-tree__new-terminal-row {
+	display: flex;
+	align-items: center;
+	height: 26px;
+	padding-right: 5px;
+}
+
+.folders-tree__new-terminal-row:hover,
+.folders-tree__new-terminal-row:focus-within {
+	background: rgba(255, 255, 255, 0.05);
+}
+
+/* The plus is centred under the collapse control's chevron. */
+.folders-tree__new-terminal {
+	all: unset;
+	box-sizing: border-box;
+	display: flex;
+	flex: 1 1 auto;
+	align-items: center;
+	gap: 8px;
+	min-width: 0;
+	height: 100%;
+	padding: 0 8px 0 9px;
+	white-space: nowrap;
+	font-size: 12.5px;
+	color: rgba(220, 226, 240, 0.55);
+	cursor: pointer;
+}
+
+.folders-tree__new-terminal > svg {
+	flex: none;
+}
+
+.folders-tree__new-terminal-row:hover .folders-tree__new-terminal,
+.folders-tree__new-terminal:focus-visible {
+	color: #dce2f0;
+}
+
+.folders-tree__new-terminal:focus-visible {
+	box-shadow: inset 0 0 0 1px rgba(87, 183, 255, 0.6);
+}
+
+/* Present in the document always, so Tab reaches them, and drawn only while
+   the row is hovered or holds focus. */
+.folders-tree__launchers {
+	display: flex;
+	flex: none;
+	gap: 2px;
+	min-inline-size: 0;
+	margin: 0;
+	padding: 0;
+	border: 0;
+	opacity: 0;
+	pointer-events: none;
+}
+
+.folders-tree__new-terminal-row:hover .folders-tree__launchers,
+.folders-tree__new-terminal-row:focus-within .folders-tree__launchers {
+	opacity: 1;
+	pointer-events: auto;
+}
+
+/* A device with no hover could never reveal them, so they are always shown. */
+@media (hover: none) {
+	.folders-tree__launchers {
+		opacity: 1;
+		pointer-events: auto;
+	}
+}
+
+.folders-tree__launcher {
+	all: unset;
+	box-sizing: border-box;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 22px;
+	height: 20px;
+	border-radius: 4px;
+	color: rgba(220, 226, 240, 0.85);
+	cursor: pointer;
+}
+
+.folders-tree__launcher:hover,
+.folders-tree__launcher:focus-visible {
+	background: rgba(255, 255, 255, 0.12);
+	color: #fff;
+}
+
+.folders-tree__launcher:focus-visible {
+	outline: 1px solid rgba(87, 183, 255, 0.7);
+	outline-offset: -1px;
+}
+
+.folders-tree__launcher .launcher-icon--agent-claude-code {
+	color: #e08a6d;
+}
+
+.folders-tree__new {
+	all: unset;
+	display: flex;
+	flex: none;
+	align-items: center;
+	gap: 8px;
+	height: 28px;
+	padding: 0 10px 0 8px;
+	color: rgba(220, 226, 240, 0.55);
+}
+
+.folders-tree__new:hover,
+.folders-tree__new:focus-visible {
+	color: #dce2f0;
+	background: rgba(255, 255, 255, 0.05);
+}
+
+/* A card in the hand is carried over the row, which holds its place and is
+   not drawn until the card is put down. */
+.folders-tree:has(.folders-tree__folder--dragging) .folders-tree__new {
+	visibility: hidden;
+}
+
+/* The peek under a project tab is the same cards without the column around
+   them, and without the grip, the menu, or the New terminal row. */
+.folders-tree--peek {
+	max-height: min(60vh, 520px);
+}
+
+/* --- A block's lines, where it has its collapse control --------------------
+ *
+ * Every line under the title starts where the collapse control does: the
+ * branch and the facts at the band's leading edge, and each row's indicator,
+ * like New terminal's plus, centred under the chevron. The branch sits close
+ * under the title as its quieter second line.
+ */
+
+.folders-tree--tree .folders-tree__branch {
+	color: rgba(220, 226, 240, 0.62);
+}
+
+.folders-tree--tree .folders-tree__branch--dirty {
+	color: #e2a45f;
+}
+
+.folders-tree--tree .folders-tree__facts,
+.folders-tree--tree .folders-tree__deleting,
+.folders-tree--tree .folders-tree__pulling {
+	margin-top: 2px;
+}
+
+/* --- The tree as a project's left column ---------------------------------- */
+
+.folders-column {
+	box-sizing: border-box;
+	display: flex;
+	flex-direction: column;
+	width: 100%;
+	height: 100%;
+	min-width: 0;
+	min-height: 0;
+	overflow: hidden;
+	background: var(--terminal-panel-surface, var(--tab-bg-active));
+}
+
+/* The same band as the panel tab strip and the sidebar's group tabs, so the
+ * project chrome runs unbroken across the three columns. */
+.folders-column__header {
+	box-sizing: border-box;
+	display: flex;
+	align-items: center;
+	flex: 0 0 auto;
+	height: var(--panel-tab-strip-height, 34px);
+	padding: 0 12px 0 0;
+	background: var(--project-chrome);
+	border-bottom: 1px solid rgba(0, 0, 0, 0.22);
+}
+
+/* The band is the header's; the tab list inside it draws only its tabs. */
+.folders-column__tabs {
+	align-self: stretch;
+	height: auto;
+	/* The first tab starts where the cards beneath it do. */
+	padding-left: 6px;
+	background: transparent;
+	border-bottom: none;
+}
+
+.folders-column__menu {
+	all: unset;
+	flex: none;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 22px;
+	height: 22px;
+	margin-left: auto;
+	border-radius: 4px;
+	color: color-mix(in srgb, var(--tab-text-selected, #ffffff) 62%, transparent);
+}
+
+.folders-column__menu:hover,
+.folders-column__menu:focus-visible,
+.folders-column__menu--active {
+	background: rgba(255, 255, 255, 0.12);
+	color: var(--tab-text-selected, #ffffff);
+}
+
+/* Both lists occupy the same cell, so the one behind keeps its layout and
+ * with it where it was scrolled to. */
+.folders-column__body {
+	display: grid;
+	grid-template: minmax(0, 1fr) / minmax(0, 1fr);
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow: hidden;
+}
+
+.folders-column__panel {
+	grid-area: 1 / 1;
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+	min-height: 0;
+	overflow: hidden auto;
+}
+
+.folders-column__panel--hidden {
+	visibility: hidden;
+	pointer-events: none;
+}
+
+/* The tree scrolls itself, so its panel must not scroll around it. */
+.folders-column__panel > .folders-tree {
+	flex: 1 1 auto;
+}
+
+/* --- Deleting a folder or worktree --------------------------------------- */
+
+.folder-delete-dialog__text,
+.folder-delete-dialog__path,
+.folder-delete-dialog__warning,
+.folder-delete-dialog__hint {
+	margin: 0;
+	font-size: 13px;
+	line-height: 1.45;
+	overflow-wrap: anywhere;
+}
+
+.folder-delete-dialog__path {
+	color: rgba(220, 226, 240, 0.6);
+	font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+	font-size: 12px;
+}
+
+.folder-delete-dialog__warning,
+.folder-delete-dialog__hint--warning {
+	color: #ff9b9b;
+}
+
+.folder-delete-dialog__panels {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	margin: 0;
+	padding: 0;
+	border: 0;
+}
+
+.folder-delete-dialog__panels > legend {
+	padding: 0;
+	margin-bottom: 4px;
+}
+
+.folder-delete-dialog__body {
+	display: flex;
+	flex-direction: column;
+	gap: 14px;
+	padding-top: 20px;
+}
+
+/* The same breathing room above the buttons as below them. */
+.folder-delete-dialog .project-edit-actions {
+	margin-top: 20px;
+}
+
+.folder-delete-dialog__subject {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+
+/* A choice row, not the modal's stacked field label. */
+.project-edit-modal label.folder-delete-dialog__option {
+	flex-direction: row;
+	align-items: flex-start;
+	gap: 10px;
+	padding: 8px 10px;
+	border: 1px solid rgba(255, 255, 255, 0.08);
+	border-radius: 6px;
+	cursor: pointer;
+}
+
+.project-edit-modal label.folder-delete-dialog__option:has(input:checked) {
+	border-color: rgba(77, 181, 255, 0.5);
+	background: rgba(77, 181, 255, 0.06);
+}
+
+.folder-delete-dialog__option input {
+	margin: 2px 0 0;
+	flex: none;
+}
+
+.folder-delete-dialog__label {
+	display: block;
+	color: #d6e3f0;
+	font-size: 13px;
+}
+
+.folder-delete-dialog__hint {
+	display: block;
+	margin-top: 2px;
+	color: rgba(220, 226, 240, 0.6);
+	font-size: 12px;
+	font-weight: 400;
+}
+
+/* Outranks the modal's blue submit button, whichever stylesheet loads last. */
+.folder-delete-dialog .project-edit-actions button.folder-delete-dialog__delete {
+	background: #b3261e;
+	border-color: rgba(255, 255, 255, 0.1);
+	color: #fff;
+}
+
+.folder-delete-dialog
+	.project-edit-actions
+	button.folder-delete-dialog__delete:hover {
+	background: #d0362d;
+}
+
+/* --- A project tab's peek --------------------------------------------------- */
+
+/* Drawn in a portal beneath the tab it belongs to. It is not a child of the
+ * tab, so nothing a tab does with the pointer passes through it. */
+.project-tab-peek {
+	position: fixed;
+	z-index: 9000;
+	box-sizing: border-box;
+	width: 280px;
+	max-width: calc(100vw - 16px);
+	padding: 4px 0;
+	overflow: hidden;
+	border-radius: 0 0 9px 9px;
+	background: var(--terminal-panel-surface, #12161c);
+	box-shadow:
+		0 12px 32px rgba(0, 0, 0, 0.5),
+		inset 0 0 0 1px rgba(255, 255, 255, 0.09);
+	-webkit-app-region: no-drag;
+}
+
+.project-tab-peek__empty {
+	padding: 8px 12px;
+	font-size: 12px;
+	color: rgba(220, 226, 240, 0.45);
+}
+
+/* --- A folder with no panels ---------------------------------------------- */
+
+/* Matches Home with every tab closed: the same surface, type, and action. */
+.folder-empty {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 10px;
+	padding: 24px;
+	box-sizing: border-box;
+	text-align: center;
+	background: var(--terminal-panel-surface, #0f1318);
+	color: #dce2f0;
+}
+
+.folder-empty__title {
+	max-width: 100%;
+	margin: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 15px;
+	font-weight: 600;
+}
+
+.folder-empty__text {
+	max-width: 100%;
+	margin: 0;
+	font-size: 12.5px;
+	color: rgba(220, 226, 240, 0.55);
+}
+
+.folder-empty__path {
+	font-family: inherit;
+	overflow-wrap: anywhere;
+	color: rgba(220, 226, 240, 0.8);
+}
+
+.folder-empty__action {
+	all: unset;
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	box-sizing: border-box;
+	margin-top: 6px;
+	padding: 8px 14px;
+	border-radius: 8px;
+	font-size: 13px;
+	cursor: pointer;
+	background: rgba(255, 255, 255, 0.06);
+	box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+	transition: background-color 120ms ease;
+}
+
+.folder-empty__action:hover {
+	background: rgba(255, 255, 255, 0.11);
+}
+
+.folder-empty__action:focus-visible {
+	outline: 2px solid rgba(120, 170, 255, 0.9);
+	outline-offset: 1px;
+}
+
+.folder-empty__key {
+	padding: 1px 6px;
+	border-radius: 4px;
+	font-family: inherit;
+	font-size: 11px;
+	background: rgba(255, 255, 255, 0.08);
+	color: rgba(220, 226, 240, 0.6);
+}

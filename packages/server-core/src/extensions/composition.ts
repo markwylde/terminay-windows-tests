@@ -1,0 +1,460 @@
+import { mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
+import type { ServerVaultComposition } from '../settings/vaultComposition.js';
+import { DirectoryBuiltInExtensionArtifactSource } from './builtInArtifacts.js';
+import type {
+	ExtensionHostDiagnosticListener,
+	ExtensionHostTransition,
+} from './diagnostics.js';
+import {
+	ExtensionInstaller,
+	type ExtensionInstallerOptions,
+} from './installer.js';
+import type {
+	BuiltInExtensionArtifactSource,
+	ExtensionRegistrySnapshot,
+} from './installerTypes.js';
+import { ExtensionHostManager } from './manager.js';
+import { NpmCliRegistryClient } from './npmClient.js';
+import type { ExtensionOperationOptions } from './operations.js';
+import type {
+	ExtensionAgentBroker,
+	ExtensionBroker,
+	ExtensionHostStatus,
+	ExtensionSecretAccessBroker,
+	ExtensionWorktreeBroker,
+} from './types.js';
+
+export interface DefaultExtensionManagementOptions {
+	readonly dataRoot: string;
+	readonly authorityLabel: string;
+	readonly broker?: ExtensionBroker;
+	readonly childEntrypoint?: string;
+	readonly secrets?: ExtensionSecretAccessBroker;
+	readonly agents?: ExtensionAgentBroker;
+	readonly worktrees?: ExtensionWorktreeBroker;
+	readonly vault?: ServerVaultComposition /** Host-owned immutable release resource directory. */;
+	readonly builtInArtifactRoot?: string /** Test/composition seam for a host-owned verified inventory. Production uses builtInArtifactRoot. */;
+	readonly builtIns?: BuiltInExtensionArtifactSource;
+	/** Where host lifecycle records go. Absent means they are not recorded. */
+	readonly onHostDiagnostic?: ExtensionHostDiagnosticListener;
+	/** Injected only so supervisor tests need no wall-clock timers. */
+	readonly schedule?: (
+		callback: () => void | Promise<void>,
+		milliseconds: number,
+	) => ReturnType<typeof setTimeout>;
+	readonly cancelSchedule?: (timer: ReturnType<typeof setTimeout>) => void;
+	readonly now?: () => number;
+	/** See `ExtensionInstallerOptions.onBuiltInWithdrawn`. */
+	readonly onBuiltInWithdrawn?: ExtensionInstallerOptions['onBuiltInWithdrawn'];
+}
+
+/** Construct the identical selected-server extension authority for Desktop's
+ * embedded server, standalone installations, and containers. */
+export function createDefaultExtensionManagement(
+	options: DefaultExtensionManagementOptions,
+): ExtensionOperationOptions & {
+	readonly installer: ExtensionInstaller;
+	readonly hosts: ExtensionHostManager;
+	readonly initialize: () => Promise<ExtensionRegistrySnapshot>;
+	readonly reconcileBuiltIns: (
+		signal?: AbortSignal,
+	) => Promise<ExtensionRegistrySnapshot>;
+	/** Cancels every pending automatic restart. Called on server shutdown. */
+	readonly stopSupervision: () => void;
+} {
+	const broker: ExtensionBroker = options.broker ?? {
+		request: async () => {
+			throw new Error('extension broker capability is unavailable');
+		},
+	};
+	const diagnostics = options.onHostDiagnostic;
+	const now = options.now ?? Date.now;
+	const schedule =
+		options.schedule ??
+		((callback, milliseconds) => setTimeout(callback, milliseconds));
+	const cancelSchedule =
+		options.cancelSchedule ?? ((timer) => clearTimeout(timer));
+	/** Restarts pending per extension, so a supervisor never queues two. */
+	const restarts = new Map<string, ReturnType<typeof setTimeout>>();
+	let stopped = false;
+	const recordSupervision = (
+		extensionId: string,
+		transition: ExtensionHostTransition,
+		detail: { consecutiveFailures?: number; restartAt?: number } = {},
+	): void => {
+		try {
+			diagnostics?.({ extensionId, transition, at: now(), ...detail });
+		} catch {
+			/* a diagnostic sink must never change extension lifecycle */
+		}
+	};
+	const hosts = new ExtensionHostManager({
+		broker,
+		...(diagnostics === undefined ? {} : { onDiagnostic: diagnostics }),
+		onStateChange: (status) => superviseRestart(status),
+		...(options.childEntrypoint === undefined
+			? {}
+			: { childEntrypoint: options.childEntrypoint }),
+		...(options.secrets === undefined ? {} : { secrets: options.secrets }),
+		...(options.agents === undefined ? {} : { agents: options.agents }),
+		...(options.worktrees === undefined
+			? {}
+			: { worktrees: options.worktrees }),
+		...(options.vault === undefined ? {} : { vault: options.vault.vault }),
+	});
+	const npm = new NpmCliRegistryClient({
+		workRoot: join(options.dataRoot, 'extensions', 'cache', 'npm'),
+	});
+	let activateReconciled:
+		| ((
+				before: ExtensionRegistrySnapshot,
+				after: ExtensionRegistrySnapshot,
+		  ) => Promise<void>)
+		| undefined;
+	const installer = new ExtensionInstaller({
+		dataRoot: options.dataRoot,
+		registryClient: npm,
+		materializer: npm,
+		...(options.builtIns === undefined
+			? options.builtInArtifactRoot === undefined
+				? {}
+				: {
+						builtIns: new DirectoryBuiltInExtensionArtifactSource(
+							options.builtInArtifactRoot,
+						),
+					}
+			: { builtIns: options.builtIns }),
+		onBuiltInsReconciled: async (before, after) =>
+			activateReconciled?.(before, after),
+		...(options.onBuiltInWithdrawn === undefined
+			? {}
+			: { onBuiltInWithdrawn: options.onBuiltInWithdrawn }),
+		probe: async ({ extensionId, packageRoot, entrypoint, manifest }) => {
+			const root = join(options.dataRoot, 'extensions');
+			const directories = {
+				config: join(root, 'config', extensionId),
+				data: join(root, 'data', extensionId),
+				cache: join(root, 'cache', extensionId),
+			};
+			await Promise.all(
+				Object.values(directories).map((directory) =>
+					mkdir(directory, { recursive: true }),
+				),
+			);
+			if (
+				'registerManifest' in broker &&
+				typeof broker.registerManifest === 'function'
+			)
+				broker.registerManifest(manifest);
+			await hosts.start({
+				extensionId,
+				packageRoot,
+				entrypoint,
+				configDirectory: directories.config,
+				dataDirectory: directories.data,
+				cacheDirectory: directories.cache,
+				permissions: manifest.permissions,
+				agentSessionSources: manifest.contributes.agentSessionSources ?? [],
+				mcpInstallTargets: manifest.contributes.mcpInstallTargets ?? [],
+				languageServers: manifest.contributes.languageServers ?? [],
+				worktreeInsights: manifest.contributes.worktreeInsights ?? [],
+				agentChatProviders: manifest.contributes.agentChatProviders ?? [],
+				terminalLaunchers: manifest.contributes.terminalLaunchers ?? [],
+				extensionDependencies: manifest.extensionDependencies ?? [],
+			});
+			await hosts.stop(extensionId);
+		},
+	});
+	const activate = async (extensionId: string): Promise<void> => {
+		const descriptor = await installer.launchDescriptor(extensionId);
+		const root = join(options.dataRoot, 'extensions');
+		const directories = {
+			config: join(root, 'config', extensionId),
+			data: join(root, 'data', extensionId),
+			cache: join(root, 'cache', extensionId),
+		};
+		await Promise.all(
+			Object.values(directories).map((directory) =>
+				mkdir(directory, { recursive: true }),
+			),
+		);
+		if (
+			'registerManifest' in broker &&
+			typeof broker.registerManifest === 'function'
+		)
+			broker.registerManifest(descriptor.manifest);
+		await hosts.stop(extensionId);
+		await hosts.start({
+			...descriptor,
+			configDirectory: directories.config,
+			dataDirectory: directories.data,
+			cacheDirectory: directories.cache,
+			permissions: descriptor.manifest.permissions,
+			agentSessionSources: descriptor.agentSessionSources,
+			mcpInstallTargets: descriptor.mcpInstallTargets,
+			languageServers: descriptor.languageServers,
+			worktreeInsights: descriptor.worktreeInsights,
+			agentChatProviders: descriptor.agentChatProviders,
+			terminalLaunchers: descriptor.terminalLaunchers,
+			extensionDependencies: descriptor.manifest.extensionDependencies ?? [],
+		});
+	};
+	const recordActivationFailure = async (
+		extensionId: string,
+		error: unknown,
+	): Promise<void> => {
+		await installer.setFailureState(
+			extensionId,
+			'failed',
+			error instanceof Error ? error.message : 'extension activation failed',
+		);
+	};
+	/**
+	 * Activate several extensions at once.
+	 *
+	 * Each host is its own child process, so one waiting on another bought
+	 * nothing but time: a fresh profile launched its built-ins one after
+	 * another on the way to the first window. An extension still starts only
+	 * once those it declares a dependency on have settled, and each failure is
+	 * recorded against its own extension without holding up the others.
+	 */
+	const activateTogether = async (
+		extensionIds: readonly string[],
+	): Promise<void> => {
+		const dependencies = new Map(
+			await Promise.all(
+				extensionIds.map(
+					async (extensionId) =>
+						[
+							extensionId,
+							await installer
+								.launchDescriptor(extensionId)
+								.then(({ manifest }) =>
+									(manifest.extensionDependencies ?? []).map(
+										(dependency) => dependency.extensionId,
+									),
+								)
+								// `activate` reads the same descriptor and reports why
+								// it is unusable; it need not be reported twice.
+								.catch(() => []),
+						] as const,
+				),
+			),
+		);
+		let remaining = [...extensionIds];
+		while (remaining.length > 0) {
+			const waiting = new Set(remaining);
+			const ready = remaining.filter((extensionId) =>
+				(dependencies.get(extensionId) ?? []).every(
+					(dependency) =>
+						dependency === extensionId || !waiting.has(dependency),
+				),
+			);
+			// A dependency cycle cannot be ordered; its members start together.
+			const wave = ready.length > 0 ? ready : remaining;
+			await Promise.all(
+				wave.map((extensionId) =>
+					activate(extensionId).catch((error: unknown) =>
+						recordActivationFailure(extensionId, error),
+					),
+				),
+			);
+			remaining = remaining.filter(
+				(extensionId) => !wave.includes(extensionId),
+			);
+		}
+	};
+	const activateEnabled = async (): Promise<void> => {
+		await activateTogether(
+			(await installer.enabledExtensionIds()).filter(
+				(extensionId) =>
+					hosts.statuses().find((status) => status.extensionId === extensionId)
+						?.state !== 'running' &&
+					// A host that reconciliation started and that has already crashed
+					// is the supervisor's to bring back, on the backoff the host
+					// chose. Activating it here as well would restart it twice and
+					// skip the wait.
+					!restarts.has(extensionId),
+			),
+		);
+	};
+	activateReconciled = async (before, reconciled): Promise<void> => {
+		await activateTogether(
+			Object.values(reconciled.extensions)
+				.filter((record) =>
+					shouldActivateAfterReconciliation(
+						before.extensions[record.extensionId],
+						record,
+						hosts,
+					),
+				)
+				.map((record) => record.extensionId),
+		);
+	};
+	/**
+	 * Bring a failed host back on its own.
+	 *
+	 * `ExtensionHost` already decides when a failure is worth retrying and how
+	 * long to wait; without something acting on that decision an extension that
+	 * dies mid-session stays dead until the application restarts, and its
+	 * terminals silently lose agent observation. Restarting through `activate`
+	 * rather than `host.start` is what re-publishes contributions, which is what
+	 * lets an already-running CLI be observed again.
+	 *
+	 * Quarantine is the deliberate end of the line: it exists to stop a crash
+	 * loop, so only an explicit restart clears it.
+	 */
+	const superviseRestart = (status: ExtensionHostStatus): void => {
+		const extensionId = status.extensionId;
+		if (status.state !== 'failed' || status.restartAt === undefined) {
+			const pending = restarts.get(extensionId);
+			if (pending !== undefined && status.state !== 'failed') {
+				cancelSchedule(pending);
+				restarts.delete(extensionId);
+			}
+			return;
+		}
+		if (stopped || restarts.has(extensionId)) return;
+		const delay = Math.max(0, status.restartAt - now());
+		restarts.set(
+			extensionId,
+			// The callback returns its work so an injected schedule can await the
+			// restart; a real timer simply ignores the promise.
+			schedule(async () => {
+				restarts.delete(extensionId);
+				if (stopped) return;
+				const current = hosts
+					.statuses()
+					.find((candidate) => candidate.extensionId === extensionId);
+				if (current?.state !== 'failed') return;
+				recordSupervision(extensionId, 'restart-attempted', {
+					consecutiveFailures: current.consecutiveCrashes,
+				});
+				try {
+					await activate(extensionId);
+				} catch (error) {
+					// A restart that cannot even start is itself a failure the host
+					// counts, so quarantine still bounds the loop.
+					await installer
+						.setFailureState(
+							extensionId,
+							'failed',
+							error instanceof Error
+								? error.message
+								: 'extension restart failed',
+						)
+						.catch(() => undefined);
+				}
+			}, delay),
+		);
+	};
+
+	/** Stop supervising, so no restart can fire after shutdown. */
+	const stopSupervision = (): void => {
+		stopped = true;
+		for (const timer of restarts.values()) cancelSchedule(timer);
+		restarts.clear();
+	};
+
+	/**
+	 * The deliberate restart: it is the only thing that clears quarantine, and
+	 * it resets the crash window with it.
+	 */
+	const restart = async (extensionId: string): Promise<void> => {
+		const pending = restarts.get(extensionId);
+		if (pending !== undefined) {
+			cancelSchedule(pending);
+			restarts.delete(extensionId);
+		}
+		await hosts.stop(extensionId).catch(() => undefined);
+		hosts.clearQuarantine(extensionId);
+		await activate(extensionId);
+	};
+
+	const reconcileBuiltIns = (
+		signal?: AbortSignal,
+	): Promise<ExtensionRegistrySnapshot> => installer.reconcileBuiltIns(signal);
+	const initialize = async (): Promise<ExtensionRegistrySnapshot> => {
+		await installer.initialize();
+		await activateEnabled();
+		return installer.snapshot();
+	};
+	return {
+		installer,
+		hosts,
+		authorityLabel: options.authorityLabel,
+		activate,
+		activateEnabled,
+		initialize,
+		reconcileBuiltIns,
+		restart,
+		stopSupervision,
+	};
+}
+
+/** A newly selected active slot, or an enabled slot without a running host,
+ * must be activated before the management surface can call it installed. */
+function shouldActivateAfterReconciliation(
+	previous: import('./installerTypes.js').InstalledExtensionRecord | undefined,
+	next: import('./installerTypes.js').InstalledExtensionRecord,
+	hosts: ExtensionHostManager,
+): boolean {
+	if (
+		!next.enabled ||
+		next.activeSlotId === undefined ||
+		next.state === 'failed' ||
+		next.state === 'incompatible' ||
+		next.state === 'quarantined'
+	)
+		return false;
+	if (previous?.activeSlotId !== next.activeSlotId || previous.enabled !== true)
+		return true;
+	return (
+		hosts.statuses().find((status) => status.extensionId === next.extensionId)
+			?.state !== 'running'
+	);
+}
+
+/** Production composition for ordinary public extensions. This layer holds no
+ * extension identities or operation knowledge of its own. */
+export function createProductionExtensionManagement(
+	options: Readonly<{
+		dataRoot: string;
+		authorityLabel: string;
+		childEntrypoint?: string;
+		vault: ServerVaultComposition;
+		agents?: ExtensionAgentBroker;
+		worktrees?: ExtensionWorktreeBroker;
+		builtInArtifactRoot?: string;
+		onHostDiagnostic?: ExtensionHostDiagnosticListener;
+		onBuiltInWithdrawn?: ExtensionInstallerOptions['onBuiltInWithdrawn'];
+	}>,
+) {
+	const management = createDefaultExtensionManagement({
+		dataRoot: options.dataRoot,
+		authorityLabel: options.authorityLabel,
+		secrets: options.vault.extensionSecrets,
+		vault: options.vault,
+		...(options.childEntrypoint === undefined
+			? {}
+			: { childEntrypoint: options.childEntrypoint }),
+		...(options.agents === undefined ? {} : { agents: options.agents }),
+		...(options.worktrees === undefined
+			? {}
+			: { worktrees: options.worktrees }),
+		...(options.builtInArtifactRoot === undefined
+			? {}
+			: { builtInArtifactRoot: options.builtInArtifactRoot }),
+		...(options.onHostDiagnostic === undefined
+			? {}
+			: { onHostDiagnostic: options.onHostDiagnostic }),
+		...(options.onBuiltInWithdrawn === undefined
+			? {}
+			: { onBuiltInWithdrawn: options.onBuiltInWithdrawn }),
+	});
+	return Object.freeze({
+		...management,
+		vault: options.vault,
+	});
+}

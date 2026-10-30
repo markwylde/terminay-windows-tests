@@ -1,0 +1,451 @@
+import {
+	createTerminalSignalParser,
+	type TerminalSignalParser,
+} from './parser.js';
+import { TerminalActivityReducer } from './reducer.js';
+import type {
+	ActivityEvent,
+	ActivityListener,
+	ActivityReplay,
+	ActivitySnapshot,
+	ProviderActivityUpdate,
+	TerminalActivitySessionSnapshot,
+	TerminalActivitySignal,
+} from './types.js';
+
+export interface ActivitySessionIdentity {
+	readonly serverId: string;
+	readonly projectId: string;
+	readonly sessionId: string;
+}
+
+export interface TerminalActivityServiceOptions {
+	readonly serverId: string;
+	readonly now?: () => number;
+	readonly maxSessions?: number;
+	readonly parser?: { readonly maxPayloadBytes?: number };
+	readonly reducer?: ConstructorParameters<typeof TerminalActivityReducer>[0];
+	readonly setTimeout?: (handler: () => void, milliseconds: number) => unknown;
+	readonly clearTimeout?: (handle: unknown) => void;
+}
+
+/** Receives each `OSC 0` / `OSC 2` title a session's output carries, raw. */
+export type ProgramTitleListener = (
+	identity: ActivitySessionIdentity,
+	title: string,
+) => void;
+
+/** Told when a user viewed, clicked into, or typed in a terminal. */
+export type TerminalInteractionListener = (
+	identity: ActivitySessionIdentity,
+) => void;
+
+export class TerminalActivityServiceError extends Error {
+	readonly code:
+		| 'invalid_identity'
+		| 'session_not_found'
+		| 'session_exited'
+		| 'project_mismatch'
+		| 'server_mismatch'
+		| 'session_limit';
+
+	constructor(code: TerminalActivityServiceError['code'], message: string) {
+		super(message);
+		this.name = 'TerminalActivityServiceError';
+		this.code = code;
+	}
+}
+
+interface SessionState {
+	/** Follows the terminal when its panel moves to another project. */
+	projectId: string;
+	readonly parser: TerminalSignalParser;
+	exited: boolean;
+}
+
+/**
+ * Server-owned activity boundary. PTY bytes enter here before any client is
+ * involved; the original bytes are never rewritten, while parsed signals and
+ * fallback evidence feed one ordered reducer. Every operation is checked
+ * against the immutable server/project/session identity.
+ */
+export class TerminalActivityService {
+	private readonly now: () => number;
+	private readonly maxSessions: number;
+	private readonly sessions = new Map<string, SessionState>();
+	private readonly reducer: TerminalActivityReducer;
+	private readonly scheduleTimeout: (
+		handler: () => void,
+		milliseconds: number,
+	) => unknown;
+	private readonly cancelTimeout: (handle: unknown) => void;
+	private deadlineTimer: unknown;
+	private deadlineAt: number | null = null;
+	private stopped = false;
+	private programTitleListener: ProgramTitleListener | undefined;
+	private readonly interactionListeners = new Set<TerminalInteractionListener>();
+
+	constructor(private readonly options: TerminalActivityServiceOptions) {
+		assertId(options.serverId, 'server id');
+		this.now = options.now ?? (() => Date.now());
+		this.maxSessions = positive(options.maxSessions ?? 4096, 'maxSessions');
+		this.scheduleTimeout =
+			options.setTimeout ??
+			((handler, milliseconds) => {
+				const timer = setTimeout(handler, milliseconds);
+				timer.unref?.();
+				return timer;
+			});
+		this.cancelTimeout =
+			options.clearTimeout ??
+			((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
+		this.reducer = new TerminalActivityReducer({
+			...options.reducer,
+			now: this.now,
+		});
+	}
+
+	/** A title is not activity and never reaches the reducer. Composition binds
+	 * the one consumer once the workspace exists. */
+	setProgramTitleListener(listener: ProgramTitleListener | undefined): void {
+		this.programTitleListener = listener;
+	}
+
+	/**
+	 * Observe user interaction with a terminal: typing, and acknowledgement by
+	 * any client. It is reported even when the reducer had nothing to clear, so
+	 * an observer need not infer interaction from an activity transition.
+	 */
+	onInteraction(listener: TerminalInteractionListener): () => void {
+		if (typeof listener !== 'function')
+			throw new TypeError('interaction listener must be a function');
+		this.interactionListeners.add(listener);
+		return () => {
+			this.interactionListeners.delete(listener);
+		};
+	}
+
+	get serverId(): string {
+		return this.options.serverId;
+	}
+	get revision(): number {
+		return this.reducer.revision;
+	}
+
+	register(identity: ActivitySessionIdentity): TerminalActivitySessionSnapshot {
+		const state = this.assertIdentity(identity, false);
+		if (state !== undefined) return this.requireSnapshot(identity.sessionId);
+		if (this.sessions.size >= this.maxSessions) {
+			throw new TerminalActivityServiceError(
+				'session_limit',
+				'activity session limit reached',
+			);
+		}
+		this.sessions.set(identity.sessionId, {
+			projectId: identity.projectId,
+			parser: createTerminalSignalParser(this.options.parser),
+			exited: false,
+		});
+		return (
+			this.reducer.register(
+				identity.sessionId,
+				identity.projectId,
+				this.now(),
+			) ?? this.requireSnapshot(identity.sessionId)
+		);
+	}
+
+	ingestPtyOutput(
+		identity: ActivitySessionIdentity,
+		bytes: string | Uint8Array,
+	): readonly ActivityEvent[] {
+		const state = this.requireActive(identity);
+		const signals = state.parser.push(bytes);
+		const events: ActivityEvent[] = [];
+		for (const signal of signals) {
+			if (signal.kind === 'title') {
+				this.programTitleListener?.(identity, signal.title);
+				continue;
+			}
+			const event = this.reducer.applySignal(identity.sessionId, signal, {
+				projectId: identity.projectId,
+				now: this.now(),
+			});
+			if (event) events.push(event);
+		}
+		const fallback = this.reducer.applyRawOutput(identity.sessionId, {
+			projectId: identity.projectId,
+			now: this.now(),
+		});
+		if (fallback) events.push(fallback);
+		this.reconcileDeadline();
+		return Object.freeze(events);
+	}
+
+	ingestSignal(
+		identity: ActivitySessionIdentity,
+		signal: TerminalActivitySignal,
+	): ActivityEvent | undefined {
+		this.requireActive(identity);
+		const event = this.reducer.applySignal(identity.sessionId, signal, {
+			projectId: identity.projectId,
+			now: this.now(),
+		});
+		this.reconcileDeadline();
+		if (signal.kind === 'userInput') this.notifyInteraction(identity);
+		return event;
+	}
+
+	ingestProvider(
+		identity: ActivitySessionIdentity,
+		update: ProviderActivityUpdate,
+	): ActivityEvent | undefined {
+		this.requireActive(identity);
+		const event = this.reducer.applyProviderActivity(
+			identity.sessionId,
+			update,
+			{ projectId: identity.projectId, now: this.now() },
+		);
+		this.reconcileDeadline();
+		return event;
+	}
+
+	/**
+	 * Acknowledge a terminal's activity. A passive acknowledgement is a client
+	 * judging that activity was not news to a user who did nothing; it clears
+	 * the activity and is not reported as interaction, so what a process sent
+	 * to the terminal stays.
+	 */
+	acknowledge(
+		identity: ActivitySessionIdentity,
+		expectedUpdatedAt?: number,
+		options: { readonly passive?: boolean } = {},
+	): ActivityEvent | undefined {
+		this.requireActive(identity);
+		if (
+			expectedUpdatedAt !== undefined &&
+			this.reducer.get(identity.sessionId)?.updatedAt !== expectedUpdatedAt
+		)
+			return undefined;
+		const event = this.reducer.acknowledge(identity.sessionId, {
+			projectId: identity.projectId,
+			now: this.now(),
+		});
+		if (options.passive !== true) this.notifyInteraction(identity);
+		return event;
+	}
+
+	markExited(identity: ActivitySessionIdentity): ActivityEvent | undefined {
+		const state = this.requireIdentity(identity);
+		if (state.exited) return undefined;
+		state.exited = true;
+		state.parser.reset();
+		const event = this.reducer.markTerminalExit(identity.sessionId, {
+			now: this.now(),
+		});
+		this.reconcileDeadline();
+		return event;
+	}
+
+	get(
+		identity: ActivitySessionIdentity,
+	): TerminalActivitySessionSnapshot | undefined {
+		this.requireIdentity(identity);
+		return this.reducer.get(identity.sessionId);
+	}
+
+	snapshot(): ActivitySnapshot {
+		return this.reducer.snapshot();
+	}
+	replay(afterRevision = 0): ActivityReplay {
+		return this.reducer.replay(afterRevision);
+	}
+	snapshotForProject(projectId: string | undefined): ActivitySnapshot {
+		return filterActivitySnapshot(this.snapshot(), projectId);
+	}
+	replayForProject(
+		afterRevision = 0,
+		projectId: string | undefined,
+	): ActivityReplay {
+		const replay = this.replay(afterRevision);
+		if (projectId === undefined) return replay;
+		if (replay.kind === 'resync') {
+			return {
+				kind: 'resync',
+				events: [],
+				snapshot: filterActivitySnapshot(
+					replay.snapshot ?? this.snapshot(),
+					projectId,
+				),
+			};
+		}
+		return {
+			kind: 'events',
+			events: replay.events.filter(
+				(event) =>
+					event.snapshot?.projectId === projectId ||
+					this.projectIdForSession(event.sessionId) === projectId,
+			),
+		};
+	}
+	/**
+	 * Follow a terminal to the project its panel was moved to. Identities
+	 * naming the project it left are refused from here on.
+	 */
+	rehomeSession(
+		sessionId: string,
+		projectId: string,
+	): ActivityEvent | undefined {
+		assertId(sessionId, 'session id');
+		assertId(projectId, 'project id');
+		const state = this.sessions.get(sessionId);
+		if (state === undefined || state.projectId === projectId) return undefined;
+		state.projectId = projectId;
+		const event = this.reducer.rehome(sessionId, projectId, this.now());
+		this.reconcileDeadline();
+		return event;
+	}
+
+	projectIdForSession(sessionId: string): string | undefined {
+		return this.sessions.get(sessionId)?.projectId;
+	}
+	tick(at = this.now()): readonly ActivityEvent[] {
+		const events = this.reducer.tick(at);
+		this.reconcileDeadline();
+		return events;
+	}
+	subscribe(listener: ActivityListener): () => void {
+		return this.reducer.subscribe(listener);
+	}
+
+	shutdown(): void {
+		if (this.stopped) return;
+		this.stopped = true;
+		if (this.deadlineTimer !== undefined)
+			this.cancelTimeout(this.deadlineTimer);
+		this.deadlineTimer = undefined;
+		this.deadlineAt = null;
+	}
+
+	private notifyInteraction(identity: ActivitySessionIdentity): void {
+		for (const listener of [...this.interactionListeners]) {
+			try {
+				listener(identity);
+			} catch {
+				/* an observer cannot block acknowledgement */
+			}
+		}
+	}
+
+	private reconcileDeadline(): void {
+		if (this.stopped) return;
+		const next = this.reducer.nextDeadline();
+		if (next === this.deadlineAt) return;
+		if (this.deadlineTimer !== undefined)
+			this.cancelTimeout(this.deadlineTimer);
+		this.deadlineTimer = undefined;
+		this.deadlineAt = next;
+		if (next === null) return;
+		this.deadlineTimer = this.scheduleTimeout(
+			() => {
+				this.deadlineTimer = undefined;
+				this.deadlineAt = null;
+				if (this.stopped) return;
+				this.reducer.tick(this.now());
+				this.reconcileDeadline();
+			},
+			Math.max(0, next - this.now()),
+		);
+	}
+
+	private requireActive(identity: ActivitySessionIdentity): SessionState {
+		const state = this.requireIdentity(identity);
+		if (state.exited)
+			throw new TerminalActivityServiceError(
+				'session_exited',
+				'terminal activity session has exited',
+			);
+		return state;
+	}
+
+	private requireIdentity(identity: ActivitySessionIdentity): SessionState {
+		const state = this.assertIdentity(identity, true);
+		if (state === undefined)
+			throw new TerminalActivityServiceError(
+				'session_not_found',
+				'terminal activity session was not registered',
+			);
+		return state;
+	}
+
+	private assertIdentity(
+		identity: ActivitySessionIdentity,
+		requireExisting: boolean,
+	): SessionState | undefined {
+		if (!identity || typeof identity !== 'object')
+			throw new TerminalActivityServiceError(
+				'invalid_identity',
+				'activity identity is required',
+			);
+		if (identity.serverId !== this.options.serverId)
+			throw new TerminalActivityServiceError(
+				'server_mismatch',
+				'activity identity belongs to another server',
+			);
+		assertId(identity.projectId, 'project id');
+		assertId(identity.sessionId, 'session id');
+		const state = this.sessions.get(identity.sessionId);
+		if (state !== undefined && state.projectId !== identity.projectId)
+			throw new TerminalActivityServiceError(
+				'project_mismatch',
+				'activity identity belongs to another project',
+			);
+		if (requireExisting && state === undefined)
+			throw new TerminalActivityServiceError(
+				'session_not_found',
+				'terminal activity session was not registered',
+			);
+		return state;
+	}
+
+	private requireSnapshot(sessionId: string): TerminalActivitySessionSnapshot {
+		const snapshot = this.reducer.get(sessionId);
+		if (snapshot === undefined)
+			throw new TerminalActivityServiceError(
+				'session_not_found',
+				'terminal activity snapshot is unavailable',
+			);
+		return snapshot;
+	}
+}
+
+function filterActivitySnapshot(
+	snapshot: ActivitySnapshot,
+	projectId: string | undefined,
+): ActivitySnapshot {
+	if (projectId === undefined) return snapshot;
+	const sessions = Object.fromEntries(
+		Object.entries(snapshot.sessions).filter(
+			([, session]) => session.projectId === projectId,
+		),
+	);
+	return Object.freeze({ ...snapshot, sessions: Object.freeze(sessions) });
+}
+
+function assertId(value: string, name: string): void {
+	if (
+		typeof value !== 'string' ||
+		!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(value)
+	) {
+		throw new TerminalActivityServiceError(
+			'invalid_identity',
+			`${name} is invalid`,
+		);
+	}
+}
+
+function positive(value: number, name: string): number {
+	if (!Number.isSafeInteger(value) || value <= 0)
+		throw new RangeError(`${name} must be a positive integer`);
+	return value;
+}

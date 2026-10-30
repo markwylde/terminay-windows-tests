@@ -1,0 +1,338 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { createTerminalActivityReducer } from "../dist/activity/index.js";
+
+test("structured signals reduce to ordered revisions and progress expires", () => {
+  const reducer = createTerminalActivityReducer({ progressStaleMs: 10, now: () => 0 });
+  const working = reducer.applySignal("session-a", { kind: "progress", state: 3 }, { projectId: "project-a", now: 0 });
+  assert.equal(working.revision, 1);
+  assert.equal(working.snapshot.status, "working");
+  assert.equal(working.snapshot.claimed, true);
+  assert.equal(reducer.snapshot().sessions["session-a"].projectId, "project-a");
+  const expired = reducer.tick(10);
+  assert.equal(expired.length, 1);
+  assert.equal(expired[0].revision, 2);
+  assert.equal(reducer.snapshot().sessions["session-a"].status, "idle");
+});
+
+test("an isolated OSC progress completion claims canonical idle against raw fallback", () => {
+  const reducer = createTerminalActivityReducer({ now: () => 0 });
+  const completion = reducer.applySignal("session-a", { kind: "progress", state: 0 }, {
+    projectId: "project-a",
+    now: 1,
+  });
+  assert.equal(completion.snapshot.status, "idle");
+  assert.equal(completion.snapshot.claimed, true);
+  assert.equal(completion.snapshot.authority, "structured");
+  assert.equal(completion.snapshot.source, "structured:progress");
+  assert.equal(reducer.applyRawOutput("session-a", { projectId: "project-a", now: 1 }), undefined);
+  assert.equal(reducer.snapshot().sessions["session-a"].status, "idle");
+});
+
+test("provider activity has precedence over structured and raw fallback", () => {
+  const reducer = createTerminalActivityReducer({ now: () => 0 });
+  const provider = reducer.applyProviderActivity("session-a", {
+    provider: "codex",
+    state: "waiting",
+    sequence: 4,
+    agentId: "root",
+  }, { now: 1 });
+  assert.equal(provider.snapshot.authority, "provider");
+  assert.equal(provider.snapshot.providerState, "waiting");
+  assert.equal(provider.snapshot.attention, true);
+
+  // Fallback signals are observed but cannot overwrite provider state/revision.
+  assert.equal(reducer.applySignal("session-a", { kind: "progress", state: 3 }, { now: 2 }), undefined);
+  assert.equal(reducer.applyRawOutput("session-a", { now: 3 }), undefined);
+  assert.equal(reducer.snapshot().sessions["session-a"].providerState, "waiting");
+  assert.deepEqual(reducer.tick(60_000), []);
+  assert.equal(reducer.snapshot().sessions["session-a"].providerState, "waiting");
+  assert.equal(reducer.snapshot().sessions["session-a"].status, "idle");
+
+  // Close protection remains tied to the real PTY foreground process even
+  // when provider state owns presentation activity.
+  const foreground = reducer.applySignal("session-a", { kind: "foreground", busy: true, processName: "codex" }, { now: 4 });
+  assert.equal(foreground.snapshot.providerState, "waiting");
+  assert.equal(foreground.snapshot.foregroundBusy, true);
+  const shell = reducer.applySignal("session-a", { kind: "foreground", busy: false, processName: "zsh" }, { now: 5 });
+  assert.equal(shell.snapshot.foregroundBusy, false);
+  assert.equal(shell.snapshot.foregroundObservation, "available");
+
+  const limited = reducer.applySignal("session-a", { kind: "foreground", observation: "limited" }, { now: 5.5 });
+  assert.equal(limited.snapshot.foregroundBusy, false);
+  assert.equal(limited.snapshot.foregroundObservation, "limited");
+
+  // Reordered and cross-run updates are fenced.
+  assert.equal(reducer.applyProviderActivity("session-a", { provider: "codex", state: "working", sequence: 3 }, { now: 6 }), undefined);
+  assert.equal(reducer.applyProviderActivity("session-a", { provider: "codex", state: "working", sequence: 5, agentId: "other" }, { now: 7 }), undefined);
+});
+
+test("a new chat in the same terminal is heard once the previous one has finished", () => {
+  const reducer = createTerminalActivityReducer({ now: () => 0 });
+  const apply = (state, sequence, agentId, provider = "claude") =>
+    reducer.applyProviderActivity("session-a", { provider, state, sequence, agentId }, { projectId: "project-a", now: sequence });
+
+  apply("working", 1, "chat-a");
+  // While the first chat is at work, another agent cannot take its terminal.
+  assert.equal(apply("working", 2, "chat-b"), undefined);
+  assert.equal(apply("done", 3, "chat-a").snapshot.providerState, "done");
+
+  // It has finished: the next chat's turn is the terminal's activity.
+  const working = apply("working", 4, "chat-b");
+  assert.equal(working.snapshot.status, "working");
+  assert.equal(working.snapshot.agentId, "chat-b");
+  const done = apply("done", 5, "chat-b");
+  assert.equal(done.snapshot.providerState, "done");
+  assert.equal(done.snapshot.acknowledged, false);
+  // The chat that left is fenced again while its successor holds the terminal.
+  apply("working", 6, "chat-b");
+  assert.equal(apply("done", 7, "chat-a"), undefined);
+
+  // A different harness takes an idle terminal the same way.
+  apply("idle", 8, "chat-b");
+  const other = apply("working", 9, "run-1", "codex");
+  assert.equal(other.snapshot.provider, "codex");
+  assert.equal(other.snapshot.status, "working");
+});
+
+test("terminal exit removes only its session and fences stale updates", () => {
+  const reducer = createTerminalActivityReducer({ now: () => 0 });
+  reducer.applySignal("session-a", { kind: "command", phase: "executing" }, { projectId: "project-a", now: 1 });
+  reducer.applySignal("session-b", { kind: "bell" }, { projectId: "project-b", now: 2 });
+  const removed = reducer.markTerminalExit("session-a", { now: 3 });
+  assert.equal(removed.type, "activity.removed");
+  assert.deepEqual(Object.keys(reducer.snapshot().sessions), ["session-b"]);
+  assert.equal(reducer.applyProviderActivity("session-a", { provider: "codex", state: "working" }, { now: 4 }), undefined);
+  assert.equal(reducer.snapshot().sessions["session-a"], undefined);
+  const replay = reducer.replay(0);
+  assert.equal(replay.kind, "events");
+  assert.deepEqual(replay.events.map((event) => event.revision), [1, 2, 3]);
+});
+
+test("activity events are monotonic and cannot cross the immutable project binding", () => {
+  const reducer = createTerminalActivityReducer({ now: () => 0 });
+  const first = reducer.applySignal("session-a", { kind: "command", phase: "executing" }, {
+    projectId: "project-a",
+    now: 20,
+  });
+  assert.equal(first.revision, 1);
+
+  // A delayed PTY/fallback event must not rewind the canonical timestamp or
+  // create a second revision after a newer event has already been committed.
+  assert.equal(reducer.applyRawOutput("session-a", { projectId: "project-a", now: 19 }), undefined);
+  assert.equal(reducer.tick(19).length, 0);
+  assert.equal(reducer.snapshot().revision, 1);
+  assert.equal(reducer.snapshot().sessions["session-a"].updatedAt, 20);
+
+  // A caller with a copied session id cannot retarget activity to another
+  // project. The rejected update must leave both state and revision intact.
+  assert.equal(reducer.applySignal("session-a", { kind: "bell" }, { projectId: "project-b", now: 21 }), undefined);
+  assert.equal(reducer.markViewed("session-a", { projectId: "project-b", now: 22 }), undefined);
+  assert.equal(reducer.snapshot().sessions["session-a"].projectId, "project-a");
+  assert.equal(reducer.snapshot().revision, 1);
+});
+
+test("project-scoped terminal exit cannot fence or remove another project", () => {
+  const reducer = createTerminalActivityReducer({ now: () => 0 });
+  reducer.register("session-a", "project-a", 1);
+  assert.equal(reducer.markTerminalExit("session-a", { projectId: "project-b", now: 2 }), undefined);
+  assert.equal(reducer.snapshot().sessions["session-a"].projectId, "project-a");
+  assert.equal(reducer.markTerminalExit("session-a", { projectId: "project-a", now: 3 }).type, "activity.removed");
+  assert.equal(reducer.applySignal("session-a", { kind: "bell" }, { projectId: "project-a", now: 4 }), undefined);
+});
+
+test("provider hooks reject delayed and unsequenced updates after a claim", () => {
+  const reducer = createTerminalActivityReducer({ now: () => 0 });
+  const first = reducer.applyProviderActivity("session-a", {
+    provider: "codex",
+    state: "working",
+    sequence: 10,
+    agentId: "agent-a",
+  }, { projectId: "project-a", now: 20 });
+  assert.equal(first.revision, 1);
+  assert.equal(reducer.applyProviderActivity("session-a", {
+    provider: "codex",
+    state: "waiting",
+    sequence: 11,
+    agentId: "agent-a",
+  }, { projectId: "project-a", now: 19 }), undefined);
+  assert.equal(reducer.applyProviderActivity("session-a", {
+    provider: "codex",
+    state: "waiting",
+    agentId: "agent-a",
+  }, { projectId: "project-a", now: 21 }), undefined);
+  assert.equal(reducer.snapshot().sessions["session-a"].providerState, "working");
+  assert.equal(reducer.snapshot().revision, 1);
+});
+
+test("bounded replay returns a complete snapshot when the delta is too old", () => {
+  const reducer = createTerminalActivityReducer({ maxEvents: 2, now: () => 0 });
+  reducer.applyRawOutput("a", { now: 1 });
+  reducer.applyRawOutput("b", { now: 2 });
+  reducer.applyRawOutput("c", { now: 3 });
+  const replay = reducer.replay(0);
+  assert.equal(replay.kind, "resync");
+  assert.equal(replay.snapshot.revision, reducer.revision);
+  assert.deepEqual(Object.keys(replay.snapshot.sessions), ["a", "b", "c"]);
+});
+
+test("raw PTY throughput refreshes expiry without publishing timestamp-only transitions", () => {
+  const reducer = createTerminalActivityReducer({ rawActivityMs: 10, now: () => 0 });
+  const first = reducer.applyRawOutput("session-a", { projectId: "project-a", now: 1 });
+  assert.equal(first.revision, 1);
+  assert.equal(first.snapshot.status, "working");
+  for (let now = 2; now <= 2_000; now += 1) {
+    assert.equal(reducer.applyRawOutput("session-a", { projectId: "project-a", now }), undefined);
+  }
+  assert.equal(reducer.revision, 1);
+  assert.equal(reducer.get("session-a").updatedAt, 1);
+  assert.deepEqual(reducer.tick(2_009), []);
+  const idle = reducer.tick(2_010);
+  assert.equal(idle.length, 1);
+  assert.equal(idle[0].revision, 2);
+  assert.equal(idle[0].snapshot.status, "idle");
+  assert.equal(idle[0].snapshot.updatedAt, 2_010);
+});
+
+test("shell start-up noise never reads as finished before the session settles", () => {
+  const reducer = createTerminalActivityReducer({ rawActivityMs: 10, now: () => 0 });
+  reducer.register("session-a", "project-a", 0);
+
+  // rc files spawn children, the prompt paints late: all before any input.
+  const busy = reducer.applySignal("session-a", { kind: "foreground", busy: true, processName: "node" }, { now: 1 });
+  assert.equal(busy.snapshot.foregroundBusy, true);
+  const idle = reducer.applySignal("session-a", { kind: "foreground", busy: false, processName: "zsh" }, { now: 2 });
+  assert.equal(idle.snapshot.acknowledged, true);
+  const prompt = reducer.applyRawOutput("session-a", { now: 30 });
+  assert.equal(prompt.snapshot.status, "working");
+  assert.equal(prompt.snapshot.acknowledged, true);
+  reducer.tick(41);
+  const settledPrompt = reducer.snapshot().sessions["session-a"];
+  assert.equal(settledPrompt.status, "idle");
+  assert.equal(settledPrompt.acknowledged, true);
+
+  // A lone finished marker at the first prompt is start-up noise too.
+  const loneFinished = reducer.applySignal("session-a", { kind: "command", phase: "finished", exitCode: 0 }, { now: 60 });
+  assert.equal(loneFinished.snapshot.acknowledged, true);
+
+  // A bell is an explicit request and still raises attention.
+  const bell = reducer.applySignal("session-a", { kind: "bell" }, { now: 70 });
+  assert.equal(bell.snapshot.attention, true);
+  assert.equal(bell.snapshot.acknowledged, false);
+});
+
+test("typing settles a session so later output stops as finished", () => {
+  const reducer = createTerminalActivityReducer({ rawActivityMs: 10, now: () => 0 });
+  reducer.applySignal("session-a", { kind: "userInput" }, { now: 1 });
+  reducer.applyRawOutput("session-a", { now: 2_000 });
+  reducer.tick(2_011);
+  const finished = reducer.snapshot().sessions["session-a"];
+  assert.equal(finished.status, "idle");
+  assert.equal(finished.acknowledged, false);
+});
+
+test("a structured executing marker settles a session without typing", () => {
+  const reducer = createTerminalActivityReducer({ now: () => 0 });
+  reducer.applySignal("session-a", { kind: "command", phase: "executing" }, { now: 1 });
+  const finished = reducer.applySignal("session-a", { kind: "command", phase: "finished", exitCode: 0 }, { now: 5_000 });
+  assert.equal(finished.snapshot.status, "idle");
+  assert.equal(finished.snapshot.acknowledged, false);
+  assert.equal(finished.snapshot.exitCode, 0);
+
+  const progressReducer = createTerminalActivityReducer({ now: () => 0 });
+  progressReducer.applySignal("session-b", { kind: "progress", state: 3 }, { now: 1 });
+  const done = progressReducer.applySignal("session-b", { kind: "progress", state: 0 }, { now: 5_000 });
+  assert.equal(done.snapshot.acknowledged, false);
+
+  const foregroundReducer = createTerminalActivityReducer({ now: () => 0 });
+  foregroundReducer.applySignal("session-c", { kind: "userInput" }, { now: 1 });
+  foregroundReducer.applySignal("session-c", { kind: "foreground", busy: true, processName: "sleep" }, { now: 2 });
+  const shell = foregroundReducer.applySignal("session-c", { kind: "foreground", busy: false, processName: "zsh" }, { now: 5_000 });
+  assert.equal(shell.snapshot.acknowledged, false);
+});
+
+test("echo of typing at a prompt is not raw-output activity", () => {
+  const reducer = createTerminalActivityReducer({ now: () => 0 });
+  reducer.applySignal("session-a", { kind: "userInput" }, { now: 1_000 });
+  const afterInput = reducer.snapshot();
+  const deadline = reducer.nextDeadline();
+  assert.equal(reducer.applyRawOutput("session-a", { now: 1_010 }), undefined);
+  assert.deepEqual(reducer.snapshot(), afterInput);
+  assert.equal(reducer.nextDeadline(), deadline);
+  assert.equal(reducer.get("session-a").status, "idle");
+});
+
+test("continuous typing stays idle and publishes nothing for its echo", () => {
+  const reducer = createTerminalActivityReducer({ now: () => 0 });
+  reducer.applySignal("session-a", { kind: "userInput" }, { now: 1_000 });
+  const revision = reducer.revision;
+  for (let now = 1_300; now <= 6_000; now += 300) {
+    assert.equal(reducer.applySignal("session-a", { kind: "userInput" }, { now }), undefined);
+    assert.equal(reducer.applyRawOutput("session-a", { now: now + 10 }), undefined);
+    assert.equal(reducer.get("session-a").status, "idle");
+  }
+  assert.equal(reducer.revision, revision);
+});
+
+test("typing just after output does not extend the working period", () => {
+  const reducer = createTerminalActivityReducer({ now: () => 0 });
+  assert.equal(reducer.applyRawOutput("session-a", { now: 0 }).snapshot.status, "working");
+  for (const now of [500, 700, 900]) {
+    reducer.applySignal("session-a", { kind: "userInput" }, { now });
+    reducer.applyRawOutput("session-a", { now: now + 10 });
+    assert.equal(reducer.get("session-a").status, "working");
+  }
+  reducer.tick(1_000);
+  assert.equal(reducer.get("session-a").status, "idle");
+  reducer.applySignal("session-a", { kind: "userInput" }, { now: 1_100 });
+  reducer.applyRawOutput("session-a", { now: 1_110 });
+  assert.equal(reducer.get("session-a").status, "idle");
+});
+
+test("an echo that lands as the working period lapses publishes the idle transition", () => {
+  const reducer = createTerminalActivityReducer({ now: () => 0 });
+  reducer.applyRawOutput("session-a", { now: 0 });
+  reducer.applySignal("session-a", { kind: "userInput" }, { now: 900 });
+  const lapsed = reducer.applyRawOutput("session-a", { now: 1_000 });
+  assert.equal(lapsed.snapshot.status, "idle");
+});
+
+test("output still arriving a second after the last keystroke is working again", () => {
+  const reducer = createTerminalActivityReducer({ now: () => 0 });
+  reducer.applyRawOutput("session-a", { now: 0 });
+  reducer.applySignal("session-a", { kind: "userInput" }, { now: 500 });
+  reducer.applyRawOutput("session-a", { now: 600 });
+  reducer.applyRawOutput("session-a", { now: 1_400 });
+  assert.equal(reducer.get("session-a").status, "idle");
+  const resumed = reducer.applyRawOutput("session-a", { now: 1_500 });
+  assert.equal(resumed.snapshot.status, "working");
+});
+
+test("a typed command is working once its output outlasts the input window", () => {
+  const reducer = createTerminalActivityReducer({ now: () => 0 });
+  reducer.applySignal("session-a", { kind: "userInput" }, { now: 1_000 });
+  assert.equal(reducer.applyRawOutput("session-a", { now: 1_100 }), undefined);
+  assert.equal(reducer.applyRawOutput("session-a", { now: 1_999 }), undefined);
+  const working = reducer.applyRawOutput("session-a", { now: 2_000 });
+  assert.equal(working.snapshot.status, "working");
+  assert.equal(working.snapshot.source, "raw:output");
+});
+
+test("a typed command that finishes inside the input window is never working", () => {
+  const reducer = createTerminalActivityReducer({ now: () => 0 });
+  const events = [reducer.applySignal("session-a", { kind: "userInput" }, { now: 1_000 })];
+  events.push(reducer.applyRawOutput("session-a", { now: 1_100 }));
+  events.push(reducer.applyRawOutput("session-a", { now: 1_500 }));
+  events.push(...reducer.tick(5_000));
+  assert.deepEqual(
+    events.filter((event) => event?.snapshot.status === "working"),
+    [],
+  );
+});
+
+test("a command-executing marker is working however recently the user typed", () => {
+  const reducer = createTerminalActivityReducer({ now: () => 0 });
+  reducer.applySignal("session-a", { kind: "userInput" }, { now: 1_000 });
+  const executing = reducer.applySignal("session-a", { kind: "command", phase: "executing" }, { now: 1_050 });
+  assert.equal(executing.snapshot.status, "working");
+});

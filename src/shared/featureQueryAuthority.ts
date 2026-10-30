@@ -1,0 +1,340 @@
+import { ClientError } from '@terminay/client-core';
+import type { TerminalPanelClientContextValue } from '../components/TerminalPanel';
+import type { ServerWorkspaceProject } from './serverWorkspaceReconciliation';
+
+export type FeatureQueryScope = Readonly<{
+	serverId: string;
+	projectId: string;
+	/** Empty for a project with no root folder. */
+	projectRoot: string;
+	/** False for a project with no root folder: there is nothing for a
+	 * filesystem, watch, Git, or Documentation query to read (ADR-0066). */
+	hasRoot: boolean;
+}>;
+
+export type ProjectFeatureAuthority = Readonly<{
+	applicationClient: NonNullable<TerminalPanelClientContextValue['applicationClient']>;
+	fileObservationClient: NonNullable<TerminalPanelClientContextValue['fileObservationClient']>;
+	fileViewerClient: NonNullable<TerminalPanelClientContextValue['fileViewerClient']>;
+	documentationClient?: TerminalPanelClientContextValue['documentationClient'];
+	mdxRuntimeClient?: TerminalPanelClientContextValue['mdxRuntimeClient'];
+	gitClient: NonNullable<TerminalPanelClientContextValue['gitClient']>;
+	recordingsClient: NonNullable<TerminalPanelClientContextValue['recordingsClient']>;
+	scope: FeatureQueryScope;
+}>;
+
+export type FeatureAvailability =
+	| Readonly<{ state: 'available'; authority: ProjectFeatureAuthority }>
+	| Readonly<{ state: 'unavailable'; reason: string }>;
+
+/**
+ * File-feature paths must use the root that the server has already bound to
+ * the authenticated project. The local project presentation can lag behind a
+ * workspace root update for one render; relativizing its former root against
+ * the new one would manufacture a traversal request such as `../former`.
+ */
+export function featureProjectRoot(
+	availability: FeatureAvailability,
+	renderedProjectRoot: string,
+): string {
+	return availability.state === 'available'
+		? availability.authority.scope.projectRoot
+		: renderedProjectRoot;
+}
+
+export type FeatureProjectRoot =
+	| Readonly<{ state: 'rooted'; root: string }>
+	| Readonly<{ state: 'no-root' }>;
+
+/**
+ * The root a project's sidebar panes read, or that it has none. Only the
+ * server says a project has no root folder; a presentation still loading is
+ * shown at the root it renders.
+ */
+export function resolveFeatureProjectRoot(
+	availability: FeatureAvailability,
+	renderedProjectRoot: string,
+): FeatureProjectRoot {
+	if (availability.state === 'available' && !availability.authority.scope.hasRoot)
+		return { state: 'no-root' };
+	return {
+		state: 'rooted',
+		root: featureProjectRoot(availability, renderedProjectRoot),
+	};
+}
+
+/**
+ * The authority a project's filesystem features (Explorer, its watches, Git,
+ * and Documentation) may use. A project with no root folder gets none, so no
+ * such query can be made for it.
+ */
+export function rootScopedFeatureAuthority(
+	availability: FeatureAvailability,
+): ProjectFeatureAuthority | undefined {
+	return availability.state === 'available' &&
+		availability.authority.scope.hasRoot
+		? availability.authority
+		: undefined;
+}
+
+/**
+ * Bind feature clients to an identity proven by the latest hydrated workspace
+ * snapshot.  UI components must not manufacture project scope from tab labels
+ * or host state.
+ */
+export function resolveProjectFeatureAuthority(
+	context: Omit<TerminalPanelClientContextValue, 'projectId'> | undefined,
+	projectId: string,
+): FeatureAvailability {
+	if (context === undefined) {
+		return { state: 'unavailable', reason: 'The selected server is not connected.' };
+	}
+	const snapshot = context.workspaceSnapshotStore?.snapshot;
+	if (snapshot === null || snapshot === undefined) {
+		return { state: 'unavailable', reason: 'The selected server workspace is still loading.' };
+	}
+	const project = snapshot.projects[projectId];
+	if (project === undefined || project.serverId !== context.serverId) {
+		return { state: 'unavailable', reason: 'The selected project is not available on this server.' };
+	}
+	const missing = missingFeatureClient(context);
+	if (missing !== null) {
+		return { state: 'unavailable', reason: `${missing} is unavailable on the selected server.` };
+	}
+	return {
+		state: 'available',
+			authority: {
+			applicationClient: context.applicationClient!,
+			fileObservationClient: context.fileObservationClient!,
+			fileViewerClient: context.fileViewerClient!,
+			documentationClient: context.documentationClient,
+			mdxRuntimeClient: context.mdxRuntimeClient,
+			gitClient: context.gitClient!,
+			recordingsClient: context.recordingsClient!,
+			scope: scopeForProject(context.serverId, project),
+		},
+	};
+}
+
+export type FeatureFailure = Readonly<{
+	title: string;
+	detail: string;
+	retryable: boolean;
+	operation?: string;
+}>;
+
+export type VisibleFeatureFailure = Readonly<{
+	feature: 'Explorer' | 'Agents' | 'Git' | 'Settings';
+	message: string;
+	/** The operation failed because the connection itself was gone, not
+	 * because the feature refused it. Recovery, not the user, repairs it. */
+	transport: boolean;
+	/** A failed background read, which the next successful read repairs. An
+	 * action failure (delete, pull, rename) is not repaired by a refresh. */
+	refresh: boolean;
+}>;
+
+/** Only a failure the transport caused is the reconnect's to explain. A
+ * feature refusal stays visible whatever the connection is doing. */
+export function clearTransportFeatureFailure(
+	failure: VisibleFeatureFailure | null,
+	visibleMessage: string | null,
+): VisibleFeatureFailure | null {
+	if (failure === null || !failure.transport) return failure;
+	if (visibleMessage !== failure.message) return failure;
+	return null;
+}
+
+/** Clear only the feature notice which a successful follow-up read has
+ * repaired. A success in Explorer must never erase a newer terminal, Git, or
+ * other feature failure sharing the global banner, and a refresh must never
+ * erase the failure of an action the user just took. */
+export function clearSucceededFeatureFailure(
+	failure: VisibleFeatureFailure | null,
+	feature: 'Explorer' | 'Git',
+	visibleMessage: string | null,
+): VisibleFeatureFailure | null {
+	if (
+		failure?.feature !== feature ||
+		!failure.refresh ||
+		visibleMessage !== failure.message
+	)
+		return failure;
+	return null;
+}
+
+/** Bounded, actionable copy for a failed server feature operation. */
+export function describeFeatureFailure(
+	feature: string,
+	error: unknown,
+	scope: Pick<FeatureQueryScope, 'serverId' | 'projectId'>,
+): FeatureFailure {
+	const operation = readOperation(error);
+	const source = readOperation(error) !== undefined && typeof error === 'object' && error !== null && 'cause' in error && error.cause !== undefined
+		? error.cause
+		: error;
+	const code = source instanceof ClientError ? source.code : undefined;
+	const retryable = source instanceof ClientError ? source.retryable : false;
+	const target = `project ${scope.projectId} on server ${scope.serverId}`;
+	if (code === 'cancelled') {
+		return {
+			title: `${feature} request was cancelled`,
+			detail: `The ${operation === undefined ? 'request' : operation} for ${target} was cancelled.`,
+			retryable: true,
+			...(operation === undefined ? {} : { operation }),
+		};
+	}
+	if (code === 'disconnected' || code === 'unavailable' || code === 'deadline') {
+		return {
+			title: `${feature} is temporarily unavailable`,
+			detail: `Reconnect to ${scope.serverId} and retry${operation === undefined ? '.' : ` ${operation}.`}`,
+			retryable: true,
+			...(operation === undefined ? {} : { operation }),
+		};
+	}
+	if (code === 'unauthorized' || code === 'forbidden') {
+		return {
+			title: `${feature} access was denied`,
+			detail: `The selected server account cannot access ${target}.`,
+			retryable: false,
+			...(operation === undefined ? {} : { operation }),
+		};
+	}
+	if (code === 'not_found') {
+		return {
+			title: `${feature} scope is no longer available`,
+			detail: `Refresh the workspace before retrying ${target}.`,
+			retryable: true,
+			...(operation === undefined ? {} : { operation }),
+		};
+	}
+	const message = error instanceof Error ? error.message : String(error);
+	return {
+		title: `${feature} could not be loaded`,
+		detail: `${operation === undefined ? 'The request' : operation} failed for ${target}: ${boundedText(message)}`,
+		retryable,
+		...(operation === undefined ? {} : { operation }),
+	};
+}
+
+/** Bounded, actionable copy for settings shared by every project on a server. */
+export function describeServerFeatureFailure(
+	feature: string,
+	error: unknown,
+	serverId: string,
+): FeatureFailure {
+	const operation = readOperation(error);
+	const source = operation !== undefined && typeof error === 'object' && error !== null && 'cause' in error && error.cause !== undefined
+		? error.cause
+		: error;
+	const code = source instanceof ClientError ? source.code : undefined;
+	const retryable = source instanceof ClientError ? source.retryable : false;
+	if (code === 'disconnected' || code === 'unavailable' || code === 'deadline') {
+		return {
+			title: `${feature} is temporarily unavailable`,
+			detail: `Reconnect to ${serverId} and retry${operation === undefined ? '.' : ` ${operation}.`}`,
+			retryable: true,
+			...(operation === undefined ? {} : { operation }),
+		};
+	}
+	if (code === 'unauthorized' || code === 'forbidden') {
+		return {
+			title: `${feature} access was denied`,
+			detail: `The selected server account cannot access ${feature.toLowerCase()} on server ${serverId}.`,
+			retryable: false,
+			...(operation === undefined ? {} : { operation }),
+		};
+	}
+	const message = error instanceof Error ? error.message : String(error);
+	return {
+		title: `${feature} could not be loaded`,
+		detail: `${operation === undefined ? 'The request' : operation} failed on server ${serverId}: ${boundedText(message)}`,
+		retryable,
+		...(operation === undefined ? {} : { operation }),
+	};
+}
+
+function scopeForProject(serverId: string, project: ServerWorkspaceProject): FeatureQueryScope {
+	return {
+		serverId,
+		projectId: project.id,
+		projectRoot: project.rootOrigin === 'none' ? '' : project.root,
+		hasRoot: project.rootOrigin !== 'none',
+	};
+}
+
+function missingFeatureClient(context: Omit<TerminalPanelClientContextValue, 'projectId'>): string | null {
+	if (context.applicationClient === undefined) return 'Application queries';
+	if (context.fileObservationClient === undefined) return 'File observation';
+	if (context.fileViewerClient === undefined) return 'Explorer';
+	if (context.gitClient === undefined) return 'Git';
+	if (context.recordingsClient === undefined) return 'Recordings';
+	return null;
+}
+
+function readOperation(error: unknown): string | undefined {
+	if (typeof error !== 'object' || error === null || !('operation' in error)) return undefined;
+	return typeof error.operation === 'string' ? error.operation : undefined;
+}
+
+function failureSource(error: unknown): unknown {
+	return typeof error === 'object' &&
+		error !== null &&
+		'cause' in error &&
+		error.cause !== undefined
+		? error.cause
+		: error;
+}
+
+/** A superseded or unmounted query must not occupy the workspace banner. */
+export function isCancelledFeatureFailure(error: unknown): boolean {
+	const source = failureSource(error);
+	return source instanceof ClientError && source.code === 'cancelled';
+}
+
+/**
+ * The connection, not the feature, failed: the client was closed, the server
+ * was unreachable, or the request outlived its deadline. While the owning
+ * connection is reconnecting these are the reconnect's to explain, and its
+ * overlay already does.
+ */
+export function isTransportFeatureFailure(error: unknown): boolean {
+	const source = failureSource(error);
+	return (
+		source instanceof ClientError &&
+		(source.code === 'disconnected' ||
+			source.code === 'unavailable' ||
+			source.code === 'deadline')
+	);
+}
+
+/** A transient `files.watch.*` or `files.folder-size.*` failure degrades the
+ * Explorer to manual refresh; it is not an Explorer outage. */
+export function isOptionalObservationFailure(error: unknown): boolean {
+	const operation = readOperation(error);
+	if (
+		operation === undefined ||
+		(!operation.startsWith('files.watch') &&
+			!operation.startsWith('files.folder-size'))
+	) {
+		return false;
+	}
+	const source =
+		typeof error === 'object' &&
+		error !== null &&
+		'cause' in error &&
+		error.cause !== undefined
+			? error.cause
+			: error;
+	if (!(source instanceof ClientError)) return false;
+	return (
+		source.code === 'unavailable' ||
+		source.code === 'cancelled' ||
+		source.code === 'deadline'
+	);
+}
+
+function boundedText(value: string): string {
+	const compact = value.replace(/\s+/g, ' ').trim();
+	return compact.length <= 512 ? compact : `${compact.slice(0, 509)}…`;
+}

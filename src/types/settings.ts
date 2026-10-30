@@ -1,0 +1,266 @@
+import type { AppCommand } from './terminay';
+
+export type KeyboardShortcutSettings = Record<AppCommand, string>;
+
+export type TerminalThemeSettings = {
+	foreground: string;
+	background: string;
+	cursor: string;
+	cursorAccent: string;
+	selectionBackground: string;
+	selectionInactiveBackground: string;
+	selectionForeground: string;
+	scrollbarSliderBackground: string;
+	scrollbarSliderHoverBackground: string;
+	scrollbarSliderActiveBackground: string;
+	black: string;
+	red: string;
+	green: string;
+	yellow: string;
+	blue: string;
+	magenta: string;
+	cyan: string;
+	white: string;
+	brightBlack: string;
+	brightRed: string;
+	brightGreen: string;
+	brightYellow: string;
+	brightBlue: string;
+	brightMagenta: string;
+	brightCyan: string;
+	brightWhite: string;
+};
+
+export type ShellSettings = {
+	program: string;
+	startupMode: 'auto' | 'login' | 'non-login';
+	extraArgs: string;
+};
+
+export type RemoteAccessSettings = {
+	exposeOnStartup: boolean;
+	webRtcHostedDomain: string;
+	webRtcIceServers: string;
+};
+
+export type TerminalRecordingSensitiveInputPolicy = 'drop' | 'mask';
+
+export type TerminalRecordingSettings = {
+	captureInput: boolean;
+	directory: string;
+	openTimelineAfterSaving: boolean;
+	recordNewTerminals: boolean;
+	sensitiveInputPolicy: TerminalRecordingSensitiveInputPolicy;
+};
+
+export type GitPanelViewMode = 'list' | 'tree';
+
+export type SidebarPaneState = 'expanded' | 'collapsed';
+export const SIDEBAR_PANEL_IDS = ['explorer', 'agents', 'git', 'documentation'] as const;
+export type SidebarPanelId = (typeof SIDEBAR_PANEL_IDS)[number];
+export const SIDEBAR_GROUP_IDS = ['explorer', 'documentation'] as const;
+export type SidebarGroupId = (typeof SIDEBAR_GROUP_IDS)[number];
+
+/** The tabs of a project's left column, in the order they are drawn. */
+export const FOLDERS_COLUMN_TAB_IDS = ['tabs', 'agents'] as const;
+export type FoldersColumnTabId = (typeof FOLDERS_COLUMN_TAB_IDS)[number];
+
+export type SidebarSettings = {
+	gitPanelViewMode: GitPanelViewMode;
+	defaultExplorerState: SidebarPaneState;
+	defaultGitState: SidebarPaneState;
+	defaultDocumentationState: SidebarPaneState;
+	defaultExplorerPaneHeight: number;
+	defaultGitPaneHeight: number;
+	defaultDocumentationPaneHeight: number;
+	panelOrder: SidebarPanelId[];
+	/** Device-local open/closed preference, indexed by server and project id. */
+	projectVisibility: Record<string, boolean>;
+	/** Device-local selected sidebar group, indexed by server and project id. */
+	projectActiveGroup: Record<string, SidebarGroupId>;
+	/** Device-local open/closed preference for the Folders tree, indexed by
+	 * server and project id. Absent means open. */
+	projectFoldersVisibility: Record<string, boolean>;
+	/** Device-local selected tab of the left column, indexed by server and
+	 * project id. Absent means Tabs. */
+	projectFoldersColumnTab: Record<string, FoldersColumnTabId>;
+	/** Device-local ids of the folders drawn collapsed in the Folders tree,
+	 * indexed by server and project id. Absent means every folder is open. */
+	projectFoldersCollapsed: Record<string, string[]>;
+};
+
+export type FileViewerSettings = {
+	customFileExtensions: FileViewerCustomExtensionDefault[];
+	diffLayout: FileViewerDiffLayout;
+	folderTaskIgnoredDirectories: string;
+	refreshIntervalSeconds: number;
+};
+
+export type FileViewerDefaultMode = 'preview' | 'text' | 'hex';
+export type FileViewerDiffLayout = 'side-by-side' | 'unified';
+
+export type FileViewerCustomExtensionDefault = {
+	extension: string;
+	defaultMode: FileViewerDefaultMode;
+};
+
+export type AiTabMetadataProvider = 'disabled' | 'codex' | 'claudeCode';
+
+export type AiTabMetadataTargetSettings = {
+	provider: AiTabMetadataProvider;
+	claudeCodeModel: string;
+	codexModel: string;
+};
+
+export type AiTabMetadataSettings = {
+	title: AiTabMetadataTargetSettings;
+	note: AiTabMetadataTargetSettings;
+};
+
+export type AgentIntegrationSettings = {
+	enabled: boolean;
+	/**
+	 * Harness switches keyed `<sourceId>/<harnessId>`. A missing key means on;
+	 * only switched-off harnesses need an entry.
+	 */
+	harnesses: Record<string, boolean>;
+};
+
+export type GitPushAgentProvider = 'disabled' | 'codex' | 'claudeCode';
+
+export type GitPushAgentSettings = {
+	provider: GitPushAgentProvider;
+	claudeCodeModel: string;
+	codexModel: string;
+	prompt: string;
+};
+
+/**
+ * Pixel, the status-bar companion. `provider` is a chat provider id, or
+ * `unset` until the user picks one on first click.
+ */
+export type PixelSettings = {
+	enabled: boolean;
+	provider: string;
+};
+
+/** How the server treats an MCP operation in one permission group. */
+export type TerminayMcpPermissionPolicy = 'ask' | 'allow' | 'deny';
+
+export type TerminayMcpPermissions = {
+	terminalsRead: TerminayMcpPermissionPolicy;
+	terminalsManage: TerminayMcpPermissionPolicy;
+	automationsRead: TerminayMcpPermissionPolicy;
+	automationsManage: TerminayMcpPermissionPolicy;
+	/** Projects and workspace windows. */
+	projectsWindows: TerminayMcpPermissionPolicy;
+	/** Reading server settings and shell profiles. */
+	settingsRead: TerminayMcpPermissionPolicy;
+	/** Changing server settings and shell profiles. */
+	settingsChange: TerminayMcpPermissionPolicy;
+	/** Showing and closing windows in the calling terminal. */
+	appWindows: TerminayMcpPermissionPolicy;
+	/** Sending and dismissing notifications of the calling terminal. */
+	notifications: TerminayMcpPermissionPolicy;
+	/** Using the tools of user-connected MCP servers. */
+	connectedServerTools: TerminayMcpPermissionPolicy;
+	/** A window typing a message into its terminal. */
+	windowMessages: TerminayMcpPermissionPolicy;
+};
+
+/** Server-owned enablement and permission policy for the local Terminay MCP bridge. */
+export type TerminayMcpSettings = {
+	enabled: boolean;
+	permissions: TerminayMcpPermissions;
+};
+
+export type DictationTranscriptionModel =
+	| 'gpt-4o-transcribe'
+	| 'gpt-4o-mini-transcribe'
+	| 'mlx-community/parakeet-tdt-0.6b-v3';
+
+export type DictationProvider = 'openai' | 'parakeet';
+
+export type DictationSettings = {
+	enabled: boolean;
+	provider: DictationProvider;
+	model: DictationTranscriptionModel;
+	microphoneDeviceId: string;
+	language: string;
+	prompt: string;
+	silenceStopSeconds: number;
+	maxDurationSeconds: number;
+};
+
+export type TerminalSettings = {
+	agentIntegration: AgentIntegrationSettings;
+	aiTabMetadata: AiTabMetadataSettings;
+	dictation: DictationSettings;
+	gitPushAgent: GitPushAgentSettings;
+	pixel: PixelSettings;
+	terminayMcp: TerminayMcpSettings;
+	allowTransparency: boolean;
+	altClickMovesCursor: boolean;
+	activityIndicators: TerminalActivityIndicatorSettings;
+	autoCloseTerminalOnExitZero: boolean;
+	/** Server setting: how long terminals keep running after Terminay quits. */
+	keepTerminalsAfterQuit: '1m' | '5m' | '30m' | '2h' | 'untilRestart';
+	/** Server setting: a terminal that creates a Git worktree moves into that
+	 * worktree's folder. Off, the folder offers the move instead. */
+	moveTerminalsIntoNewWorktreeFolders: boolean;
+	/** Server setting: a program names its tab with OSC 0 / OSC 2. A name a
+	 * person gave the tab always wins. */
+	programSetTabTitles: boolean;
+	/** Device setting: which Terminay Desktop release channel this machine follows. */
+	updateChannel: 'stable' | 'beta';
+	convertEol: boolean;
+	cursorBlink: boolean;
+	cursorStyle: 'block' | 'underline' | 'bar';
+	cursorWidth: number;
+	cursorInactiveStyle: 'outline' | 'block' | 'bar' | 'underline' | 'none';
+	customGlyphs: boolean;
+	disableStdin: boolean;
+	drawBoldTextInBrightColors: boolean;
+	fastScrollSensitivity: number;
+	fontFamily: string;
+	fontSize: number;
+	fontWeight: string;
+	fontWeightBold: string;
+	ignoreBracketedPasteMode: boolean;
+	letterSpacing: number;
+	lineHeight: number;
+	macOptionIsMeta: boolean;
+	macOptionClickForcesSelection: boolean;
+	minimumContrastRatio: number;
+	rescaleOverlappingGlyphs: boolean;
+	rightClickSelectsWord: boolean;
+	screenReaderMode: boolean;
+	scrollback: number;
+	/** Device setting: whether the workspace status bar is shown. */
+	showStatusBar: boolean;
+	/** Device setting: whether the status bar is shown in compact chrome. */
+	showStatusBarCompact: boolean;
+	scrollOnEraseInDisplay: boolean;
+	scrollOnUserInput: boolean;
+	scrollSensitivity: number;
+	smoothScrollDuration: number;
+	tabStopWidth: number;
+	wordSeparator: string;
+	fileViewer: FileViewerSettings;
+	keyboardShortcuts: KeyboardShortcutSettings;
+	recording: TerminalRecordingSettings;
+	remoteAccess: RemoteAccessSettings;
+	shell: ShellSettings;
+	sidebar: SidebarSettings;
+	theme: TerminalThemeSettings;
+};
+
+export type TerminalActivityIndicatorSettings = {
+	amberDelaySeconds: number;
+	greenDelaySeconds: number;
+	showActiveTabs: boolean;
+	showFinishedTabs: boolean;
+	signalDetection: boolean;
+	progressStaleSeconds: number;
+	tabSwitchSuppressionSeconds: number;
+};

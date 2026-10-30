@@ -1,0 +1,417 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { TerminayClient } from "@terminay/client-core";
+import { createInMemoryTransportPair } from "@terminay/protocol-conformance";
+import {
+	HeadlessChannelTransport,
+	ServerConnection,
+} from "../dist/index.js";
+
+class FakeChannel {
+	constructor(peer = null) {
+		this.label = "application";
+		this.peer = peer;
+		this.readyState = "connecting";
+		this.bufferedAmount = 0;
+		this.messages = new Set();
+		this.states = new Set();
+		this.sent = [];
+		this.closed = false;
+		this.sendError = undefined;
+		this.maxMessageBytes = undefined;
+	}
+
+	send(frame) {
+		if (this.sendError !== undefined) throw this.sendError;
+		if (this.readyState !== "open") throw new Error("channel is not open");
+		// A real SCTP lane refuses a message above its negotiated maximum.
+		if (this.maxMessageBytes !== undefined && frame.byteLength > this.maxMessageBytes) {
+			throw new Error(`channel message is ${frame.byteLength} bytes; negotiated SCTP max is ${this.maxMessageBytes}`);
+		}
+		this.sent.push(new Uint8Array(frame));
+		this.peer?.emit(new Uint8Array(frame));
+	}
+
+	close() {
+		if (this.closed) return;
+		this.closed = true;
+		this.readyState = "closed";
+		for (const listener of [...this.states]) listener("closed");
+		if (this.peer !== null && !this.peer.closed) this.peer.close();
+	}
+
+	onMessage(listener) {
+		this.messages.add(listener);
+		return () => this.messages.delete(listener);
+	}
+
+	onStateChange(listener) {
+		this.states.add(listener);
+		return () => this.states.delete(listener);
+	}
+
+	open() {
+		this.readyState = "open";
+		for (const listener of [...this.states]) listener("open");
+	}
+
+	emit(frame) {
+		for (const listener of [...this.messages]) listener(frame);
+	}
+}
+
+function channelPair() {
+	const left = new FakeChannel();
+	const right = new FakeChannel(left);
+	left.peer = right;
+	left.open();
+	right.open();
+	return { left, right };
+}
+
+test("headless channel transport waits for open, copies frames, and closes cleanly", async () => {
+	const channel = new FakeChannel();
+	const transport = new HeadlessChannelTransport(channel, { maxFrameBytes: 8, maxBufferedBytes: 16 });
+	const opening = transport.open();
+	channel.open();
+	await opening;
+	assert.equal(transport.state, "open");
+	const original = new Uint8Array([1, 2, 3]);
+	await transport.send(original);
+	original[0] = 9;
+	assert.deepEqual([...channel.sent[0]], [1, 2, 3]);
+	channel.emit(new Uint8Array([4, 5]));
+	const iterator = transport.incoming[Symbol.asyncIterator]();
+	assert.deepEqual([...(await iterator.next()).value], [4, 5]);
+	await transport.close();
+	assert.equal(transport.state, "closed");
+});
+
+test("an externally closed channel releases native listeners before a reconnect can replace it", async () => {
+	const channel = new FakeChannel();
+	channel.open();
+	const transport = new HeadlessChannelTransport(channel);
+	await transport.open();
+	const states = [];
+	transport.onStateChange((state) => states.push(state));
+
+	channel.close();
+
+	assert.equal(transport.state, "closed");
+	assert.deepEqual(states, ["closed"]);
+	assert.equal(channel.messages.size, 0);
+	assert.equal(channel.states.size, 0);
+	channel.emit(new Uint8Array([1]));
+	assert.equal(transport.bufferedBytes, 0);
+	assert.deepEqual(await transport.incoming[Symbol.asyncIterator]().next(), { done: true, value: undefined });
+});
+
+test("a throwing transport state observer cannot escape a native close callback or hide the terminal transition", async () => {
+	const channel = new FakeChannel();
+	channel.open();
+	const transport = new HeadlessChannelTransport(channel);
+	await transport.open();
+	const states = [];
+	transport.onStateChange(() => {
+		throw new Error("observer is faulty");
+	});
+	transport.onStateChange((state) => states.push(state));
+
+	assert.doesNotThrow(() => channel.close());
+	assert.equal(transport.state, "closed");
+	assert.deepEqual(states, ["closed"]);
+	assert.equal(channel.messages.size, 0);
+	assert.equal(channel.states.size, 0);
+});
+
+test("invalid or oversized inbound frames fail closed before reaching the application", async () => {
+	const channel = new FakeChannel();
+	channel.open();
+	const transport = new HeadlessChannelTransport(channel, { maxFrameBytes: 4, maxInboundBytes: 4 });
+	await transport.open();
+	channel.emit(new Uint8Array([1, 2, 3, 4, 5]));
+	assert.equal(transport.state, "failed");
+	assert.equal(channel.closed, true);
+	const iterator = transport.incoming[Symbol.asyncIterator]();
+	await assert.rejects(iterator.next(), /transport frame size out of bounds/);
+});
+
+test("a slow backpressured channel fails closed instead of waiting forever", async () => {
+	const channel = new FakeChannel();
+	channel.open();
+	channel.bufferedAmount = 16;
+	const transport = new HeadlessChannelTransport(channel, {
+		maxFrameBytes: 8,
+		maxBufferedBytes: 16,
+		maxWritableWaitMs: 15,
+	});
+	await transport.open();
+	const states = [];
+	transport.onStateChange((state, reason) => states.push([state, reason?.code]));
+	await assert.rejects(transport.send(new Uint8Array([1])), /remained backpressured/);
+	assert.equal(transport.state, "failed");
+	assert.equal(channel.closed, true);
+	assert.deepEqual(states, [["failed", "timeout"]]);
+});
+
+test("headless channel send racing with close rejects and cannot reuse the channel", async () => {
+	const channel = new FakeChannel();
+	channel.open();
+	channel.bufferedAmount = 16;
+	const transport = new HeadlessChannelTransport(channel, {
+		maxFrameBytes: 8,
+		maxBufferedBytes: 16,
+		maxWritableWaitMs: 1_000,
+	});
+	await transport.open();
+	const sending = transport.send(new Uint8Array([1]));
+	await transport.close({ code: "unavailable", message: "scripted close" });
+	await assert.rejects(sending, /transport is (?:closing|closed)/u);
+	await assert.rejects(transport.send(new Uint8Array([2])), /transport is closed/u);
+	assert.deepEqual(channel.sent, []);
+});
+
+test("headless channel observes abort while waiting for backpressure", async () => {
+	const channel = new FakeChannel();
+	channel.open();
+	channel.bufferedAmount = 16;
+	const transport = new HeadlessChannelTransport(channel, {
+		maxFrameBytes: 8,
+		maxBufferedBytes: 16,
+		maxWritableWaitMs: 1_000,
+	});
+	await transport.open();
+	const controller = new AbortController();
+	const waiting = transport.waitForWritable(1, controller.signal);
+	controller.abort(new Error("scripted abort"));
+	await assert.rejects(waiting, /scripted abort/u);
+	assert.equal(transport.state, "open");
+	await transport.close();
+});
+
+test("a rejected native send fails only its sender while the channel stays usable", async () => {
+	const channel = new FakeChannel();
+	channel.open();
+	channel.sendError = new Error("scripted native send failure");
+	const transport = new HeadlessChannelTransport(channel, { maxFrameBytes: 8, maxBufferedBytes: 16 });
+	await transport.open();
+	await assert.rejects(transport.send(new Uint8Array([1])), (error) => {
+		assert.match(error.message, /headless data channel send failed/u);
+		assert.match(String(error.cause?.message), /scripted native send failure/u);
+		return true;
+	});
+	// One unsendable message is that request's failure, not the session's: a
+	// channel that actually died reports it through its own state instead.
+	assert.equal(transport.state, "open");
+	assert.equal(channel.closed, false);
+	channel.sendError = undefined;
+	await transport.send(new Uint8Array([2]));
+	assert.deepEqual([...channel.sent[0]], [2]);
+	channel.close();
+	assert.equal(transport.state, "closed");
+});
+
+test("frames above the channel message limit travel as fragments and reassemble exactly", async () => {
+	const channels = channelPair();
+	const sender = new HeadlessChannelTransport(channels.left, { maxMessageBytes: 2048 });
+	const receiver = new HeadlessChannelTransport(channels.right, { maxMessageBytes: 2048 });
+	const frame = new Uint8Array(9_001).map((_, index) => index % 251);
+	await sender.send(frame);
+	assert.equal(channels.left.sent.length > 1, true);
+	for (const message of channels.left.sent) assert.equal(message.byteLength <= 2048, true);
+	const iterator = receiver.incoming[Symbol.asyncIterator]();
+	assert.deepEqual([...(await iterator.next()).value], [...frame]);
+	assert.equal(receiver.state, "open");
+
+	// A frame that already fits is never fragmented.
+	channels.left.sent.length = 0;
+	const small = new Uint8Array([7, 7, 7]);
+	await sender.send(small);
+	assert.deepEqual(channels.left.sent.map((message) => [...message]), [[7, 7, 7]]);
+	assert.deepEqual([...(await iterator.next()).value], [7, 7, 7]);
+});
+
+test("a peer that cannot reassemble a fragment fails closed rather than delivering it", async () => {
+	const channel = new FakeChannel();
+	channel.open();
+	const transport = new HeadlessChannelTransport(channel);
+	await transport.open();
+	// Fragment magic with a header that claims a later index than any transfer.
+	const stray = new Uint8Array([0x54, 0x52, 0x4d, 0x46, 1, 0, 0, 1, 0, 3, 0, 9, 1, 2, 3]);
+	channel.emit(stray);
+	assert.equal(transport.state, "failed");
+	assert.equal(channel.closed, true);
+});
+
+test("a throwing or poisoned native buffered-byte counter fails the relay closed", async () => {
+	for (const value of [Number.NaN, -1, Number.MAX_SAFE_INTEGER]) {
+		const channel = new FakeChannel();
+		channel.open();
+		channel.bufferedAmount = value;
+		const transport = new HeadlessChannelTransport(channel, { maxFrameBytes: 8, maxBufferedBytes: 16 });
+		await transport.open();
+		assert.equal(transport.queuedBytes, 0);
+		assert.equal(transport.state, "failed");
+		assert.equal(channel.closed, true);
+	}
+
+	const channel = new FakeChannel();
+	channel.open();
+	Object.defineProperty(channel, "bufferedAmount", {
+		get() {
+			throw new Error("native counter failed");
+		},
+	});
+	const transport = new HeadlessChannelTransport(channel, { maxFrameBytes: 8, maxBufferedBytes: 16 });
+	await transport.open();
+	await assert.rejects(transport.waitForWritable(), /buffered amount is invalid/);
+	assert.equal(transport.state, "failed");
+	assert.equal(channel.closed, true);
+});
+
+test("the canonical client protocol runs over a headless application channel", async () => {
+	const channels = channelPair();
+	const clientTransport = new HeadlessChannelTransport(channels.left);
+	const serverTransport = new HeadlessChannelTransport(channels.right);
+	const server = new ServerConnection(serverTransport, {
+		serverId: "server-a",
+		serverVersion: "1.0.0",
+		capabilities: ["workspace"],
+		authenticate: ({ hello }) => ({ clientId: hello.clientId, authScope: "read" }),
+		queries: {
+			"workspace.echo": ({ envelope, context }) => ({
+				clientId: context.clientId,
+				payload: envelope.payload,
+			}),
+		},
+	});
+	const serverTask = server.start();
+	const client = new TerminayClient({ transport: clientTransport, clientId: "client-a", capabilities: ["workspace"] });
+	const hello = await client.connect();
+	assert.equal(hello.serverId, "server-a");
+	const result = await client.query("workspace.echo", { view: "remote" });
+	assert.deepEqual(result.result, { clientId: "client-a", payload: { view: "remote" } });
+	await client.close();
+	await serverTask;
+	assert.equal(server.state, "closed");
+});
+
+test("Local and headless remote transports share one client/server application protocol suite", async () => {
+	const run = async (clientTransport, serverTransport) => {
+		const server = new ServerConnection(serverTransport, {
+			serverId: "server-a",
+			serverVersion: "1.0.0",
+			capabilities: ["workspace"],
+			authenticate: ({ hello }) => ({ clientId: hello.clientId, authScope: "write" }),
+			queries: {
+				"workspace.snapshot": () => ({ revision: 4, projects: ["project-a"] }),
+			},
+			commands: {
+				"workspace.create": ({ envelope, context }) => ({
+					result: { clientId: context.clientId, payload: envelope.payload },
+					revision: context.expectedRevision === undefined ? 5 : context.expectedRevision + 1,
+				}),
+			},
+		});
+		const serverTask = server.start();
+		const client = new TerminayClient({ transport: clientTransport, clientId: "client-a", capabilities: ["workspace"] });
+		const hello = await client.connect();
+		const snapshot = await client.query("workspace.snapshot");
+		const command = await client.command("workspace.create", { name: "Project A" }, { expectedRevision: 4, commandId: "create-project-a" });
+		await client.close();
+		await serverTask;
+		return { hello: hello.serverId, snapshot: snapshot.result, command: command.result };
+	};
+
+	const local = createInMemoryTransportPair();
+	await local.open();
+	const localResult = await run(local.client, local.server);
+
+	const left = new FakeChannel();
+	const right = new FakeChannel(left);
+	left.peer = right;
+	left.open();
+	right.open();
+	const remoteResult = await run(new HeadlessChannelTransport(left), new HeadlessChannelTransport(right));
+	assert.deepEqual(remoteResult, localResult);
+});
+
+test("a query result larger than the channel message limit still answers the client", async () => {
+	const channels = channelPair();
+	const messageLimit = 8 * 1024;
+	channels.left.maxMessageBytes = messageLimit;
+	channels.right.maxMessageBytes = messageLimit;
+	const clientTransport = new HeadlessChannelTransport(channels.left);
+	const serverTransport = new HeadlessChannelTransport(channels.right);
+	const tasks = Array.from({ length: 4_000 }, (_, index) => ({
+		id: `specs/tasks/${index}.md:task-${index}`,
+		label: `Finish the folder task ${index}`,
+		checked: index % 2 === 0,
+	}));
+	// A folder task scan answers in a binary body, exactly like `files.tasks`.
+	const body = new TextEncoder().encode(JSON.stringify({ files: tasks, truncated: false }));
+	const aggregation = () => ({
+		result: { contentType: "application/json", bodyLength: body.byteLength },
+		body,
+	});
+	const server = new ServerConnection(serverTransport, {
+		serverId: "server-a",
+		serverVersion: "1.0.0",
+		capabilities: ["files"],
+		authenticate: ({ hello }) => ({ clientId: hello.clientId, authScope: "read" }),
+		queries: { "files.tasks": aggregation },
+	});
+	const serverTask = server.start();
+	const client = new TerminayClient({ transport: clientTransport, clientId: "client-a", capabilities: ["files"] });
+	await client.connect();
+
+	const answer = await client.queryWithBody("files.tasks", { path: "." });
+
+	assert.equal(answer.body.byteLength, body.byteLength);
+	const decoded = JSON.parse(new TextDecoder().decode(answer.body));
+	assert.equal(decoded.files.length, tasks.length);
+	assert.deepEqual(decoded.files.at(-1), tasks.at(-1));
+	assert.equal(channels.right.sent.some((message) => message.byteLength > messageLimit), false);
+	assert.equal(channels.right.sent.length > 1, true);
+	// The session survives the oversized answer and keeps serving.
+	assert.equal(clientTransport.state, "open");
+	assert.equal((await client.queryWithBody("files.tasks", { path: "." })).body.byteLength, body.byteLength);
+	await client.close();
+	await serverTask;
+});
+
+test("a response the channel refuses fails that query alone and leaves the session serving", async () => {
+	const channels = channelPair();
+	const clientTransport = new HeadlessChannelTransport(channels.left);
+	const serverTransport = new HeadlessChannelTransport(channels.right);
+	// No negotiated message limit is known, so nothing is fragmented and the
+	// channel itself refuses the oversized answer.
+	channels.right.send = function send(frame) {
+		if (frame.byteLength > 4096) throw new Error("channel message exceeds the negotiated SCTP maximum");
+		FakeChannel.prototype.send.call(this, frame);
+	};
+	const server = new ServerConnection(serverTransport, {
+		serverId: "server-a",
+		serverVersion: "1.0.0",
+		capabilities: ["files"],
+		authenticate: ({ hello }) => ({ clientId: hello.clientId, authScope: "read" }),
+		queries: {
+			"files.tasks": () => {
+				const payload = new TextEncoder().encode(JSON.stringify(Array.from({ length: 2_000 }, (_, index) => `task-${index}`)));
+				return { result: { contentType: "application/json", bodyLength: payload.byteLength }, body: payload };
+			},
+			"files.count": () => ({ files: 3 }),
+		},
+	});
+	const serverTask = server.start();
+	const client = new TerminayClient({ transport: clientTransport, clientId: "client-a", capabilities: ["files"] });
+	await client.connect();
+
+	await assert.rejects(client.queryWithBody("files.tasks", { path: "." }));
+
+	assert.equal(clientTransport.state, "open");
+	assert.equal(serverTransport.state, "open");
+	assert.deepEqual((await client.query("files.count", { path: "." })).result, { files: 3 });
+	await client.close();
+	await serverTask;
+});

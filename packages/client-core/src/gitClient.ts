@@ -1,0 +1,272 @@
+import type { JsonValue } from "@terminay/protocol";
+import type { GitStatusChangeEvent } from "./git.js";
+import { createHostCapabilityProvider } from "./host.js";
+import type {
+  ClientEvent,
+  CommandOptions,
+  HostCapabilityProvider,
+  HostCapabilitySet,
+  QueryOptions,
+} from "./types.js";
+
+export const GIT_CLIENT_OPERATIONS = Object.freeze({
+  status: "git.status",
+  branch: "git.branch",
+  diff: "git.diff",
+  listWorktrees: "git.worktrees.list",
+  openTerminal: "git.worktree.open-terminal",
+  switchProject: "git.worktree.switch-project",
+  renamePresentation: "git.worktree.rename",
+  reveal: "git.worktree.reveal",
+  revealFolder: "git.folder.reveal",
+  copy: "git.worktree.copy",
+  pull: "git.worktree.pull",
+  remove: "git.worktree.remove",
+  removeClean: "git.worktree.remove-clean",
+  move: "git.worktree.move",
+  quickPushPropose: "git.quick-push.propose",
+  quickPushApprove: "git.quick-push.approve",
+  worktreeProperties: "git.worktree.properties",
+  signIn: "git.worktree.sign-in",
+  insightPreferences: "git.worktree-insights.preferences",
+  setInsightPrompts: "git.worktree-insights.set-prompts",
+} as const);
+
+export type GitSignInChoice = "accept" | "later" | "never";
+
+export interface GitClientTransport {
+  readonly query: <T extends JsonValue = JsonValue>(operation: string, payload?: JsonValue, options?: QueryOptions) => Promise<T>;
+  readonly command: <T extends JsonValue = JsonValue>(operation: string, payload?: JsonValue, options?: CommandOptions) => Promise<T>;
+  readonly subscribeClientEvents?: <T extends JsonValue = JsonValue>(event: string, listener: (message: ClientEvent<T>) => void, onResync?: () => void) => Promise<() => void>;
+}
+
+export interface GitClientHostOptions {
+  readonly capabilities?: HostCapabilitySet | HostCapabilityProvider;
+}
+
+export interface GitWorktreeReference {
+  readonly projectId: string;
+  readonly repositoryId: string;
+  readonly worktreeId: string;
+}
+
+export interface GitQuickPushProposalRequest extends GitWorktreeReference {
+  readonly provider: string;
+  readonly targetBranch?: string;
+}
+
+export interface GitQuickPushApprovalRequest {
+  readonly proposalId: string;
+  readonly revision: JsonValue;
+  readonly actionDigest: string;
+}
+
+/**
+ * Feature-facing Git client. It sends only canonical identities and reviewed
+ * action data to the server; paths and provider credentials are never inputs
+ * to this API. Clipboard copy fails before transport use when the current
+ * host cannot perform it; reveal happens on the server host.
+ */
+export class TerminayGitClient {
+  readonly host: HostCapabilityProvider;
+
+  constructor(private readonly transport: GitClientTransport, options: GitClientHostOptions = {}) {
+    this.host = createHostCapabilityProvider(options.capabilities ?? {});
+  }
+
+  /** `fresh` asks the server to measure every worktree rather than answer
+   *  from its cached listing; set it only for a listing the user asked for. */
+  list(request: { readonly projectId?: string; readonly repositoryId?: string; readonly worktreeId?: string; readonly fresh?: boolean } = {}, options: QueryOptions = {}): Promise<JsonValue> {
+    const { fresh, ...identities } = request;
+    if (fresh !== undefined && typeof fresh !== "boolean") throw new TypeError("fresh is invalid");
+    const payload = boundedObject(identities, "Git worktree list") as Record<string, JsonValue>;
+    return this.transport.query(GIT_CLIENT_OPERATIONS.listWorktrees, fresh === true ? { ...payload, fresh: true } : payload, options);
+  }
+
+  subscribeStatusChanges(listener: (event: GitStatusChangeEvent) => void, onResync?: () => void): Promise<() => void> {
+    if (typeof this.transport.subscribeClientEvents !== "function") throw new Error("Git status subscriptions are unavailable on this transport");
+    return this.transport.subscribeClientEvents("git.status.changed", (message) => listener(validateStatusChangeEvent(message.payload)), onResync);
+  }
+
+  status(reference: Partial<GitWorktreeReference> & { readonly projectId: string }, options: QueryOptions = {}): Promise<JsonValue> {
+    return this.read(GIT_CLIENT_OPERATIONS.status, reference, options);
+  }
+
+  branch(reference: Partial<GitWorktreeReference> & { readonly projectId: string }, options: QueryOptions = {}): Promise<JsonValue> {
+    return this.read(GIT_CLIENT_OPERATIONS.branch, reference, options);
+  }
+
+  diff(reference: Partial<GitWorktreeReference> & { readonly projectId: string; readonly path?: string }, options: QueryOptions = {}): Promise<JsonValue> {
+    const value = this.readReference(reference);
+    const path = reference.path === undefined ? undefined : boundedRelativePath(reference.path);
+    return this.transport.query(GIT_CLIENT_OPERATIONS.diff, { ...value, ...(path === undefined ? {} : { path }) }, options);
+  }
+
+  openTerminal(reference: GitWorktreeReference, options: CommandOptions = {}): Promise<JsonValue> {
+    this.host.require("nativeWindows");
+    return this.action(GIT_CLIENT_OPERATIONS.openTerminal, reference, options);
+  }
+
+  switchProject(reference: GitWorktreeReference, options: CommandOptions = {}): Promise<JsonValue> {
+    this.host.require("nativeWindows");
+    return this.action(GIT_CLIENT_OPERATIONS.switchProject, reference, options);
+  }
+
+  renamePresentation(reference: GitWorktreeReference, name: string, options: CommandOptions = {}): Promise<JsonValue> {
+    if (typeof name !== "string" || name.trim().length === 0 || name.length > 256 || /[\0\r\n]/u.test(name)) throw new TypeError("worktree presentation name is invalid");
+    return this.transport.command(GIT_CLIENT_OPERATIONS.renamePresentation, { ...validatedReference(reference), name }, options);
+  }
+
+  /** The server host reveals; listings say whether this client may ask. */
+  reveal(reference: GitWorktreeReference, options: CommandOptions = {}): Promise<JsonValue> {
+    return this.action(GIT_CLIENT_OPERATIONS.reveal, reference, options);
+  }
+
+  /**
+   * Show a folder of a project in the server host's file manager. Only ids are
+   * sent: the server decides which directory the folder is.
+   */
+  revealFolder(request: { readonly projectId: string; readonly folderId: string }, options: CommandOptions = {}): Promise<JsonValue> {
+    return this.transport.command(GIT_CLIENT_OPERATIONS.revealFolder, { projectId: boundedId(request.projectId, "projectId"), folderId: boundedId(request.folderId, "folderId") }, options);
+  }
+
+  copy(reference: GitWorktreeReference, options: CommandOptions = {}): Promise<JsonValue> {
+    this.host.require("clipboard");
+    return this.action(GIT_CLIENT_OPERATIONS.copy, reference, options);
+  }
+
+  pull(reference: GitWorktreeReference, options: CommandOptions = {}): Promise<JsonValue> {
+    return this.action(GIT_CLIENT_OPERATIONS.pull, reference, options);
+  }
+
+  remove(reference: GitWorktreeReference, expectedHead?: string | null, options: CommandOptions = {}): Promise<JsonValue> {
+    const value = validatedReference(reference);
+    return this.transport.command(GIT_CLIENT_OPERATIONS.remove, { ...value, ...(expectedHead === undefined ? {} : { expectedHead: boundedHead(expectedHead) }) }, options);
+  }
+
+  /** Removes the worktree only if the server still finds it clean at the reviewed HEAD. It is a separate
+   * operation from `remove`, so a server that predates it rejects the request instead of forcing a removal. */
+  removeClean(reference: GitWorktreeReference, expectedHead: string, options: CommandOptions = {}): Promise<JsonValue> {
+    const value = validatedReference(reference);
+    if (typeof expectedHead !== "string" || expectedHead.length === 0) throw new TypeError("expectedHead is required for clean-only removal");
+    return this.transport.command(GIT_CLIENT_OPERATIONS.removeClean, { ...value, expectedHead: boundedToken(expectedHead, "expectedHead", 256) }, options);
+  }
+
+  move(reference: GitWorktreeReference, name: string, expectedHead?: string | null, options: CommandOptions = {}): Promise<JsonValue> {
+    const value = validatedReference(reference);
+    if (typeof name !== "string" || name.length === 0 || name.length > 255 || name === "." || name === ".." || name.trim() !== name || /[/\\\0\r\n]/u.test(name)) throw new TypeError("worktree directory name is invalid");
+    return this.transport.command(GIT_CLIENT_OPERATIONS.move, { ...value, name, ...(expectedHead === undefined ? {} : { expectedHead: boundedHead(expectedHead) }) }, options);
+  }
+
+  proposeQuickPush(request: GitQuickPushProposalRequest, options: CommandOptions = {}): Promise<JsonValue> {
+    const value = validatedReference(request);
+    const provider = boundedToken(request.provider, "provider", 64);
+    const targetBranch = request.targetBranch === undefined ? undefined : boundedBranch(request.targetBranch);
+    return this.transport.command(GIT_CLIENT_OPERATIONS.quickPushPropose, { ...value, provider, ...(targetBranch === undefined ? {} : { targetBranch }) }, options);
+  }
+
+  approveQuickPush(request: GitQuickPushApprovalRequest, options: CommandOptions = {}): Promise<JsonValue> {
+    if (typeof request !== "object" || request === null || Array.isArray(request)) throw new TypeError("Quick Push approval is invalid");
+    const proposalId = boundedToken(request.proposalId, "proposalId", 128);
+    const actionDigest = boundedToken(request.actionDigest, "actionDigest", 128);
+    if (typeof request.revision !== "object" || request.revision === null || Array.isArray(request.revision)) throw new TypeError("Quick Push revision is invalid");
+    return this.transport.command(GIT_CLIENT_OPERATIONS.quickPushApprove, { proposalId, revision: request.revision, actionDigest }, options);
+  }
+
+  /** One worktree's extension-published properties, including every check item. */
+  worktreeProperties(reference: { readonly projectId: string; readonly worktreeId: string }, options: QueryOptions = {}): Promise<JsonValue> {
+    return this.transport.query(GIT_CLIENT_OPERATIONS.worktreeProperties, { projectId: boundedId(reference.projectId, "projectId"), worktreeId: boundedId(reference.worktreeId, "worktreeId") }, options);
+  }
+
+  /** Answer a forge sign-in prompt the listing reported for a project. */
+  signIn(request: { readonly projectId: string; readonly origin: string; readonly choice: GitSignInChoice; readonly token?: string }, options: CommandOptions = {}): Promise<JsonValue> {
+    if (request.choice !== "accept" && request.choice !== "later" && request.choice !== "never") throw new TypeError("sign-in choice is invalid");
+    const token = request.token === undefined ? undefined : boundedToken(request.token, "token", 4096);
+    return this.transport.command(GIT_CLIENT_OPERATIONS.signIn, { projectId: boundedId(request.projectId, "projectId"), origin: boundedToken(request.origin, "origin", 2048), choice: request.choice, ...(token === undefined ? {} : { token }) }, options);
+  }
+
+  insightPreferences(options: QueryOptions = {}): Promise<JsonValue> {
+    return this.transport.query(GIT_CLIENT_OPERATIONS.insightPreferences, {}, options);
+  }
+
+  setInsightPrompts(extensionId: string, enabled: boolean, options: CommandOptions = {}): Promise<JsonValue> {
+    if (typeof enabled !== "boolean") throw new TypeError("enabled is invalid");
+    return this.transport.command(GIT_CLIENT_OPERATIONS.setInsightPrompts, { extensionId: boundedToken(extensionId, "extensionId", 128), enabled }, options);
+  }
+
+  private action(operation: string, reference: GitWorktreeReference, options: CommandOptions): Promise<JsonValue> {
+    return this.transport.command(operation, validatedReference(reference) as unknown as JsonValue, options);
+  }
+
+  private read(operation: string, reference: Partial<GitWorktreeReference> & { readonly projectId: string }, options: QueryOptions): Promise<JsonValue> {
+    return this.transport.query(operation, this.readReference(reference) as unknown as JsonValue, options);
+  }
+
+  private readReference(reference: Partial<GitWorktreeReference> & { readonly projectId: string }): Record<string, string> {
+    const projectId = boundedId(reference.projectId, "projectId");
+    const repositoryId = reference.repositoryId === undefined ? undefined : boundedId(reference.repositoryId, "repositoryId");
+    const worktreeId = reference.worktreeId === undefined ? undefined : boundedId(reference.worktreeId, "worktreeId");
+    return { projectId, ...(repositoryId === undefined ? {} : { repositoryId }), ...(worktreeId === undefined ? {} : { worktreeId }) };
+  }
+}
+
+function validatedReference(reference: GitWorktreeReference): GitWorktreeReference {
+  if (typeof reference !== "object" || reference === null || Array.isArray(reference)) throw new TypeError("Git worktree reference is invalid");
+  return {
+    projectId: boundedId(reference.projectId, "projectId"),
+    repositoryId: boundedId(reference.repositoryId, "repositoryId"),
+    worktreeId: boundedId(reference.worktreeId, "worktreeId"),
+  };
+}
+
+function boundedObject(value: Record<string, unknown>, label: string): JsonValue {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError(`${label} payload is invalid`);
+  const result: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (item === undefined) continue;
+    result[key] = boundedToken(item, key, 128);
+  }
+  return result;
+}
+
+function boundedToken(value: unknown, label: string, max: number): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > max || /[\0\r\n]/u.test(value)) throw new TypeError(`${label} is invalid`);
+  return value;
+}
+
+function boundedId(value: unknown, label: string): string {
+  const token = boundedToken(value, label, 128);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(token)) throw new TypeError(`${label} is invalid`);
+  return token;
+}
+
+function boundedHead(value: string | null): string | null { return value === null ? null : boundedToken(value, "expectedHead", 256); }
+function boundedBranch(value: string): string { const branch = boundedToken(value, "targetBranch", 256); if (branch.startsWith("-") || branch.includes("..") || branch.includes("@{") || /[\s~^:?*[\\\]]/u.test(branch)) throw new TypeError("targetBranch is invalid"); return branch; }
+function boundedRelativePath(value: string): string { if (typeof value !== "string" || value.length === 0 || value.length > 4096 || /[\0\r\n]/u.test(value) || value.startsWith("/") || value.split(/[\\/]+/u).some((part) => part === "..")) throw new TypeError("Git diff path is invalid"); return value; }
+function validateStatusChangeEvent(value: JsonValue | undefined): GitStatusChangeEvent {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("Git status event is invalid");
+  const event = value as Record<string, JsonValue | undefined>;
+  if (event.type !== "git.status.changed") throw new TypeError("Git status event type is invalid");
+  if (typeof event.revision !== "number" || !Number.isSafeInteger(event.revision) || event.revision < 0 || event.cursor !== String(event.revision)) throw new TypeError("Git status event revision is invalid");
+  const projectId = boundedId(event.projectId, "projectId");
+  const repositoryId = event.repositoryId === null ? null : boundedId(event.repositoryId, "repositoryId");
+  const worktreeId = event.worktreeId === null ? null : boundedId(event.worktreeId, "worktreeId");
+  const state = event.state;
+  if (!["ready", "not-repository", "git-unavailable", "missing-gitfile", "command-error"].includes(String(state))) throw new TypeError("Git status event state is invalid");
+  const branch = event.branch === null ? null : boundedToken(event.branch, "branch", 256);
+  const head = event.head === null ? null : boundedToken(event.head, "head", 256);
+  if (typeof event.changedFiles !== "number" || !Number.isSafeInteger(event.changedFiles) || event.changedFiles < 0 || typeof event.bounded !== "boolean") throw new TypeError("Git status event is invalid");
+  return Object.freeze({
+    revision: event.revision,
+    cursor: event.cursor as string,
+    type: "git.status.changed",
+    projectId,
+    repositoryId,
+    worktreeId,
+    state: state as GitStatusChangeEvent["state"],
+    branch,
+    head,
+    changedFiles: event.changedFiles,
+    bounded: event.bounded,
+  });
+}

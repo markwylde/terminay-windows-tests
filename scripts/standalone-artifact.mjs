@@ -1,0 +1,152 @@
+import { createHash } from 'node:crypto'
+import { lstat, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { dirname, join, sep } from 'node:path'
+
+const PACKAGE_NAME = '@terminay/server'
+const REQUIRED_FILES = ['package.json', 'dist/cli.js', 'dist/index.js', 'dist/mcpEntry.js', 'dist/bundled-npm-evidence.json']
+const NODE_ENGINE = '24.15.0'
+const NPM_INSTALLER = '12.2.0'
+const REQUIRED_BINS = {
+  'terminay-server': 'dist/cli.js',
+  'terminay-mcp': 'dist/mcpEntry.js',
+}
+// `source` is a build the operator made on their own machine from a branch or
+// commit. It carries no publisher signature, so it is never a channel the
+// release pipeline produces — only one `terminay daemon install <ref>` writes.
+export const RELEASE_CHANNELS = Object.freeze(['tag', 'main', 'source'])
+export const ARTIFACT_ARCHITECTURES = Object.freeze(['x64', 'arm64'])
+
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function fail(message) {
+  throw new Error(`standalone artifact validation failed: ${message}`)
+}
+
+async function readRegularFile(root, path) {
+  const absolute = join(root, path)
+  const info = await lstat(absolute).catch(() => undefined)
+  if (info === undefined || !info.isFile()) fail(`required file is missing or not regular: ${path}`)
+  const bytes = await readFile(absolute)
+  return { bytes, size: info.size }
+}
+
+function assertSafeManifestPath(path) {
+  if (path.length === 0 || path.startsWith('/') || path.includes('\\') || path.split('/').some((part) => part === '..' || part === '')) {
+    fail(`manifest path is not a safe relative path: ${path}`)
+  }
+}
+
+/**
+ * Validate the release coordinates that pin a payload to a channel, a commit,
+ * and an architecture. These cannot be derived from the payload, so they are
+ * supplied by the builder and recorded verbatim in the manifest.
+ */
+export function normalizeArtifactRelease(release) {
+  if (release === null || typeof release !== 'object') fail('release coordinates are missing')
+  const { channel, revision, architecture } = release
+  if (!RELEASE_CHANNELS.includes(channel)) fail(`release channel must be one of: ${RELEASE_CHANNELS.join(', ')}`)
+  if (typeof revision !== 'string' || !/^[a-f0-9]{40}$/u.test(revision)) fail('release revision must be a full lowercase commit sha')
+  if (!ARTIFACT_ARCHITECTURES.includes(architecture)) fail(`release architecture must be one of: ${ARTIFACT_ARCHITECTURES.join(', ')}`)
+  return { channel, revision, architecture }
+}
+
+/**
+ * Inspect the minimal standalone server payload without executing it. The
+ * result is deterministic and contains hashes, not file contents or secrets.
+ */
+export async function inspectStandaloneArtifact(root, release) {
+  const { channel, revision, architecture } = normalizeArtifactRelease(release)
+  const packageFile = await readRegularFile(root, 'package.json')
+  let packageJson
+  try {
+    packageJson = JSON.parse(packageFile.bytes.toString('utf8'))
+  } catch (error) {
+    fail(`package.json is not valid JSON: ${error instanceof Error ? error.message : 'unknown error'}`)
+  }
+
+  if (packageJson?.name !== PACKAGE_NAME) fail(`package name must be ${PACKAGE_NAME}`)
+  if (typeof packageJson.version !== 'string' || packageJson.version.length === 0) fail('package version is missing')
+  if (packageJson.engines?.node !== NODE_ENGINE) fail(`Node engine must be pinned to ${NODE_ENGINE}`)
+  if (packageJson.dependencies?.npm !== NPM_INSTALLER) fail(`bundled npm installer must be pinned to ${NPM_INSTALLER}`)
+  const npmEvidence = JSON.parse((await readRegularFile(root, 'dist/bundled-npm-evidence.json')).bytes.toString('utf8'))
+  if (npmEvidence?.schemaVersion !== 1 || npmEvidence?.version !== NPM_INSTALLER || !Number.isSafeInteger(npmEvidence?.packageCount) || npmEvidence.packageCount < 50 || !Array.isArray(npmEvidence.packages) || npmEvidence.packages.length !== npmEvidence.packageCount || !/^[a-f0-9]{64}$/u.test(npmEvidence.closureSha256)) fail('bundled npm closure evidence is invalid')
+  if (!Array.isArray(packageJson.files) || !packageJson.files.includes('dist')) fail('package files must include dist')
+  if (!Object.entries(REQUIRED_BINS).every(([name, path]) => packageJson.bin?.[name] === path) || Object.keys(packageJson.bin ?? {}).length !== Object.keys(REQUIRED_BINS).length) {
+    fail('standalone artifact must expose exactly the terminay-server and terminay-mcp bins')
+  }
+
+  const files = []
+  for (const path of REQUIRED_FILES) {
+    const file = path === 'package.json' ? packageFile : await readRegularFile(root, path)
+    const normalizedPath = path.split(sep).join('/')
+    assertSafeManifestPath(normalizedPath)
+    files.push({ path: normalizedPath, size: file.size, sha256: sha256(file.bytes) })
+  }
+
+  for (const path of ['dist/cli.js', 'dist/index.js', 'dist/mcpEntry.js']) {
+    const source = (await readFile(join(root, path), 'utf8'))
+    if (/['"]electron(?:\/|['"])/u.test(source)) fail(`${path} imports Electron`)
+  }
+
+  return {
+    schemaVersion: 1,
+    artifact: 'terminay-server',
+    channel,
+    revision,
+    architecture,
+    package: { name: packageJson.name, version: packageJson.version, node: packageJson.engines.node, npm: packageJson.dependencies.npm },
+    files,
+    provenance: {
+      generatedBy: 'scripts/standalone-artifact.mjs',
+      packageManifest: 'package.json',
+      lockfile: 'package-lock.json',
+    },
+  }
+}
+
+/** Write a deterministic payload manifest next to a standalone artifact. */
+export async function writeStandaloneArtifactManifest(root, release, outputPath = join(root, 'artifact-manifest.json')) {
+  const manifest = await inspectStandaloneArtifact(root, release)
+  await mkdir(dirname(outputPath), { recursive: true })
+  await writeFile(outputPath, `${JSON.stringify(manifest, null, 2)}\n`)
+  return manifest
+}
+
+/**
+ * Re-hash a payload and compare it with a previously generated manifest. This
+ * intentionally does not verify signatures; release signing remains a later
+ * gate and cannot be implied by this check.
+ */
+export async function validateStandaloneArtifact(root, manifest, expectedRelease) {
+  if (manifest === null || typeof manifest !== 'object' || manifest.schemaVersion !== 1 || manifest.artifact !== 'terminay-server') {
+    fail('manifest schema or artifact name is invalid')
+  }
+  if (!Array.isArray(manifest.files) || manifest.files.length !== REQUIRED_FILES.length) fail('manifest file list is invalid')
+  const release = normalizeArtifactRelease({ channel: manifest.channel, revision: manifest.revision, architecture: manifest.architecture })
+  if (expectedRelease !== undefined) {
+    const wanted = normalizeArtifactRelease(expectedRelease)
+    for (const field of ['channel', 'revision', 'architecture']) {
+      if (release[field] !== wanted[field]) fail(`manifest ${field} is ${release[field]}, expected ${wanted[field]}`)
+    }
+  }
+  const expected = await inspectStandaloneArtifact(root, release)
+  const expectedJson = JSON.stringify(expected)
+  const actualJson = JSON.stringify({ ...manifest, provenance: expected.provenance })
+  if (actualJson !== expectedJson) fail('manifest metadata or file hashes do not match the payload')
+  return expected
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const root = process.argv[2]
+  if (!root) fail('usage: node scripts/standalone-artifact.mjs <artifact-root> [manifest-path]')
+  const outputPath = process.argv[3] ?? join(root, 'artifact-manifest.json')
+  const release = normalizeArtifactRelease({
+    channel: process.env.TERMINAY_RELEASE_CHANNEL ?? 'tag',
+    revision: process.env.TERMINAY_RELEASE_REVISION,
+    architecture: process.env.TERMINAY_RELEASE_ARCHITECTURE ?? process.arch,
+  })
+  const manifest = await writeStandaloneArtifactManifest(root, release, outputPath)
+  console.log(JSON.stringify({ artifact: manifest.artifact, version: manifest.package.version, channel: manifest.channel, revision: manifest.revision, architecture: manifest.architecture, files: manifest.files.length, outputPath }))
+}

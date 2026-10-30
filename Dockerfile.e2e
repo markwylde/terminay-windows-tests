@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1.7
+# Per-commit Electron E2E image. Dependencies come from the lockfile-keyed base
+# (Dockerfile.e2e-base); this image adds only the source, its build and the
+# browser-shell fixture's Vite dependency cache, so runners that already hold
+# the base download only these layers.
+ARG E2E_BASE_IMAGE
+FROM ${E2E_BASE_IMAGE}
+
+USER root
+COPY --chown=node:node . .
+
+USER node
+ARG TURBO_TEAM=wylde
+RUN --mount=type=secret,id=turbo_token,required=false,uid=1000,gid=1000,mode=0400 \
+    --mount=type=secret,id=turbo_signature_key,required=false,uid=1000,gid=1000,mode=0400 \
+    if [ -f /run/secrets/turbo_token ] && [ -f /run/secrets/turbo_signature_key ]; then \
+      export TURBO_TOKEN="$(cat /run/secrets/turbo_token)"; \
+      export TURBO_REMOTE_CACHE_SIGNATURE_KEY="$(cat /run/secrets/turbo_signature_key)"; \
+      export TURBO_TEAM; \
+    fi; \
+    npm run build:app
+
+# Commit the browser-shell fixture's Vite dependency bundle into the image so
+# no shard starts a fixture against a cold cache.
+RUN node --experimental-strip-types scripts/prebundle-e2e-vite-deps.mjs
+
+# A tab shows the title its program sets. Debian's ~/.bashrc writes
+# `user@host: dir` into the title at every prompt, which would name every tab
+# after the container. The suite's shells keep the same prompt without it, so
+# a tab's title is whatever the test under way gave it.
+RUN printf '%s\n' "PS1='\\u@\\h:\\w\\\$ '" >> /home/node/.bashrc
+
+ENTRYPOINT ["sh", "scripts/support/e2e-container-entrypoint.sh"]

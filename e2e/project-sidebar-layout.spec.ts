@@ -1,0 +1,1328 @@
+import { expect, type Locator, type Page, test } from './fixtures';
+import { sendAppCommand } from './support/app';
+import {
+	openFileExplorer,
+	selectSidebarGroup,
+	setProjectRoot,
+} from './support/ui';
+import { createStartedProject } from './support/project-start';
+
+type WorkspaceCommandRecord = Readonly<{
+	operation: string;
+	command?: Readonly<{
+		type: string;
+		projectId?: string;
+		sidebar?: Readonly<Record<string, unknown>>;
+	}>;
+}>;
+
+type WorkspaceTestApi = Readonly<{
+	getCommandRecords: () => Promise<readonly WorkspaceCommandRecord[]>;
+	resetCommandRecords: () => Promise<void>;
+}>;
+
+function activeSidebar(page: Page): Locator {
+	return page.locator(
+		'.project-workspace--active .file-explorer-sidebar [data-sidebar-panel-stack]',
+	);
+}
+
+function sidebarPane(page: Page, id: string): Locator {
+	return activeSidebar(page).locator(`[data-sidebar-pane-id="${id}"]`);
+}
+
+function leftColumn(page: Page): Locator {
+	return page.locator(
+		'.project-workspace--active [data-terminay-folders-column="true"]',
+	);
+}
+
+function leftColumnPanel(page: Page, id: 'tabs' | 'agents'): Locator {
+	return leftColumn(page).locator(`[data-folders-column-panel="${id}"]`);
+}
+
+function sidebarTitle(page: Page, id: string): Locator {
+	return sidebarPane(page, id).locator('[data-sidebar-pane-title]');
+}
+
+function resizeHandle(page: Page, followingPaneId: string): Locator {
+	return activeSidebar(page).locator(
+		`[data-sidebar-resize-handle="${followingPaneId}"]`,
+	);
+}
+
+async function requireWorkspaceTest(page: Page): Promise<void> {
+	await page.evaluate(() => {
+		const candidate = (
+			window as Window & {
+				terminayWorkspaceTest?: WorkspaceTestApi;
+			}
+		).terminayWorkspaceTest;
+		if (!candidate) {
+			throw new Error('Workspace command test seam is unavailable.');
+		}
+	});
+}
+
+async function expandPane(page: Page, id: string): Promise<void> {
+	const pane = sidebarPane(page, id);
+	if (
+		await pane.evaluate((element) =>
+			element.classList.contains('sidebar-pane--collapsed'),
+		)
+	) {
+		await pane.locator('.sidebar-pane__header').click();
+		await expect(pane).not.toHaveClass(/sidebar-pane--collapsed/);
+	}
+}
+
+async function commandRecords(
+	page: Page,
+): Promise<readonly WorkspaceCommandRecord[]> {
+	return await page.evaluate(async () => {
+		const candidate = (
+			window as Window & {
+				terminayWorkspaceTest?: WorkspaceTestApi;
+			}
+		).terminayWorkspaceTest;
+		if (!candidate)
+			throw new Error('Workspace command test seam is unavailable.');
+		return await candidate.getCommandRecords();
+	});
+}
+
+async function resetCommandRecords(page: Page): Promise<void> {
+	await page.evaluate(async () => {
+		const candidate = (
+			window as Window & {
+				terminayWorkspaceTest?: WorkspaceTestApi;
+			}
+		).terminayWorkspaceTest;
+		if (!candidate)
+			throw new Error('Workspace command test seam is unavailable.');
+		await candidate.resetCommandRecords();
+	});
+}
+
+const EXPLORER_GROUP_IDS = ['explorer', 'git'] as const;
+
+test('sidebar groups switch Explorer and Documentation stacks, and Agents is in the left column', async ({
+	mainWindow,
+}) => {
+	await openFileExplorer(mainWindow);
+	const tablist = mainWindow
+		.locator('.project-workspace--active')
+		.getByRole('tablist', { name: 'Sidebar' });
+	await expect(tablist.getByRole('tab', { name: 'Explorer' })).toHaveAttribute(
+		'aria-selected',
+		'true',
+	);
+	await expect(sidebarPane(mainWindow, 'explorer')).toBeVisible();
+	await expect(sidebarPane(mainWindow, 'git')).toBeVisible();
+	await expect(sidebarPane(mainWindow, 'documentation')).toHaveCount(0);
+	await expect(sidebarPane(mainWindow, 'agents')).toHaveCount(0);
+
+	await selectSidebarGroup(mainWindow, 'documentation');
+	await expect(sidebarPane(mainWindow, 'documentation')).toBeVisible();
+	await expect(sidebarPane(mainWindow, 'explorer')).toHaveCount(0);
+	await expect(sidebarPane(mainWindow, 'git')).toHaveCount(0);
+	await expect(sidebarPane(mainWindow, 'agents')).toHaveCount(0);
+
+	await expect(tablist.getByRole('tab')).toHaveCount(2);
+	await expect(tablist.getByRole('tab', { name: 'Agents' })).toHaveCount(0);
+	// Agents are a tab of the left column instead.
+	await expect(
+		leftColumn(mainWindow).getByRole('tab', { name: 'Agents' }),
+	).toBeVisible();
+
+	await selectSidebarGroup(mainWindow, 'explorer');
+	await expect(sidebarPane(mainWindow, 'explorer')).toBeVisible();
+	await expect(sidebarPane(mainWindow, 'git')).toBeVisible();
+
+	// A narrow drawer offers the same two groups: there is no Agents group
+	// at any width.
+	await mainWindow.setViewportSize({ width: 390, height: 844 });
+	await openFileExplorer(mainWindow);
+	await expect(tablist.getByRole('tab')).toHaveCount(2);
+	await expect(tablist.getByRole('tab', { name: 'Agents' })).toHaveCount(0);
+});
+
+test('sidebar visibility stays local to this device and project', async ({
+	mainWindow,
+}) => {
+	await requireWorkspaceTest(mainWindow);
+	const sidebar = mainWindow.locator(
+		'.project-workspace--active .file-explorer-sidebar',
+	);
+	const toggle = mainWindow.getByLabel('Toggle file explorer');
+
+	await expect(sidebar).not.toBeVisible();
+	await resetCommandRecords(mainWindow);
+	await toggle.click();
+	await expect(sidebar).toBeVisible();
+	await expect
+		.poll(
+			async () =>
+				(await commandRecords(mainWindow)).filter(
+					(record) => record.command?.type === 'project.sidebar.update',
+				).length,
+		)
+		.toBe(0);
+
+	await createStartedProject(mainWindow);
+	await expect(mainWindow.locator('.project-tab')).toHaveCount(2);
+	await expect(sidebar).not.toBeVisible();
+
+	await mainWindow.locator('.project-tab').first().click();
+	await expect(sidebar).toBeVisible();
+	// The restored sidebar is the first one drawn: no project is presented from
+	// default settings, sidebar closed, while this device's settings load.
+	await mainWindow.addInitScript(() => {
+		const record = window as Window & { __closedSidebarDraws?: number };
+		record.__closedSidebarDraws = 0;
+		const inspect = () => {
+			const workspace = document.querySelector('.project-workspace--active');
+			if (workspace === null) return;
+			const drawn = workspace.querySelector('.file-explorer-sidebar');
+			if (drawn === null || !drawn.checkVisibility())
+				record.__closedSidebarDraws = (record.__closedSidebarDraws ?? 0) + 1;
+		};
+		new MutationObserver(inspect).observe(document, {
+			attributes: true,
+			childList: true,
+			subtree: true,
+		});
+	});
+	await mainWindow.reload();
+	await expect(sidebar).toBeVisible();
+	expect(
+		await mainWindow.evaluate(
+			() =>
+				(window as Window & { __closedSidebarDraws?: number })
+					.__closedSidebarDraws,
+		),
+	).toBe(0);
+});
+
+async function panelGeometry(page: Page, ids: readonly string[]) {
+	return await page.evaluate(
+		(paneIds) => {
+			const stack = document.querySelector<HTMLElement>(
+				'.project-workspace--active [data-sidebar-panel-stack]',
+			);
+			if (!stack) throw new Error('Sidebar panel stack is unavailable.');
+			const rectangle = (element: Element | null) => {
+				if (!element)
+					throw new Error('Expected sidebar element is unavailable.');
+				const rect = element.getBoundingClientRect();
+				return { bottom: rect.bottom, height: rect.height, top: rect.top };
+			};
+			return {
+				stack: {
+					clientHeight: stack.clientHeight,
+					scrollHeight: stack.scrollHeight,
+					style: getComputedStyle(stack).overflowY,
+					...rectangle(stack),
+				},
+				panes: Object.fromEntries(
+					paneIds.map((id) => [
+						id,
+						{
+							body: rectangle(
+								document.querySelector(
+									`.project-workspace--active [data-sidebar-pane-id="${id}"] .sidebar-pane__body`,
+								),
+							),
+							title: rectangle(
+								document.querySelector(
+									`.project-workspace--active [data-sidebar-pane-id="${id}"] [data-sidebar-pane-title]`,
+								),
+							),
+						},
+					]),
+				),
+			};
+		},
+		[...ids],
+	);
+}
+
+async function expectTitleSafePanelLayout(page: Page, ids: readonly string[]) {
+	await expect
+		.poll(async () => {
+			const geometry = await panelGeometry(page, ids);
+			return (
+				geometry.stack.scrollHeight <= geometry.stack.clientHeight + 1 &&
+				ids.every((id) => {
+					const title = geometry.panes[id]?.title;
+					return (
+						title !== undefined &&
+						title.top >= geometry.stack.top - 1 &&
+						title.bottom <= geometry.stack.bottom + 1
+					);
+				})
+			);
+		})
+		.toBe(true);
+	return await panelGeometry(page, ids);
+}
+
+async function dragHandle(page: Page, followingPaneId: string, deltaY: number) {
+	const handle = resizeHandle(page, followingPaneId);
+	const box = await handle.boundingBox();
+	if (!box)
+		throw new Error(`Resize handle for ${followingPaneId} has no hit box.`);
+	const x = box.x + box.width / 2;
+	const y = box.y + box.height / 2;
+	await page.mouse.move(x, y);
+	await page.mouse.down();
+	await page.mouse.move(x, y + deltaY / 3);
+	await page.mouse.move(x, y + (deltaY * 2) / 3);
+	await page.mouse.move(x, y + deltaY);
+	return { x, y };
+}
+
+type ResizeReleaseTrace = Readonly<{
+	attempt: number;
+	canonicalRevision: number;
+	deltaY: number;
+	followingPaneId: string;
+	flushed: number;
+	immediatelyAfterRelease: number;
+	beforeRelease: number;
+	start: number;
+	afterCanonicalReconciliation: number;
+}>;
+
+async function animationFrames(page: Page, count: number): Promise<void> {
+	await page.evaluate(async (frameCount) => {
+		for (let index = 0; index < frameCount; index += 1) {
+			await new Promise<void>((resolve) =>
+				requestAnimationFrame(() => resolve()),
+			);
+		}
+	}, count);
+}
+
+async function sidebarBoundaryOffset(
+	page: Page,
+	followingPaneId: string,
+): Promise<number> {
+	return await page.evaluate((paneId) => {
+		const stack = document.querySelector<HTMLElement>(
+			'.project-workspace--active [data-sidebar-panel-stack]',
+		);
+		const title = document.querySelector<HTMLElement>(
+			`.project-workspace--active [data-sidebar-pane-id="${paneId}"] [data-sidebar-pane-title]`,
+		);
+		if (!stack || !title) {
+			throw new Error(`Sidebar boundary for ${paneId} is unavailable.`);
+		}
+		return (
+			title.getBoundingClientRect().top - stack.getBoundingClientRect().top
+		);
+	}, followingPaneId);
+}
+
+async function workspaceRevision(page: Page): Promise<number> {
+	const revision = Number(
+		await page
+			.locator('.app-shell')
+			.getAttribute('data-terminay-workspace-revision'),
+	);
+	if (!Number.isSafeInteger(revision) || revision < 1) {
+		throw new Error(`Workspace revision is invalid: ${revision}.`);
+	}
+	return revision;
+}
+
+/**
+ * This deliberately uses the real Electron input path. It records the exact
+ * boundary the user sees across pointer release, React rendering, and the
+ * server-owned snapshot that resolves the sidebar command. A resize that
+ * visually springs back on mouse-up fails with its complete trace.
+ */
+async function dragAndTraceRelease(
+	page: Page,
+	attempt: number,
+	followingPaneId: string,
+	deltaY: number,
+	expectedCommitCount: number,
+): Promise<ResizeReleaseTrace> {
+	const handle = resizeHandle(page, followingPaneId);
+	const box = await handle.boundingBox();
+	if (!box)
+		throw new Error(`Resize handle for ${followingPaneId} has no hit box.`);
+	const x = box.x + box.width / 2;
+	const y = box.y + box.height / 2;
+	const start = await sidebarBoundaryOffset(page, followingPaneId);
+	const revisionBeforeRelease = await workspaceRevision(page);
+
+	await page.mouse.move(x, y);
+	await page.mouse.down();
+	for (const fraction of [0.2, 0.45, 0.7, 1]) {
+		await page.mouse.move(x, y + deltaY * fraction);
+	}
+	const beforeRelease = await sidebarBoundaryOffset(page, followingPaneId);
+	expect(
+		Math.abs(beforeRelease - start),
+		`attempt ${attempt} (${followingPaneId}, ${deltaY}px) never moved during drag`,
+	).toBeGreaterThanOrEqual(20);
+
+	await page.mouse.up();
+	const immediatelyAfterRelease = await sidebarBoundaryOffset(
+		page,
+		followingPaneId,
+	);
+	await animationFrames(page, 2);
+	const flushed = await sidebarBoundaryOffset(page, followingPaneId);
+
+	await expect
+		.poll(
+			async () =>
+				(await commandRecords(page)).filter(
+					(record) => record.command?.type === 'project.sidebar.update',
+				).length,
+			{ message: `attempt ${attempt} did not reach the sidebar authority` },
+		)
+		.toBe(expectedCommitCount);
+	await expect
+		.poll(() => workspaceRevision(page), {
+			message: `attempt ${attempt} never reconciled the server workspace snapshot`,
+		})
+		.toBeGreaterThan(revisionBeforeRelease);
+	const canonicalRevision = await workspaceRevision(page);
+	await animationFrames(page, 3);
+	const afterCanonicalReconciliation = await sidebarBoundaryOffset(
+		page,
+		followingPaneId,
+	);
+
+	const trace: ResizeReleaseTrace = {
+		attempt,
+		canonicalRevision,
+		deltaY,
+		followingPaneId,
+		flushed,
+		immediatelyAfterRelease,
+		beforeRelease,
+		start,
+		afterCanonicalReconciliation,
+	};
+	for (const [phase, boundary] of Object.entries({
+		immediatelyAfterRelease,
+		flushed,
+		afterCanonicalReconciliation,
+	})) {
+		expect(
+			Math.abs(boundary - beforeRelease),
+			`${JSON.stringify(trace)} sprang back during ${phase}`,
+		).toBeLessThanOrEqual(1);
+	}
+	return trace;
+}
+
+test('real pointer releases preserve every repeated sidebar resize through React and canonical reconciliation', async ({
+	mainWindow,
+}) => {
+	test.setTimeout(90_000);
+	await openFileExplorer(mainWindow);
+	await requireWorkspaceTest(mainWindow);
+	const ids = [...EXPLORER_GROUP_IDS];
+	for (const id of ids) await expandPane(mainWindow, id);
+	await expectTitleSafePanelLayout(mainWindow, ids);
+	await resetCommandRecords(mainWindow);
+
+	const interactions = [
+		['git', 42],
+		['git', -36],
+		['git', 30],
+		['git', -42],
+		['git', 36],
+		['git', -30],
+		['git', 42],
+		['git', -36],
+		['git', 30],
+		['git', -42],
+		['git', 36],
+		['git', -30],
+	] as const;
+	const traces: ResizeReleaseTrace[] = [];
+	for (const [index, [followingPaneId, deltaY]] of interactions.entries()) {
+		traces.push(
+			await dragAndTraceRelease(
+				mainWindow,
+				index + 1,
+				followingPaneId,
+				deltaY,
+				index + 1,
+			),
+		);
+	}
+
+	expect(traces).toHaveLength(12);
+	expect(new Set(traces.map((trace) => trace.followingPaneId))).toEqual(
+		new Set(['git']),
+	);
+	await expectTitleSafePanelLayout(mainWindow, ids);
+});
+
+type FastGitResizeSample = Readonly<{
+	boundary: number;
+	commandCount: number;
+	revision: number;
+	when:
+		| 'start'
+		| 'held-before-release'
+		| 'release'
+		| 'flushed'
+		| 'reconciled';
+}>;
+
+async function sidebarUpdateCount(page: Page): Promise<number> {
+	return (await commandRecords(page)).filter(
+		(record) => record.command?.type === 'project.sidebar.update',
+	).length;
+}
+
+/**
+ * Sample what follows a release, each at the event it waits on: two frames
+ * for React to draw the release, then the sidebar command reaching the
+ * authority and the window drawing the server's revision after it, and three
+ * frames more. The canonical reconciliation is the last thing that moves the
+ * boundary, so a spring-back has happened by the last sample.
+ */
+async function sampleAfterRelease(
+	page: Page,
+	sample: (when: FastGitResizeSample['when']) => Promise<void>,
+	before: Readonly<{ commands: number; revision: number }>,
+): Promise<void> {
+	await animationFrames(page, 2);
+	await sample('flushed');
+	await expect
+		.poll(() => sidebarUpdateCount(page), {
+			message: 'the release never reached the sidebar authority',
+		})
+		.toBeGreaterThan(before.commands);
+	await expect
+		.poll(() => workspaceRevision(page), {
+			message: 'the release never reconciled the server workspace snapshot',
+		})
+		.toBeGreaterThan(before.revision);
+	await animationFrames(page, 3);
+	await sample('reconciled');
+}
+
+/**
+ * This is the manual failure report, deliberately without settling between
+ * pointer down and pointer up: Files and Git are expanded; the Files/Git
+ * boundary moves upward and the button is released in under 600ms. The full
+ * trace remains in the assertion output when the boundary later springs back.
+ */
+test('fast real release of the Files/Git boundary does not spring back', async ({
+	electronApp,
+	mainWindow,
+}) => {
+	test.setTimeout(45_000);
+	await electronApp.evaluate(({ BrowserWindow }) => {
+		const window =
+			BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
+		if (!window) throw new Error('The main BrowserWindow is unavailable.');
+		window.setBounds({ ...window.getBounds(), height: 1275, width: 1980 });
+	});
+	await openFileExplorer(mainWindow);
+	await requireWorkspaceTest(mainWindow);
+	for (const id of EXPLORER_GROUP_IDS) {
+		await expandPane(mainWindow, id);
+	}
+	const stackBox = await activeSidebar(mainWindow).boundingBox();
+	if (!stackBox) throw new Error('Sidebar stack has no geometry.');
+	const desiredGitBoundary = Math.round(stackBox.height * 0.45);
+	const currentOffset = await sidebarBoundaryOffset(mainWindow, 'git');
+	await dragHandle(mainWindow, 'git', desiredGitBoundary - currentOffset);
+	await mainWindow.mouse.up();
+	await expect
+		.poll(() => sidebarBoundaryOffset(mainWindow, 'git'))
+		.toBeCloseTo(desiredGitBoundary, 0);
+
+	await resetCommandRecords(mainWindow);
+	const handle = resizeHandle(mainWindow, 'git');
+	const box = await handle.boundingBox();
+	if (!box) throw new Error('Files/Git resize handle has no hit box.');
+	const x = box.x + box.width / 2;
+	const y = box.y + box.height / 2;
+	const startedAt = Date.now();
+	const samples: FastGitResizeSample[] = [];
+	const sample = async (when: FastGitResizeSample['when']) => {
+		samples.push({
+			boundary: await sidebarBoundaryOffset(mainWindow, 'git'),
+			commandCount: (await commandRecords(mainWindow)).filter(
+				(record) => record.command?.type === 'project.sidebar.update',
+			).length,
+			revision: await workspaceRevision(mainWindow),
+			when,
+		});
+	};
+
+	await sample('start');
+	const before = {
+		commands: await sidebarUpdateCount(mainWindow),
+		revision: await workspaceRevision(mainWindow),
+	};
+	await mainWindow.mouse.move(x, y);
+	await mainWindow.mouse.down();
+	// Four ordinary real mouse moves mirror a quick manual drag, each drawn
+	// before the next.
+	for (const fraction of [0.25, 0.5, 0.75, 1]) {
+		await mainWindow.mouse.move(x, y - 120 * fraction, { steps: 3 });
+		await animationFrames(mainWindow, 1);
+	}
+	await sample('held-before-release');
+
+	// Do not await a command, workspace snapshot, or React state update before
+	// release: this is the exact timing of the reported interaction.
+	await mainWindow.mouse.up();
+	await sample('release');
+	await sampleAfterRelease(mainWindow, sample, before);
+
+	const held = samples.find((entry) => entry.when === 'held-before-release');
+	if (!held) throw new Error('Missing held-before-release geometry.');
+	const escaped = samples.filter(
+		(entry) =>
+			entry.when !== 'start' && Math.abs(entry.boundary - held.boundary) > 1,
+	);
+	expect(
+		escaped,
+		`Files/Git boundary sprang back after a fast release: ${JSON.stringify({
+			elapsedBeforeReleaseMs: Date.now() - startedAt,
+			samples,
+			commandRecords: await commandRecords(mainWindow),
+		})}`,
+	).toEqual([]);
+});
+
+/**
+ * The manual report is intermittent. This uses one large real pointer move and
+ * immediate pointer-up twenty times, while preserving the reported visible
+ * pane set. Each attempt samples through the first post-release second; the
+ * assertion prints every failed release rather than concealing a 2-in-3 rate.
+ */
+test('twenty immediate real releases of the Files/Git boundary never spring back', { tag: '@heavy' }, async ({
+	mainWindow,
+}) => {
+	test.setTimeout(75_000);
+	await openFileExplorer(mainWindow);
+	await requireWorkspaceTest(mainWindow);
+	for (const id of EXPLORER_GROUP_IDS) {
+		await expandPane(mainWindow, id);
+	}
+	await resetCommandRecords(mainWindow);
+
+	const traces: Array<{
+		attempt: number;
+		samples: FastGitResizeSample[];
+	}> = [];
+	for (let attempt = 1; attempt <= 20; attempt += 1) {
+		const handle = resizeHandle(mainWindow, 'git');
+		const box = await handle.boundingBox();
+		if (!box) throw new Error('Files/Git resize handle has no hit box.');
+		const x = box.x + box.width / 2;
+		const y = box.y + box.height / 2;
+		const samples: FastGitResizeSample[] = [];
+		const sample = async (when: FastGitResizeSample['when']) => {
+			samples.push({
+				boundary: await sidebarBoundaryOffset(mainWindow, 'git'),
+				commandCount: (await commandRecords(mainWindow)).filter(
+					(record) => record.command?.type === 'project.sidebar.update',
+				).length,
+				revision: await workspaceRevision(mainWindow),
+				when,
+			});
+		};
+
+		await sample('start');
+		const before = {
+			commands: await sidebarUpdateCount(mainWindow),
+			revision: await workspaceRevision(mainWindow),
+		};
+		await mainWindow.mouse.move(x, y);
+		await mainWindow.mouse.down();
+		await mainWindow.mouse.move(x, y - 80, { steps: 1 });
+		await sample('held-before-release');
+		// This is intentionally the next operation: no wait, snapshot poll, or
+		// framework settle is allowed between the final move and mouse release.
+		await mainWindow.mouse.up();
+		await sample('release');
+		await sampleAfterRelease(mainWindow, sample, before);
+		traces.push({ attempt, samples });
+
+		// Bring the next attempt back to approximately the same useful range;
+		// this is setup only and is deliberately not part of the sampled gesture.
+		const restoreHandle = resizeHandle(mainWindow, 'git');
+		const restoreBox = await restoreHandle.boundingBox();
+		if (!restoreBox)
+			throw new Error('Files/Git restore handle has no hit box.');
+		await mainWindow.mouse.move(
+			restoreBox.x + restoreBox.width / 2,
+			restoreBox.y + restoreBox.height / 2,
+		);
+		await mainWindow.mouse.down();
+		await mainWindow.mouse.move(
+			restoreBox.x + restoreBox.width / 2,
+			restoreBox.y + restoreBox.height / 2 + 80,
+			{ steps: 1 },
+		);
+		await mainWindow.mouse.up();
+	}
+
+	const bounced = traces.flatMap(({ attempt, samples }) => {
+		const held = samples.find((entry) => entry.when === 'held-before-release');
+		if (!held) return [{ attempt, samples }];
+		return samples.some(
+			(entry) =>
+				entry.when !== 'start' && Math.abs(entry.boundary - held.boundary) > 1,
+		)
+			? [{ attempt, samples }]
+			: [];
+	});
+	expect(
+		bounced,
+		`Fast Files/Git release traces: ${JSON.stringify({
+			bounced,
+			commandRecords: await commandRecords(mainWindow),
+		})}`,
+	).toEqual([]);
+});
+
+test('project sidebar keeps titles visible while previewing and committing VS Code-style vertical resizing', async ({
+	mainWindow,
+}) => {
+	test.setTimeout(45_000);
+	await openFileExplorer(mainWindow);
+	await requireWorkspaceTest(mainWindow);
+	const ids = [...EXPLORER_GROUP_IDS];
+	for (const id of ids) {
+		await expandPane(mainWindow, id);
+		await expect(sidebarTitle(mainWindow, id)).toBeVisible();
+	}
+
+	const stack = activeSidebar(mainWindow);
+	const before = await panelGeometry(mainWindow, ids);
+	expect(before.stack.style).toBe('hidden');
+	expect(before.stack.scrollHeight).toBeLessThanOrEqual(
+		before.stack.clientHeight + 1,
+	);
+	for (const id of ids) {
+		expect(before.panes[id].title.top).toBeGreaterThanOrEqual(
+			before.stack.top - 1,
+		);
+		expect(before.panes[id].title.bottom).toBeLessThanOrEqual(
+			before.stack.bottom + 1,
+		);
+	}
+
+	const handle = resizeHandle(mainWindow, 'git');
+	const title = sidebarTitle(mainWindow, 'git');
+	const [handleBox, titleBox] = await Promise.all([
+		handle.boundingBox(),
+		title.boundingBox(),
+	]);
+	if (!handleBox || !titleBox)
+		throw new Error('Sidebar resize geometry is unavailable.');
+	expect(
+		Math.abs(handleBox.y + handleBox.height - titleBox.y),
+	).toBeLessThanOrEqual(1);
+
+	await resetCommandRecords(mainWindow);
+	const startExplorerHeight = before.panes.explorer.body.height;
+	await dragHandle(mainWindow, 'git', 48);
+	await expect
+		.poll(
+			async () =>
+				(await panelGeometry(mainWindow, ids)).panes.explorer.body.height,
+		)
+		.not.toBe(startExplorerHeight);
+	const preview = await panelGeometry(mainWindow, ids);
+	expect(
+		(await commandRecords(mainWindow)).filter(
+			(record) => record.command?.type === 'project.sidebar.update',
+		),
+	).toHaveLength(0);
+	await mainWindow.mouse.up();
+	await expect
+		.poll(
+			async () =>
+				(await commandRecords(mainWindow)).filter(
+					(record) => record.command?.type === 'project.sidebar.update',
+				).length,
+		)
+		.toBe(1);
+	const [verticalCommit] = (await commandRecords(mainWindow)).filter(
+		(record) => record.command?.type === 'project.sidebar.update',
+	);
+	expect(verticalCommit.command?.sidebar).toEqual(
+		expect.objectContaining({
+			sidebarExplorerHeight: expect.any(Number),
+			sidebarGitHeight: expect.any(Number),
+		}),
+	);
+	expect(verticalCommit.command?.sidebar).not.toEqual(
+		expect.objectContaining({
+			sidebarAgentsHeight: expect.any(Number),
+		}),
+	);
+
+	const after = await panelGeometry(mainWindow, ids);
+	expect(
+		Math.abs(after.panes.git.title.top - preview.panes.git.title.top),
+	).toBeLessThanOrEqual(1);
+	expect(after.stack.scrollHeight).toBeLessThanOrEqual(
+		after.stack.clientHeight + 1,
+	);
+	for (const id of ids) {
+		expect(after.panes[id].title.top).toBeGreaterThanOrEqual(
+			after.stack.top - 1,
+		);
+		expect(after.panes[id].title.bottom).toBeLessThanOrEqual(
+			after.stack.bottom + 1,
+		);
+	}
+	await expect(stack).toHaveCSS('overflow-y', 'hidden');
+});
+
+test('sidebar resize cancellation and width previews do not flood workspace commands', async ({
+	mainWindow,
+}) => {
+	await openFileExplorer(mainWindow);
+	await requireWorkspaceTest(mainWindow);
+	const ids = [...EXPLORER_GROUP_IDS];
+	for (const id of ids) await expandPane(mainWindow, id);
+	const initial = await panelGeometry(mainWindow, ids);
+	await resetCommandRecords(mainWindow);
+	const point = await dragHandle(mainWindow, 'git', 42);
+	await mainWindow.evaluate(
+		({ pointerId, x, y }) => {
+			window.dispatchEvent(
+				new PointerEvent('pointercancel', {
+					bubbles: true,
+					clientX: x,
+					clientY: y + 42,
+					pointerId,
+				}),
+			);
+		},
+		{ pointerId: 1, x: point.x, y: point.y },
+	);
+	// The synthetic cancellation ends the application interaction; release the
+	// Playwright mouse state before beginning the independent width interaction.
+	await mainWindow.mouse.up();
+	await expect
+		.poll(
+			async () =>
+				(await panelGeometry(mainWindow, ids)).panes.explorer.body.height,
+		)
+		.toBeCloseTo(initial.panes.explorer.body.height, 0);
+	expect(
+		(await commandRecords(mainWindow)).filter(
+			(record) => record.command?.type === 'project.sidebar.update',
+		),
+	).toHaveLength(0);
+
+	const widthHandle = mainWindow.locator('.workspace-split-layout__separator');
+	const widthBox = await widthHandle.boundingBox();
+	if (!widthBox) throw new Error('Sidebar width handle has no hit box.');
+	await pageMouseDragPreview(
+		mainWindow,
+		widthBox.x + widthBox.width / 2,
+		widthBox.y + widthBox.height / 2,
+		55,
+	);
+	expect(
+		(await commandRecords(mainWindow)).filter(
+			(record) => record.command?.type === 'project.sidebar.update',
+		),
+	).toHaveLength(0);
+	await mainWindow.mouse.up();
+	// The width is the device's, shared by every project: finishing the resize
+	// remembers it on the device and sends no workspace command at all.
+	await expect
+		.poll(() =>
+			mainWindow.evaluate(() =>
+				window.localStorage.getItem('terminay.view.column-widths.v1'),
+			),
+		)
+		.toMatch(/"sidebar":\d+/u);
+	expect(
+		(await commandRecords(mainWindow)).filter(
+			(record) => record.command?.type === 'project.sidebar.update',
+		),
+	).toHaveLength(0);
+});
+
+test('every vertical boundary supports repeated bidirectional and keyboard resizing through collapse and reorder', async ({
+	mainWindow,
+}) => {
+	await openFileExplorer(mainWindow);
+	await requireWorkspaceTest(mainWindow);
+	const ids = [...EXPLORER_GROUP_IDS];
+	for (const id of ids) await expandPane(mainWindow, id);
+
+	for (const followingPaneId of ids.slice(1)) {
+		await resetCommandRecords(mainWindow);
+		for (const delta of [28, -20, 16, -12]) {
+			await dragHandle(mainWindow, followingPaneId, delta);
+			await mainWindow.mouse.up();
+		}
+		await expect
+			.poll(
+				async () =>
+					(await commandRecords(mainWindow)).filter(
+						(record) => record.command?.type === 'project.sidebar.update',
+					).length,
+			)
+			.toBe(4);
+		const handle = resizeHandle(mainWindow, followingPaneId);
+		await expect(handle).toHaveAttribute('role', 'separator');
+		await expect(handle).toHaveAttribute('aria-valuemin', /\d+/);
+		await expect(handle).toHaveAttribute('aria-valuemax', /\d+/);
+		await expect(handle).toHaveAttribute('aria-valuenow', /\d+/);
+	}
+
+	const keyboardHandle = resizeHandle(mainWindow, 'git');
+	await resetCommandRecords(mainWindow);
+	await keyboardHandle.focus();
+	await mainWindow.keyboard.press('ArrowDown');
+	await mainWindow.keyboard.press('ArrowUp');
+	await mainWindow.keyboard.press('Home');
+	await mainWindow.keyboard.press('End');
+	await expect
+		.poll(
+			async () =>
+				(await commandRecords(mainWindow)).filter(
+					(record) => record.command?.type === 'project.sidebar.update',
+				).length,
+		)
+		.toBe(4);
+
+	const git = sidebarPane(mainWindow, 'git');
+	await git.locator('.sidebar-pane__header').click();
+	await expect(git).toHaveClass(/sidebar-pane--collapsed/);
+	await expect(sidebarTitle(mainWindow, 'git')).toBeVisible();
+	await git.locator('.sidebar-pane__header').click();
+	await expect(git).not.toHaveClass(/sidebar-pane--collapsed/);
+	await expect
+		.poll(async () =>
+			activeSidebar(mainWindow)
+				.locator('[data-sidebar-pane-id]')
+				.evaluateAll((elements) =>
+					elements.map((element) =>
+						element.getAttribute('data-sidebar-pane-id'),
+					),
+				),
+		)
+		.toEqual(['explorer', 'git']);
+	const geometry = await panelGeometry(mainWindow, ids);
+	for (const id of ids) {
+		expect(geometry.panes[id].title.top).toBeGreaterThanOrEqual(
+			geometry.stack.top - 1,
+		);
+		expect(geometry.panes[id].title.bottom).toBeLessThanOrEqual(
+			geometry.stack.bottom + 1,
+		);
+	}
+});
+
+test('sidebar never becomes the vertical scroller at supported window heights', async ({
+	createWorkspace,
+	electronApp,
+	mainWindow,
+}) => {
+	const workspace = await createWorkspace({
+		name: 'sidebar-layout-scroll-ownership',
+		seed: {
+			files: Object.fromEntries(
+				Array.from({ length: 96 }, (_, index) => [
+					`file-${String(index).padStart(3, '0')}.txt`,
+					`${index}\n`,
+				]),
+			),
+		},
+	});
+	await setProjectRoot(mainWindow, workspace.rootDir);
+	await openFileExplorer(mainWindow);
+	const ids = [...EXPLORER_GROUP_IDS];
+	for (const id of ids) await expandPane(mainWindow, id);
+
+	for (const height of [520, 700]) {
+		await electronApp.evaluate(({ BrowserWindow }, nextHeight) => {
+			const window =
+				BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
+			if (!window) throw new Error('The main BrowserWindow is unavailable.');
+			const bounds = window.getBounds();
+			window.setBounds({ ...bounds, height: nextHeight });
+		}, height);
+		await expect
+			.poll(async () => (await panelGeometry(mainWindow, ids)).stack.height)
+			.toBeGreaterThan(100);
+		const geometry = await expectTitleSafePanelLayout(mainWindow, ids);
+		expect(geometry.stack.scrollHeight).toBeLessThanOrEqual(
+			geometry.stack.clientHeight + 1,
+		);
+		for (const id of ids) {
+			expect(geometry.panes[id].title.top).toBeGreaterThanOrEqual(
+				geometry.stack.top - 1,
+			);
+			expect(geometry.panes[id].title.bottom).toBeLessThanOrEqual(
+				geometry.stack.bottom + 1,
+			);
+		}
+	}
+
+	const explorerBody = sidebarPane(mainWindow, 'explorer').locator(
+		'.sidebar-pane__body',
+	);
+	await expect
+		.poll(async () =>
+			explorerBody.evaluate(
+				(element) => element.scrollHeight > element.clientHeight,
+			),
+		)
+		.toBe(true);
+	const explorerScroll = await explorerBody.evaluate((element) => {
+		element.scrollTop = 48;
+		return element.scrollTop;
+	});
+	expect(explorerScroll).toBeGreaterThan(0);
+	expect(
+		await activeSidebar(mainWindow).evaluate((element) => element.scrollTop),
+	).toBe(0);
+});
+
+test('normal project windows enforce the title-safe minimum height', async ({
+	electronApp,
+	mainWindow,
+}) => {
+	await openFileExplorer(mainWindow);
+	const ids = [...EXPLORER_GROUP_IDS];
+	for (const id of ids) await expandPane(mainWindow, id);
+
+	const constrainedHeight = await electronApp.evaluate(({ BrowserWindow }) => {
+		const window =
+			BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
+		if (!window) throw new Error('The main BrowserWindow is unavailable.');
+		const bounds = window.getBounds();
+		window.setBounds({ ...bounds, height: 1 });
+		return window.getBounds().height;
+	});
+	expect(constrainedHeight).toBeGreaterThanOrEqual(260);
+	await expect(activeSidebar(mainWindow)).toHaveAttribute(
+		'data-sidebar-layout-feasible',
+		'true',
+	);
+	await expect(
+		activeSidebar(mainWindow).locator('[data-sidebar-minimum-height-notice]'),
+	).toHaveCount(0);
+	const geometry = await expectTitleSafePanelLayout(mainWindow, ids);
+	for (const id of ids) {
+		const title = geometry.panes[id]?.title;
+		if (!title) throw new Error(`Missing ${id} sidebar title geometry.`);
+		expect(title.top).toBeGreaterThanOrEqual(geometry.stack.top - 1);
+		expect(title.bottom).toBeLessThanOrEqual(geometry.stack.bottom + 1);
+	}
+});
+
+test('committed pane sizes remain project-local through project switching and renderer reload', async ({
+	mainWindow,
+}) => {
+	test.setTimeout(90_000);
+	await openFileExplorer(mainWindow);
+	const ids = [...EXPLORER_GROUP_IDS];
+	for (const id of ids) await expandPane(mainWindow, id);
+	const firstProjectId = await mainWindow
+		.locator('.project-tab--active')
+		.getAttribute('data-project-id');
+	if (!firstProjectId)
+		throw new Error('Active project identity is unavailable.');
+	await dragHandle(mainWindow, 'git', 56);
+	await mainWindow.mouse.up();
+	const firstHeight = (await panelGeometry(mainWindow, ids)).panes.explorer.body
+		.height;
+	// The reload below rebuilds the sidebar from the server's snapshot, so the
+	// resize must have been applied there, not only shown by the renderer's
+	// pending-commit overlay. The server records a command as it applies it.
+	await expect
+		.poll(async () =>
+			(await commandRecords(mainWindow)).some(
+				(record) =>
+					record.command?.type === 'project.sidebar.update' &&
+					record.command.projectId === firstProjectId &&
+					typeof record.command.sidebar?.sidebarExplorerHeight === 'number',
+			),
+		)
+		.toBe(true);
+
+	await createStartedProject(mainWindow);
+	await expect(mainWindow.locator('.project-tab')).toHaveCount(2);
+	await expect(mainWindow.locator('[data-pending-project-id]')).toHaveCount(0);
+	await openFileExplorer(mainWindow);
+	await expect(activeSidebar(mainWindow)).toBeVisible();
+	for (const id of ids) await expandPane(mainWindow, id);
+	const secondHeight = (await panelGeometry(mainWindow, ids)).panes.explorer
+		.body.height;
+	expect(secondHeight).not.toBeCloseTo(firstHeight, 0);
+
+	// A sidebar that is still being measured mid-switch must not flash the
+	// minimum-height status, so count every one that reaches the DOM.
+	await mainWindow.evaluate(() => {
+		const counter = window as unknown as { sidebarNoticeMutations: number };
+		counter.sidebarNoticeMutations = 0;
+		new MutationObserver(() => {
+			if (document.querySelector('[data-sidebar-minimum-height-notice]')) {
+				counter.sidebarNoticeMutations += 1;
+			}
+		}).observe(document.body, { childList: true, subtree: true });
+	});
+	await mainWindow.locator(`[data-project-id="${firstProjectId}"]`).click();
+	await expect(mainWindow.locator('.project-tab--active')).toHaveAttribute(
+		'data-project-id',
+		firstProjectId,
+	);
+	await expect(activeSidebar(mainWindow)).toBeVisible();
+	await expect
+		.poll(
+			async () =>
+				(await panelGeometry(mainWindow, ids)).panes.explorer.body.height,
+		)
+		.toBeCloseTo(firstHeight, 0);
+	expect(
+		await mainWindow.evaluate(
+			() =>
+				(window as unknown as { sidebarNoticeMutations: number })
+					.sidebarNoticeMutations,
+		),
+	).toBe(0);
+	await mainWindow.reload();
+	// A reload restores this device's sidebar visibility and the project's
+	// expanded panes. The renderer first paints with default device settings
+	// (sidebar closed) and opens the sidebar once the stored ones load, so a
+	// toggle decided from a snapshot taken before that load would close the
+	// restored sidebar. Wait for the restored state itself instead.
+	await expect(activeSidebar(mainWindow)).toBeVisible();
+	for (const id of ids) {
+		await expect(sidebarPane(mainWindow, id)).not.toHaveClass(
+			/sidebar-pane--collapsed/,
+		);
+	}
+	await expect
+		.poll(
+			async () =>
+				(await panelGeometry(mainWindow, ids)).panes.explorer.body.height,
+		)
+		.toBeCloseTo(firstHeight, 0);
+});
+
+test('narrow mobile viewport opens navigation as a full-height drawer', async ({
+	mainWindow,
+}) => {
+	await mainWindow.setViewportSize({ width: 390, height: 844 });
+	await openFileExplorer(mainWindow);
+	const geometry = await mainWindow.evaluate(() => {
+		const layout = document.querySelector(
+			'.project-workspace--active [data-shared-ui="workspace-split-layout"]',
+		);
+		const navigation = document.querySelector(
+			'.project-workspace--active [data-shared-ui="workspace-navigation"]',
+		);
+		if (!layout || !navigation) {
+			throw new Error('Workspace split layout is missing.');
+		}
+		const layoutRect = layout.getBoundingClientRect();
+		const navigationRect = navigation.getBoundingClientRect();
+		return {
+			layoutHeight: layoutRect.height,
+			navigationHeight: navigationRect.height,
+			navigationTop: navigationRect.top,
+			layoutTop: layoutRect.top,
+			drawer: layout.getAttribute('data-navigation-drawer'),
+		};
+	});
+	expect(geometry.drawer).toBe('true');
+	expect(geometry.navigationHeight).toBe(geometry.layoutHeight);
+	expect(geometry.navigationTop).toBe(geometry.layoutTop);
+});
+
+test('dismissing the narrow drawer restores a full-height terminal', async ({
+	mainWindow,
+}) => {
+	await mainWindow.setViewportSize({ width: 390, height: 844 });
+	const content = mainWindow.locator(
+		'.project-workspace--active [data-shared-ui="workspace-content"]',
+	);
+	await expect(content).toBeVisible();
+	const closedHeight = await content.evaluate(
+		(element) => element.getBoundingClientRect().height,
+	);
+	await openFileExplorer(mainWindow);
+	const openHeight = await content.evaluate(
+		(element) => element.getBoundingClientRect().height,
+	);
+	expect(openHeight).toBe(closedHeight);
+	await mainWindow.getByLabel('Toggle file explorer').click();
+	await expect(
+		mainWindow.locator('.project-workspace--active .file-explorer-sidebar'),
+	).toHaveCount(0);
+	const restoredHeight = await content.evaluate(
+		(element) => element.getBoundingClientRect().height,
+	);
+	expect(restoredHeight).toBe(closedHeight);
+	const layout = mainWindow.locator(
+		'.project-workspace--active [data-shared-ui="workspace-split-layout"]',
+	);
+	await expect(layout).toHaveAttribute('data-navigation-drawer', 'false');
+	const layoutHeight = await layout.evaluate(
+		(element) => element.getBoundingClientRect().height,
+	);
+	expect(restoredHeight).toBe(layoutHeight);
+});
+
+async function pageMouseDragPreview(
+	page: Page,
+	x: number,
+	y: number,
+	deltaX: number,
+): Promise<void> {
+	await page.mouse.move(x, y);
+	await page.mouse.down();
+	await page.mouse.move(x + deltaX / 2, y);
+	await page.mouse.move(x + deltaX, y);
+}
+
+test('the left column switches between Tabs and Agents from icon tabs in its band', async ({
+	appHarness,
+	mainWindow,
+}) => {
+	const column = leftColumn(mainWindow);
+	const band = column.locator('.folders-column__header');
+	const tabsTab = band.getByRole('tab', { name: 'Tabs' });
+	const agentsTab = band.getByRole('tab', { name: 'Agents' });
+	const tabsPanel = leftColumnPanel(mainWindow, 'tabs');
+	const agentsPanel = leftColumnPanel(mainWindow, 'agents');
+	const actions = band.getByRole('button', { name: 'Tabs actions' });
+
+	// Two icon tabs in the band, Tabs first and selected; the band says nothing.
+	await expect(band.getByRole('tablist')).toBeVisible();
+	await expect(band.getByRole('tab')).toHaveCount(2);
+	await expect(tabsTab).toHaveAttribute('aria-selected', 'true');
+	await expect(agentsTab).toHaveAttribute('aria-selected', 'false');
+	await expect(tabsTab).toHaveAttribute('title', 'Tabs');
+	expect((await band.innerText()).trim()).toBe('');
+	await expect(tabsPanel).toBeVisible();
+	await expect(agentsPanel).toBeHidden();
+	await expect(actions).toBeVisible();
+
+	// One list, with none of a pane's chrome and no count on the icon.
+	await expect(column.locator('.sidebar-pane')).toHaveCount(0);
+	await expect(column.locator('[data-sidebar-pane-title]')).toHaveCount(0);
+	await expect(column.locator('[data-sidebar-resize-handle]')).toHaveCount(0);
+	await expect(column.locator('.sidebar-pane__count')).toHaveCount(0);
+	expect((await agentsTab.innerText()).trim()).toBe('');
+
+	// The band and its icons match the sidebar's on the other side.
+	await openFileExplorer(mainWindow);
+	const sidebarTabs = mainWindow
+		.locator('.project-workspace--active .file-explorer-sidebar')
+		.getByRole('tablist', { name: 'Sidebar' });
+	const box = (locator: Locator) =>
+		locator.evaluate((element) => {
+			const rect = element.getBoundingClientRect();
+			return {
+				width: Math.round(rect.width),
+				height: Math.round(rect.height),
+			};
+		});
+	expect(await box(tabsTab)).toEqual(
+		await box(sidebarTabs.getByRole('tab', { name: 'Explorer' })),
+	);
+	expect(
+		await band.evaluate((element) => getComputedStyle(element).backgroundColor),
+	).toBe(
+		await sidebarTabs.evaluate(
+			(element) => getComputedStyle(element).backgroundColor,
+		),
+	);
+	expect((await band.boundingBox())?.height).toBe(
+		(await sidebarTabs.boundingBox())?.height,
+	);
+
+	// Enough terminals that the tree is taller than a short window, scrolled.
+	await mainWindow.setViewportSize({ width: 1100, height: 420 });
+	for (let created = 0; created < 8; created += 1)
+		await sendAppCommand(mainWindow, 'new-terminal');
+	const tree = tabsPanel.locator('.folders-tree');
+	await expect(tree.locator('.folders-tree__row--terminal')).toHaveCount(9);
+	await expect
+		.poll(() => tree.evaluate((el) => el.scrollHeight > el.clientHeight))
+		.toBe(true);
+	// As far down as it goes, which is what the browser will keep.
+	const scrolledTo = await tree.evaluate((element) => {
+		element.scrollTop = element.scrollHeight;
+		return element.scrollTop;
+	});
+	expect(scrolledTo).toBeGreaterThan(0);
+	// The list scrolls; the column around it does not.
+	expect(
+		await column.evaluate((el) => el.scrollHeight === el.clientHeight),
+	).toBe(true);
+
+	// Agents takes the whole column, and the actions control goes with Tabs.
+	await agentsTab.click();
+	await expect(agentsTab).toHaveAttribute('aria-selected', 'true');
+	await expect(agentsPanel).toBeVisible();
+	await expect(tabsPanel).toBeHidden();
+	await expect(actions).toHaveCount(0);
+	const body = column.locator('.folders-column__body');
+	expect((await agentsPanel.boundingBox())?.height).toBe(
+		(await body.boundingBox())?.height,
+	);
+
+	// The keyboard moves between the tabs, and focus goes with the selection.
+	await agentsTab.focus();
+	await mainWindow.keyboard.press('ArrowRight');
+	await expect(tabsTab).toHaveAttribute('aria-selected', 'true');
+	await expect(tabsTab).toBeFocused();
+	await expect(tabsPanel).toBeVisible();
+	await expect(actions).toBeVisible();
+	// The tree is where it was left.
+	expect(await tree.evaluate((element) => element.scrollTop)).toBe(
+		scrolledTo,
+	);
+	await mainWindow.keyboard.press('ArrowLeft');
+	await expect(agentsTab).toHaveAttribute('aria-selected', 'true');
+
+	// The choice is this device's, and survives a reload.
+	await mainWindow.reload();
+	await expect(
+		leftColumn(mainWindow).getByRole('tab', { name: 'Agents' }),
+	).toHaveAttribute('aria-selected', 'true');
+	await expect(leftColumnPanel(mainWindow, 'agents')).toBeVisible();
+	await expect(leftColumnPanel(mainWindow, 'tabs')).toBeHidden();
+
+	// With agent integration off there is one list and no tabs to choose from.
+	const settingsWindow = await appHarness.openSettingsWindow({
+		page: mainWindow,
+		sectionId: 'agent-integration',
+	});
+	const toggle = settingsWindow
+		.getByLabel('Agent status and sidebar')
+		.locator('input[type="checkbox"]');
+	await toggle.evaluate((element) => (element as HTMLInputElement).click());
+	await expect(toggle).not.toBeChecked();
+	await settingsWindow.close();
+	await expect(leftColumn(mainWindow).getByRole('tab')).toHaveCount(0);
+	await expect(leftColumn(mainWindow).getByRole('tablist')).toHaveCount(0);
+	await expect(leftColumnPanel(mainWindow, 'tabs')).toBeVisible();
+	await expect(leftColumnPanel(mainWindow, 'agents')).toHaveCount(0);
+	await expect(
+		leftColumn(mainWindow).getByRole('button', { name: 'Tabs actions' }),
+	).toBeVisible();
+});

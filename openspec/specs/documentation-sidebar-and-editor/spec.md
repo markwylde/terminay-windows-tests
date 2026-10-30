@@ -1,0 +1,646 @@
+# documentation-sidebar-and-editor Specification
+
+## Purpose
+
+Define the per-project Documentation pane that discovers Markdown and MDX files under the project root and the Documentation panel presentation that provides rich MDXEditor editing, isolated live preview, and debounced autosave over server-owned file identity.
+
+## Requirements
+
+### Requirement: Documentation capability scope
+
+Each project SHALL expose a Documentation pane that recursively discovers Markdown and MDX files under the project root and presents them as a focused, folder-grouped document tree. Opening a document SHALL create a dockable Documentation panel with a rich MDXEditor editing surface, live browser preview, and debounced autosave. Documentation SHALL be a distinct presentation from the general-purpose file viewer while reusing its server-owned file identity, revision, draft, conflict, save, and watch guarantees. Executable previews SHALL use the isolated MDX browser runtime.
+
+#### Scenario: Opening a document
+- **WHEN** a user selects a document in the Documentation pane
+- **THEN** a dockable Documentation panel opens with rich editing, live preview, and debounced autosave over the server-owned file session
+
+### Requirement: Documentation pane placement and persistence
+
+Documentation SHALL live in the Documentation sidebar group as a collapsible, vertically resizable pane. Additional panes in that group SHALL be reorderable with it, and its height and collapse state SHALL persist with the project, subject to the pane auto-expanding on its first visit in an app session. The pane SHALL appear for every project, and its order, height, collapse state, and folder expansion state SHALL persist with that project without changing project files or another project's sidebar.
+
+#### Scenario: Resizing and collapsing
+- **WHEN** a user resizes, collapses, or reorders the Documentation pane
+- **THEN** the choice persists with that project and does not change project files or another project's sidebar
+
+#### Scenario: Every project has the pane
+- **WHEN** any project is opened
+- **THEN** the Documentation pane is present in its Documentation sidebar group
+
+### Requirement: Documentation pane defaults and stored-state normalization
+
+Settings SHALL carry explicit defaults for the Documentation pane's collapsed state and height. Stored settings and stored project state that do not contain the Documentation pane SHALL normalize to exactly one collapsed Documentation pane appended once to the existing order, and SHALL NOT reorder, duplicate, or remove any other pane. Documentation folder expansion SHALL persist per project through the same server-owned state ownership as other expanded sidebar entries and SHALL NOT be written into project files.
+
+#### Scenario: Stored state without the pane
+- **WHEN** stored settings or stored project state contain no Documentation pane
+- **THEN** exactly one collapsed Documentation pane is appended to the existing order
+- **AND** no other pane is reordered, duplicated, or removed
+
+#### Scenario: Folder expansion persistence
+- **WHEN** a user expands Documentation folders in a project
+- **THEN** the expansion persists with that project through server-owned state and no project file is modified
+
+### Requirement: Document tree contents and ordering
+
+The pane SHALL recursively list `.md` and `.mdx` files beneath the exact project root, with extension matching following the environment's filename case rules. Only folders containing a matching document at some descendant depth SHALL appear. Folders SHALL sort before documents, and each group SHALL sort by display title using a stable locale-aware order with the canonical relative path as its tie-breaker.
+
+#### Scenario: Folder with no documents
+- **WHEN** a folder contains no `.md` or `.mdx` file at any descendant depth
+- **THEN** it does not appear in the tree
+
+#### Scenario: Sorting
+- **WHEN** the tree renders a folder's children
+- **THEN** folders sort before documents and each group sorts by display title in a stable locale-aware order, tie-broken by canonical relative path
+
+### Requirement: Ignore rules and symlink containment
+
+The tree SHALL respect the configured project file-ignore rules and SHALL skip `.git`, dependency, generated-output, hidden, and other configured ignored directories by default. Symlinks SHALL NEVER be followed outside the canonical project scope.
+
+#### Scenario: Ignored directory
+- **WHEN** a documentation file lies inside `.git`, a dependency directory, generated output, a hidden directory, or another configured ignored directory
+- **THEN** it does not appear in the tree
+
+#### Scenario: Escaping symlink
+- **WHEN** a symlink points outside the canonical project scope
+- **THEN** it is not followed
+
+### Requirement: Tree row behaviour
+
+Folder rows SHALL expand and collapse without opening a tab. Document rows SHALL expose their project-relative location accessibly when the display title differs from the filename. A manual refresh SHALL be available whenever no catalog build is in flight, so that the tree can be rescanned when filesystem observation is unavailable or when the user wants an immediate rescan.
+
+#### Scenario: Expanding a folder
+- **WHEN** a user expands or collapses a folder row
+- **THEN** no tab opens
+
+#### Scenario: Title differs from filename
+- **WHEN** a document's display title differs from its filename
+- **THEN** its project-relative location is exposed accessibly
+
+#### Scenario: Manual refresh
+- **WHEN** observation is unavailable or a user requests a rescan, and no catalog build is in flight
+- **THEN** manual refresh is available
+
+### Requirement: Server-side discovery
+
+Recursive discovery, metadata extraction, ignore handling, and observation SHALL run on the exact project's environment adapter under Terminay Server. The renderer and browser clients SHALL NEVER recursively inspect a host filesystem.
+
+#### Scenario: Building the catalog
+- **WHEN** the document catalog is built
+- **THEN** discovery, metadata extraction, ignore handling, and observation run on the project's environment adapter under the server, not in a client
+
+### Requirement: Bounded discovery
+
+Discovery SHALL be bounded by entry count, depth, bytes inspected, elapsed time, and cancellation. A partial result SHALL be explicit and SHALL remain navigable.
+
+#### Scenario: Bound reached
+- **WHEN** discovery exceeds its entry, depth, byte, or time bound, or is cancelled
+- **THEN** the partial result is explicitly marked and remains navigable
+
+### Requirement: Document catalog query
+
+The server SHALL own document discovery and expose it as one bounded catalog query taking a project identity, an optional known catalog revision, and bounded paging options. Its metadata SHALL report the catalog revision, scanned entry and file counts, a partial reason when limits stopped the scan, a next cursor when more records remain, and the root observation capability. Its body SHALL carry a bounded structured list of folder and document records, where a document record contains its project-relative path, its `md` or `mdx` extension, its display title, whether that title came from frontmatter or the filename, and a bounded diagnostic when title parsing failed. The client SHALL NOT discover documents by repeatedly expanding file-explorer directories.
+
+#### Scenario: Requesting a project catalog
+- **WHEN** a client requests the document catalog for a project
+- **THEN** it receives the catalog revision, scanned entry and file counts, any partial reason, any next cursor, the root observation capability, and a bounded list of folder and document records
+
+#### Scenario: Document record contents
+- **WHEN** a document record is returned
+- **THEN** it carries the project-relative path, the `md` or `mdx` extension, the display title, the title source, and any bounded title diagnostic
+
+#### Scenario: Catalog limits reached
+- **WHEN** traversal depth, entry count, file count, inspected bytes, result bytes, or duration reaches its bound
+- **THEN** the result is marked partial with its reason and any next cursor
+
+#### Scenario: Cross-project request
+- **WHEN** a catalog query names a project the authenticated client is not authorized for
+- **THEN** the request is rejected and no records are returned
+
+### Requirement: Frontmatter title metadata
+
+The catalog SHALL read only a bounded document prefix to determine metadata. YAML frontmatter `title` SHALL supply the display title when it is a non-empty string. Other frontmatter fields SHALL remain intact and SHALL NOT become filesystem or application authority.
+
+#### Scenario: Valid title frontmatter
+- **WHEN** a document's YAML frontmatter contains a non-empty `title` string
+- **THEN** that value becomes the display title
+
+#### Scenario: Other frontmatter fields
+- **WHEN** frontmatter contains fields other than `title`
+- **THEN** they remain intact and confer no filesystem or application authority
+
+### Requirement: Filename title fallback
+
+Without a usable frontmatter title, the filename without `.md` or `.mdx` SHALL be split on separators and common camel-case boundaries and displayed in title case. The underlying filename and canonical path SHALL NEVER change implicitly. Malformed or oversized frontmatter SHALL fall back to the filename title and SHALL expose a bounded diagnostic without hiding the document.
+
+#### Scenario: No frontmatter title
+- **WHEN** a document has no usable frontmatter title
+- **THEN** its filename without extension is split on separators and camel-case boundaries and displayed in title case, leaving the filename and canonical path unchanged
+
+#### Scenario: Malformed frontmatter
+- **WHEN** frontmatter is malformed or oversized
+- **THEN** the filename title is used, a bounded diagnostic is exposed, and the document is still listed
+
+### Requirement: Incremental catalog updates
+
+Server-owned watch events SHALL incrementally add, remove, move, retitle, and regroup documents. Atomic saves, rename and delete, temporary root loss, watch overflow, and resync SHALL follow the existing Explorer observation contract. An external metadata or filename change SHALL preserve unrelated expanded folders, selection, and open panels.
+
+#### Scenario: External rename
+- **WHEN** a document is renamed or retitled outside Terminay
+- **THEN** the tree updates incrementally while unrelated expanded folders, selection, and open panels are preserved
+
+#### Scenario: Watch overflow
+- **WHEN** watch events overflow or the root is temporarily lost
+- **THEN** the existing Explorer observation contract governs resync
+
+### Requirement: Coalesced catalog refresh from root observation
+
+Catalog invalidation SHALL use the existing project-root observation subscription. An ordinary watch event SHALL schedule one coalesced catalog refresh and SHALL NOT clear the last good tree while it is in flight. A watch overflow or resync SHALL discard incremental assumptions and fetch a fresh catalog. A stale in-flight catalog response SHALL be rejected rather than applied. Subscriptions and pending refresh timers SHALL be cancelled when the project, root, or server changes.
+
+#### Scenario: Burst of watch events
+- **WHEN** several watch events arrive in quick succession
+- **THEN** one coalesced catalog refresh is scheduled and the last good tree stays visible until it resolves
+
+#### Scenario: Watch overflow
+- **WHEN** the watch subscription reports overflow or resync
+- **THEN** incremental assumptions are discarded and a fresh catalog is fetched
+
+#### Scenario: Stale response
+- **WHEN** a catalog response arrives for a superseded request
+- **THEN** it is rejected rather than applied
+
+#### Scenario: Project or server changes
+- **WHEN** the project, root, or server changes
+- **THEN** the observation subscription and any pending refresh timer are cancelled
+
+### Requirement: Documentation panel height allocation
+
+The Documentation panel SHALL allocate its available height only to the surfaces it is currently presenting. When no live preview is displayed, the editing surface — toolbar and reading canvas together — SHALL occupy the panel's full available height at every viewport size, and the panel SHALL NOT reserve height for an absent preview. The stacked arrangement used at narrow viewports SHALL apply only when the editor and a live preview are presented together, and the boundary drawn between them SHALL be present only in that arrangement.
+
+#### Scenario: Markdown document at a phone-sized viewport
+
+- **WHEN** a Documentation panel presenting only the editor is displayed at a phone-sized viewport
+- **THEN** the editing surface fills the panel's available height, and its toolbar and reading canvas are visible and scrollable
+
+#### Scenario: Editor and preview at a narrow viewport
+
+- **WHEN** a Documentation panel presenting both the editor and a live preview is displayed at a narrow viewport
+- **THEN** the editor and the preview stack vertically, each retaining usable height, separated by a visible boundary
+
+#### Scenario: No boundary without a preview
+
+- **WHEN** a Documentation panel presents the editor without a live preview
+- **THEN** no editor-to-preview boundary is drawn, at any viewport size
+
+### Requirement: Canonical Documentation panel identity
+
+Selecting a document SHALL open or focus one canonical Documentation panel for that project file, and repeated opens SHALL NOT create duplicate Documentation panels. A normal File Viewer panel and a Documentation panel for the same canonical file SHALL NOT coexist. Opening the file through any surface SHALL focus the existing canonical file panel. If the request names a presentation or a File Viewer mode, the panel SHALL switch to it; if the request names neither, the panel SHALL keep its current presentation. A switch SHALL NOT replace the panel's server-owned file session or draft.
+
+#### Scenario: Reopening a document
+- **WHEN** a user selects an already open document
+- **THEN** the existing Documentation panel is focused rather than duplicated
+
+#### Scenario: Opening from Explorer
+- **WHEN** a file already open in Documentation mode is opened from Explorer
+- **THEN** the existing canonical file panel is focused and stays in Documentation mode
+
+#### Scenario: Opening with a requested File Viewer mode
+- **WHEN** a file already open in Documentation mode is opened with a requested File Viewer mode, such as Diff from Git changes
+- **THEN** pending Documentation edits are flushed
+- **AND** the existing canonical file panel switches to the File Viewer presentation in that mode, keeping its server-owned file session and draft
+
+### Requirement: Documentation panel presentation and title
+
+Documentation panels SHALL support the normal Dockview focus, close, split, drag, reorder, native-window, and responsive web presentations allowed by the project's environment boundary. The tab title SHALL use the current frontmatter title with the same filename fallback as the tree, and a title change SHALL update the tree and tab after the corresponding draft or save revision becomes authoritative.
+
+#### Scenario: Editing the frontmatter title
+- **WHEN** a user changes the frontmatter title and the corresponding revision becomes authoritative
+- **THEN** the tree entry and tab title update
+
+### Requirement: Link handling
+
+Project-relative `.md` and `.mdx` links SHALL open in Documentation mode. External links SHALL use the normal external-link policy.
+
+#### Scenario: Following a relative document link
+- **WHEN** a user follows a project-relative `.md` or `.mdx` link
+- **THEN** the target opens in Documentation mode
+
+#### Scenario: Following an external link
+- **WHEN** a user follows an external link
+- **THEN** the normal external-link policy applies
+
+### Requirement: Rich editing capabilities
+
+The editing surface SHALL use MDXEditor and SHALL provide the Markdown/MDX-safe capabilities represented by its supported plugins, including headings, emphasis, lists, quotes, thematic breaks, links, images, tables, code blocks, frontmatter, directives and admonitions, JSX, search and replace, undo and redo, Markdown shortcuts, Sandpack-style live code-block editors, and source and diff modes where supported. First-party MDXEditor capabilities SHALL be enabled when their required execution fits the MDX browser-runtime boundary.
+
+#### Scenario: Using a rich capability
+- **WHEN** a user applies a supported MDXEditor capability such as a table, code block, or directive
+- **THEN** the document is edited through that capability
+
+#### Scenario: Capability requiring unsafe execution
+- **WHEN** an MDXEditor capability would require execution outside the MDX browser-runtime boundary
+- **THEN** it is not enabled
+
+### Requirement: Toolbar behaviour
+
+The toolbar SHALL expose the supported rich editing actions with accessible names, keyboard operation, overflow behaviour, and a compact responsive layout. Inserting an admonition from the toolbar, including `info`, SHALL create an editable directive using the matching registered rich-editor descriptor.
+
+#### Scenario: Inserting an admonition
+- **WHEN** a user inserts any admonition type, including `info`, from the toolbar
+- **THEN** an editable directive is created from the matching registered descriptor without disrupting another panel or terminal
+
+#### Scenario: Narrow toolbar
+- **WHEN** the panel is narrow
+- **THEN** the toolbar uses its compact responsive layout with overflow, keeping accessible names and keyboard operation
+
+### Requirement: Reading canvas typography and rhythm
+
+Rich text SHALL use the application's Open Sans reading face, a comfortable body line height, and deliberate vertical rhythm for headings, paragraphs, lists, quotes, code, and tables. Task-list controls SHALL remain visually distinct to the left of their labels with a consistent readable gutter. The reading canvas SHALL use a compact leading inset and SHALL expand fluidly at desktop widths without producing edge-to-edge prose, then SHALL tighten its type and margins at narrower breakpoints. After the final block, the canvas SHALL retain scrollable trailing space equal to 80% of the Documentation tab height. Editor controls and popup menus SHALL retain the same dark palette as the Documentation surface.
+
+#### Scenario: Reading at desktop width
+- **WHEN** a Documentation panel is wide
+- **THEN** the reading canvas expands fluidly without edge-to-edge prose
+
+#### Scenario: Task list rendering
+- **WHEN** a Markdown task list is displayed
+- **THEN** each checkbox sits to the left of, and is clearly separated from, its label by a consistent gutter
+
+#### Scenario: Scrolling to the end
+- **WHEN** a user scrolls past the final block
+- **THEN** trailing space equal to 80% of the Documentation tab height remains scrollable
+
+#### Scenario: Opening a toolbar dropdown
+- **WHEN** a user opens an editor control or popup menu
+- **THEN** it uses the same dark palette as the Documentation surface
+
+### Requirement: Table presentation
+
+Rich table cells SHALL use the Documentation palette and readable row sizing. Structural row, column, and add controls SHALL remain visually quiet until their relevant edge is hovered or focused instead of filling an empty table with persistent icons.
+
+#### Scenario: Empty table
+- **WHEN** a table has no hovered or focused edge
+- **THEN** its structural row, column, and add controls stay quiet rather than showing persistent icons
+
+### Requirement: Documentation status bar
+
+The Documentation status bar SHALL report the file size and sync state and SHALL NOT label the rich editor as Monaco.
+
+#### Scenario: Status bar contents
+- **WHEN** a Documentation panel is open
+- **THEN** the status bar shows file size and sync state without naming the editor as Monaco
+
+### Requirement: Fenced code block editing
+
+Inserting a fenced code block SHALL open a registered dark CodeMirror editor and SHALL NEVER take down the surrounding rich editor.
+
+#### Scenario: Inserting a code block
+- **WHEN** a user inserts a fenced code block
+- **THEN** a registered dark CodeMirror editor opens inside the surrounding rich editor, which continues to function
+
+### Requirement: Soft line break rendering
+
+The rich text surface SHALL render a Markdown soft line break — a single newline inside a paragraph, list item, heading, table cell, or block quote — as a space, matching the live preview and standard Markdown rendering. A hard line break SHALL continue to render as a line break. Whitespace a user types SHALL remain significant: consecutive spaces and a trailing space at the end of a line SHALL stay visible and editable in the rich text surface.
+
+#### Scenario: Paragraph wrapped across source lines
+- **WHEN** a document contains a paragraph whose source is wrapped over several lines separated by single newlines
+- **THEN** the rich text surface shows it as continuous prose with a space at each wrap, breaking only where the surface itself runs out of width
+- **AND** the live preview and the rich text surface show the same paragraph breaks
+
+#### Scenario: Blank line between paragraphs
+- **WHEN** two blocks of text are separated by a blank line
+- **THEN** the rich text surface shows them as separate paragraphs
+
+#### Scenario: Hard line break
+- **WHEN** a paragraph contains a hard line break
+- **THEN** the rich text surface shows a line break at that point
+
+#### Scenario: Code keeps its own line breaks
+- **WHEN** a document contains a fenced code block, or is shown in source or diff mode
+- **THEN** every line break in it is preserved exactly as written
+
+#### Scenario: Typing significant whitespace
+- **WHEN** a user types consecutive spaces, or a space at the end of a line
+- **THEN** that whitespace remains visible and the caret stays where the user put it
+
+#### Scenario: Caret movement across a wrap
+- **WHEN** a user moves the caret, selects, or deletes across a point where the source wraps
+- **THEN** the text behaves as a single continuous paragraph
+
+### Requirement: Reading a document never rewrites it
+
+The rich text surface SHALL report the normalization it performs when it parses a document, and the Documentation panel SHALL NOT treat that report as an edit. Opening, reading, and closing a document without typing SHALL leave its bytes on disk unchanged and SHALL NOT put the document into an unsaved state.
+
+#### Scenario: Opening a hand-wrapped document
+- **WHEN** a user opens a document whose paragraphs are wrapped over several source lines and does not type
+- **THEN** the file on disk is unchanged after the autosave delay has passed
+- **AND** the document is not reported as having unsaved changes
+
+#### Scenario: Closing without typing
+- **WHEN** a user opens a document and closes it without typing
+- **THEN** no save is performed and the file on disk is unchanged
+
+### Requirement: Saving writes the document as the rich text surface holds it
+
+When a user edits a document, the save SHALL write the whole document as the rich text surface holds it, in which a paragraph wrapped over several source lines is one paragraph on one line. The words SHALL be unchanged; only the line wrapping of the prose SHALL differ.
+
+#### Scenario: Editing a hand-wrapped document
+- **WHEN** a user types into a document whose paragraphs are wrapped over several source lines
+- **THEN** the saved file holds each of those paragraphs on a single line with the same words
+
+#### Scenario: Structure is not reflowed
+- **WHEN** such a document is saved
+- **THEN** its headings, lists, tables, code blocks, and blank-line paragraph boundaries are still present and separate
+
+### Requirement: Lossless source handling
+
+Source constructs that have no rich visual editor SHALL remain losslessly editable in source mode or an appropriate structured placeholder. Switching rich, source, diff, and preview presentations SHALL NOT discard a draft.
+
+#### Scenario: Unsupported construct
+- **WHEN** a document contains a construct with no rich visual editor
+- **THEN** it remains losslessly editable in source mode or through a structured placeholder
+
+#### Scenario: Switching presentation
+- **WHEN** a user switches between rich, source, diff, and preview
+- **THEN** the draft is retained
+
+### Requirement: Markdown and MDX format boundary
+
+Markdown documents SHALL NOT gain MDX syntax merely by being opened. If a user introduces MDX-only syntax into a `.md` file, the editor SHALL explain the format mismatch and SHALL offer an explicit rename to `.mdx`; it SHALL NOT silently rename the file or strip syntax.
+
+#### Scenario: Opening a .md file
+- **WHEN** a `.md` document is opened
+- **THEN** no MDX syntax is introduced
+
+#### Scenario: MDX syntax typed into a .md file
+- **WHEN** a user introduces MDX-only syntax into a `.md` file
+- **THEN** the editor explains the mismatch and offers an explicit rename to `.mdx` without silently renaming or stripping content
+
+### Requirement: Project images and assets
+
+Relative project images and assets SHALL resolve from the document folder through server-authorized resource identities. Image insertion that creates or copies a project file SHALL be an explicit filesystem mutation with normal project scope validation. Rich-editor images SHALL preserve their intrinsic aspect ratio and SHALL be capped at the available width of the Documentation reading canvas.
+
+#### Scenario: Rendering a relative image
+- **WHEN** a document references a relative project image
+- **THEN** it resolves from the document folder through a server-authorized resource identity, preserving aspect ratio and capped at the canvas width
+
+#### Scenario: Inserting an image file
+- **WHEN** image insertion creates or copies a project file
+- **THEN** it is an explicit filesystem mutation subject to normal project scope validation
+
+### Requirement: Preview isolation
+
+The executable preview SHALL always be rendered through the isolated MDX browser runtime. The MDXEditor editing surface SHALL NEVER evaluate project imports inside Terminay's main renderer.
+
+#### Scenario: Previewing an MDX document
+- **WHEN** an MDX document with project imports is previewed
+- **THEN** evaluation occurs only in the isolated MDX browser runtime, never in Terminay's main renderer
+
+### Requirement: Documentation autosave debounce
+
+Documentation mode SHALL autosave after one second without an editor change. Continued typing SHALL reset the debounce and SHALL NOT create overlapping saves. Autosave SHALL use the shared server-owned file session and SHALL declare the expected disk and draft revisions, preserving atomic-write, canonical-path, size, authorization, and environment guarantees from the file viewer.
+
+#### Scenario: Pausing typing
+- **WHEN** a user stops editing for one second
+- **THEN** an autosave runs against the shared server-owned file session declaring expected disk and draft revisions
+
+#### Scenario: Continuous typing
+- **WHEN** a user keeps typing
+- **THEN** the debounce resets and no overlapping saves are issued
+
+### Requirement: Autosave status reporting
+
+Routine autosave state SHALL be reported by the shared bottom status bar, and the rich editor SHALL NOT add a second `Saving`, `Saved`, or `Unsaved changes` row above its toolbar. Contextual notices SHALL remain available for conflicts, failures, preview diagnostics, and cancellable work. A successful save SHALL advance the base revision and clear dirty state.
+
+#### Scenario: Routine save
+- **WHEN** an autosave succeeds
+- **THEN** the shared bottom status bar reports it, the base revision advances, dirty state clears, and no duplicate status row appears above the toolbar
+
+#### Scenario: Conflict or failure
+- **WHEN** a save conflicts or fails
+- **THEN** a contextual notice is presented
+
+### Requirement: Flush on blur, presentation change, and close
+
+Blur, presentation changes, and an attempted close SHALL request an immediate flush of a pending debounce. Closing SHALL wait for the bounded in-flight result; a failure or conflict SHALL keep the draft and SHALL ask whether to keep the panel open or close while retaining the server-owned draft.
+
+#### Scenario: Closing with pending changes
+- **WHEN** a user closes a Documentation panel with a pending debounce
+- **THEN** the save flushes immediately and the close waits for the bounded in-flight result
+
+#### Scenario: Close-time save failure
+- **WHEN** the flushed save fails or conflicts on close
+- **THEN** the draft is retained and the user is asked whether to keep the panel open or close
+
+### Requirement: Save serialization
+
+A slow save SHALL serialize later editor revisions and SHALL save the newest pending revision next. An older completion SHALL NOT mark newer unsaved content saved.
+
+#### Scenario: Editing during a slow save
+- **WHEN** a user edits while a save is in flight
+- **THEN** the newest pending revision is saved next and the older completion does not mark it saved
+
+### Requirement: Self-write event reconciliation
+
+A successful autosave SHALL retain a bounded history of exact written file revisions while delayed filesystem observations settle. Duplicate delayed self-write events from an earlier save SHALL remain acknowledged after the user begins a later edit and SHALL NEVER enter the external-conflict flow.
+
+#### Scenario: Delayed self-write event
+- **WHEN** a delayed filesystem event for an earlier autosave arrives after the user has begun a later edit
+- **THEN** it is acknowledged from the bounded revision history and does not enter the external-conflict flow
+
+### Requirement: External change handling
+
+An external change to a clean document SHALL refresh the editor. An external change while local changes are dirty or saving SHALL enter the existing explicit conflict flow and SHALL NEVER overwrite either version automatically.
+
+#### Scenario: Clean document changed externally
+- **WHEN** a document with no local changes changes on disk
+- **THEN** the editor refreshes
+
+#### Scenario: Dirty document changed externally
+- **WHEN** a document changes on disk while local changes are dirty or saving
+- **THEN** the explicit conflict flow starts and neither version is overwritten automatically
+
+### Requirement: Autosave scope and failure retry
+
+Normal file viewer Text and HEX modes SHALL retain their existing explicit-save behaviour. Leaving Documentation mode SHALL flush its pending autosave before the presentation changes and SHALL NOT turn general file editing into autosave. Autosave failure SHALL use bounded retry with visible status and user-triggered retry and SHALL NEVER run an unbounded write loop or silently drop a draft.
+
+#### Scenario: Leaving Documentation mode
+- **WHEN** a panel switches away from Documentation mode
+- **THEN** the pending autosave flushes first and the new presentation retains explicit-save behaviour
+
+#### Scenario: Repeated autosave failure
+- **WHEN** autosave keeps failing
+- **THEN** retry stays bounded with visible status and a user-triggered retry, and the draft is not dropped
+
+### Requirement: Editor state preserved across saves
+
+Autosave metadata refreshes SHALL NOT remount the rich editor: the active caret, selection, composition, and keyboard focus SHALL remain in place after a save.
+
+#### Scenario: Save during typing
+- **WHEN** an autosave completes while the user is editing
+- **THEN** caret, selection, composition, and keyboard focus are unchanged
+
+### Requirement: Live preview presentation
+
+Markdown and MDX documents MAY display a live preview alongside or instead of the editor according to the selected responsive layout. `.mdx` imports, JSX expressions, project React components, and browser-safe dependencies SHALL execute in the isolated runtime without a trust prompt. Network connections, external assets, interactive controls, JavaScript form handlers, governed downloads, browser storage, and cookies SHALL behave according to the MDX browser-runtime contract.
+
+#### Scenario: Rendering a project component
+- **WHEN** an MDX document imports a project React component
+- **THEN** it renders in the isolated runtime with normal browser networking and external assets and without a trust prompt
+
+### Requirement: Preview navigation containment
+
+Preview navigation and popup attempts SHALL NOT replace the document, navigate Terminay, or create an ungoverned window.
+
+#### Scenario: Preview attempts navigation
+- **WHEN** preview content attempts navigation or a popup
+- **THEN** the document is not replaced, Terminay does not navigate, and no ungoverned window is created
+
+### Requirement: Preview error containment
+
+Compilation and runtime errors SHALL leave the editor and autosaved draft usable. Diagnostics SHALL identify the relevant source or import and SHALL offer preview restart.
+
+#### Scenario: MDX compilation error
+- **WHEN** a document fails to compile or throws at runtime
+- **THEN** the editor and autosaved draft remain usable and a diagnostic identifies the source or import and offers preview restart
+
+### Requirement: Server-owned Documentation state
+
+The document catalog, metadata, file sessions, drafts, saves, watches, compilation inputs, and project resources SHALL be server-owned and scoped by authenticated server, project, and environment identity. Clients SHALL render the tree and editor through the application protocol and SHALL NEVER infer filesystem authority from an extension, title, rendered link, or MDX import.
+
+#### Scenario: Client authority
+- **WHEN** a client renders the tree or editor
+- **THEN** it derives no filesystem authority from an extension, title, rendered link, or MDX import
+
+#### Scenario: Local and remote parity
+- **WHEN** Local Desktop or a remote web client uses Documentation
+- **THEN** both use the same server-authorized catalog, file-session, watch, compilation, and resource contracts
+
+### Requirement: Panel moves and disconnect behaviour
+
+Panel moves SHALL preserve canonical file identity and draft state only where the environment boundary permits. Disconnect SHALL preserve a dirty server-owned draft, SHALL cancel in-flight catalog and resource transfers, and SHALL destroy or suspend client preview execution. Reconnect SHALL obtain a fresh bounded snapshot or revision-based resumption before editing or previewing.
+
+#### Scenario: Disconnect with unsaved work
+- **WHEN** a client disconnects with a dirty Documentation draft
+- **THEN** the server-owned draft is preserved, in-flight catalog and resource transfers are cancelled, and client preview execution is destroyed or suspended
+
+#### Scenario: Reconnect
+- **WHEN** a client reconnects
+- **THEN** it obtains a fresh bounded snapshot or revision-based resumption before editing or previewing
+
+### Requirement: Distinguishable failure states
+
+Missing roots, unsupported observation, rejected paths, bounded partial traversal, malformed frontmatter, catalog failure, file conflict, save failure, compilation failure, and preview crash SHALL be distinguishable states. A catalog refresh failure SHALL retain the last successful tree and SHALL clear only its own stale failure after recovery. A vanished open document SHALL retain its draft and SHALL offer recovery appropriate to the existing file viewer deletion and rename contract.
+
+#### Scenario: Catalog refresh fails
+- **WHEN** a catalog refresh fails
+- **THEN** the last successful tree is retained and only that failure clears after recovery
+
+#### Scenario: Open document deleted
+- **WHEN** an open document vanishes from disk
+- **THEN** its draft is retained and recovery follows the existing file viewer deletion and rename contract
+
+### Requirement: Failure isolation
+
+Failure in one document or preview SHALL NOT collapse the tree, close another panel, or interrupt a terminal. An unexpected rich-editor failure SHALL be contained to that Documentation panel; the panel SHALL retain its server-owned draft and SHALL offer an editor retry, and SHALL NEVER replace the application workspace with an empty renderer.
+
+#### Scenario: Rich editor crashes
+- **WHEN** the rich editor fails unexpectedly in one panel
+- **THEN** the failure is contained to that panel, its server-owned draft is retained, an editor retry is offered, and the workspace is not replaced by an empty renderer
+
+#### Scenario: One preview fails
+- **WHEN** one document's preview fails
+- **THEN** the tree does not collapse, other panels stay open, and terminals are uninterrupted
+
+### Requirement: Documentation non-goals
+
+Documentation SHALL NOT replace the general-purpose Explorer or file viewer, SHALL NOT turn normal file viewer editing into autosave, SHALL NOT execute MDX in Terminay's main renderer or reproduce arbitrary project development-server configuration, SHALL NOT treat frontmatter as application configuration or authorization, and SHALL NOT follow symlinks or imports outside the canonical project root.
+
+#### Scenario: Frontmatter as configuration
+- **WHEN** frontmatter contains configuration-like fields
+- **THEN** they confer no application configuration or authorization
+
+#### Scenario: Import outside the project root
+- **WHEN** an MDX import or symlink resolves outside the canonical project root
+- **THEN** it is not followed
+
+### Requirement: Documentation follows desktop zoom
+
+The Documentation editor SHALL follow the desktop zoom level that Zoom In, Zoom Out, and Reset Zoom set for terminals. Each zoom step SHALL scale rich text, source mode, and diff mode text by the same proportion it scales a default-sized terminal, and the reading column's maximum width SHALL scale with it. A Documentation tab opened after the zoom level changed SHALL start at the current level. Editor toolbars SHALL keep their size.
+
+#### Scenario: Zooming in on a document
+
+- **WHEN** a Documentation tab is open and the user invokes Zoom In
+- **THEN** the document text grows
+
+#### Scenario: Resetting zoom
+
+- **WHEN** the user invokes Reset Zoom after zooming a document
+- **THEN** the document text returns to its default size
+
+#### Scenario: Opening a document while zoomed
+
+- **WHEN** the user opens a document after zooming out
+- **THEN** the document opens at the zoomed-out size
+
+### Requirement: View source from a Documentation panel
+
+The Documentation toolbar SHALL offer an accessible, keyboard-operable **View source** action. The action SHALL flush pending Documentation edits and switch the same canonical panel to the File Viewer presentation with its mode switcher, keeping the server-owned file session and draft. If the flush fails, the panel SHALL stay in the Documentation presentation and report the save failure.
+
+#### Scenario: Viewing source
+- **WHEN** a user activates View source in a Documentation panel
+- **THEN** pending edits are flushed
+- **AND** the same panel shows the File Viewer presentation, where Text, HEX, Diff, and (when available) Tasks can be selected
+
+#### Scenario: Flush fails
+- **WHEN** a user activates View source and flushing pending edits fails
+- **THEN** the panel stays in the Documentation presentation and shows the save failure
+
+#### Scenario: Narrow toolbar
+- **WHEN** the Documentation panel is narrow
+- **THEN** View source stays reachable through the toolbar's overflow with its accessible name
+
+### Requirement: Documentation pane auto-expands on first visit
+
+Selecting the Documentation sidebar group SHALL expand the Documentation pane the first time that group is shown for a project in an app session, and SHALL start catalog indexing if no catalog has been built yet. Once the user collapses the pane themselves, selecting the group again SHALL leave it collapsed for the rest of that app session. A later app session SHALL again expand it on first visit.
+
+#### Scenario: First visit in a session
+- **WHEN** a user selects the Documentation sidebar group for the first time in an app session and the pane's stored state is collapsed
+- **THEN** the pane expands and catalog indexing starts
+
+#### Scenario: Manual collapse within the session
+- **WHEN** a user collapses the Documentation pane and later returns to the Documentation sidebar group in the same app session
+- **THEN** the pane stays collapsed
+
+#### Scenario: Next app session
+- **WHEN** the app is restarted and the user selects the Documentation sidebar group
+- **THEN** the pane expands again on that first visit
+
+### Requirement: Background catalog indexing owned by the project
+
+Catalog indexing SHALL be a background activity scoped to the project rather than to the visibility of the Documentation pane. Once started, an in-flight catalog build and its root observation subscription SHALL survive switching sidebar groups, hiding the sidebar, and collapsing the Documentation pane, and SHALL continue to completion. They SHALL be torn down only when the project, root, or server changes, or when the user stops the build.
+
+#### Scenario: Switching sidebar group mid-index
+- **WHEN** a catalog build is in flight and the user switches to another sidebar group or hides the sidebar
+- **THEN** the build continues and its result is available when the pane is shown again
+
+#### Scenario: Collapsing the pane mid-index
+- **WHEN** a catalog build is in flight and the user collapses the Documentation pane
+- **THEN** the build continues rather than being cancelled
+
+#### Scenario: Project scope ends
+- **WHEN** the project, root, or server changes
+- **THEN** the in-flight build and the root observation subscription are cancelled
+
+### Requirement: Indexing progress and cancellation in the pane header
+
+While a catalog build is in flight the Documentation pane header SHALL show a progress indicator in place of the refresh control, together with an accessibly labelled stop control. Activating stop SHALL cancel the in-flight build, retain the previously loaded catalog — an empty tree when none had loaded — and restore the refresh control. The header SHALL return to the refresh control when a build completes or fails.
+
+#### Scenario: Build in flight
+- **WHEN** a catalog build is in flight
+- **THEN** the pane header shows a progress indicator in place of the refresh control and an accessibly labelled stop control beside it
+
+#### Scenario: Stopping a build
+- **WHEN** a user activates the stop control during a build
+- **THEN** the build is cancelled, the previously loaded catalog is retained, and the refresh control returns
+
+#### Scenario: Build settles
+- **WHEN** a catalog build completes or fails
+- **THEN** the progress indicator and stop control are replaced by the refresh control

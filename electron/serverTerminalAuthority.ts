@@ -1,0 +1,2838 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash, randomBytes } from 'node:crypto';
+import { appendFileSync, watch as watchFileSystem } from 'node:fs';
+import {
+	lstat,
+	mkdir,
+	open,
+	readdir,
+	realpath,
+	rename,
+	rm,
+	stat,
+	writeFile,
+} from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
+import {
+	basename,
+	dirname,
+	isAbsolute,
+	join,
+	relative,
+	resolve,
+	sep,
+} from 'node:path';
+import type { JsonValue } from '@terminay/protocol';
+import { decodeFrame } from '@terminay/protocol';
+import { AgentStatusService } from '../packages/server-core/src/activity/agentService';
+import { agentChatProviderBridge } from '../packages/server-core/src/agentChat/extensionBridge';
+import {
+	ProjectAgentScope,
+	SessionSourceBridge,
+	type SessionSourceDiagnosticRecord,
+} from '../packages/server-core/src/activity/index';
+import type { ActivitySessionIdentity } from '../packages/server-core/src/activity/service';
+import { TerminalActivityService } from '../packages/server-core/src/activity/service';
+import { NotificationManager } from '../packages/server-core/src/notifications/manager';
+import {
+	AI_SERVER_OPERATIONS,
+	AiService,
+	createAiOperationHandlers,
+	createWorkspaceAiTargetAuthority,
+	OpenAiDictationProvider,
+	ServerParakeetDictationProvider,
+	type ServerParakeetRuntime,
+	TerminalReplayBuffer,
+	VaultProviderCredentialResolver,
+} from '../packages/server-core/src/aiService/index';
+import type { ServerCoreCompositionOptions } from '../packages/server-core/src/composition';
+import {
+	createServerCoreComposition,
+	type ServerCoreComposition,
+} from '../packages/server-core/src/composition';
+import { OrderedEventJournal } from '../packages/server-core/src/events';
+import type { ExtensionHostDiagnosticListener } from '../packages/server-core/src/extensions/diagnostics';
+import {
+	type AgentHarnessSwitches,
+	agentHarnessSwitchesFromSettings,
+	createDefaultExtensionManagement,
+	createProductionExtensionManagement,
+	McpInstallRouter,
+	SessionSourceSupervisor,
+	withdrawnAgentExtensionSwitches,
+} from '../packages/server-core/src/extensions/index';
+import type { McpServerCommand } from '@terminay/extension-api';
+import {
+	CanonicalProjectPathResolver,
+	DocumentationCatalog,
+	type DocumentationProjectContext,
+	FileCatalog,
+	type FileCatalogOperationFailure,
+	type FileCatalogProjectContext,
+	type FileCatalogStorage,
+	type FileContentProjectContext,
+	FileContentStreamService,
+	type FileProjectContext,
+	type FileSessionStorage,
+	ServerDocumentationCatalogAdapter,
+	ServerFileAdapter,
+	ServerFileCatalogAdapter,
+	ServerFileContentAdapter,
+} from '../packages/server-core/src/fileService/index';
+import {
+	type FileObservationHost,
+	ServerFileObservationAdapter,
+} from '../packages/server-core/src/fileService/observationAdapter';
+import {
+	createSessionHolderPtyFactory,
+	type SessionHolderLauncher,
+	type SessionHolderPtyFactory,
+} from '../packages/server-core/src/sessionHolder/factory';
+import { ServerGitAdapter } from '../packages/server-core/src/gitService/adapter';
+import { GitService } from '../packages/server-core/src/gitService/service';
+import type { GitObservationReport } from '../packages/server-core/src/gitService/types';
+import type { SessionHolderObservationReport } from '../packages/server-core/src/sessionHolder/observation';
+import {
+	fileWorktreePromptPreferences,
+	serverVaultWorktreeCredentials,
+	WorktreeInsightService,
+} from '../packages/server-core/src/worktreeInsights/index';
+import {
+	MdxRuntime,
+	type MdxRuntimeProjectContext,
+	ServerMdxRuntimeAdapter,
+} from '../packages/server-core/src/mdxRuntime/index';
+import type { ServerSettingsRepository } from '../packages/server-core/src/settings/repository';
+import { FOLDER_TERMINAL_CAPTURED_EVENT } from '../packages/server-core/src/workspaceProtocol';
+import {
+	createWorktreeCaptureHost,
+	type WorktreeCaptureReport,
+} from '../packages/server-core/src/worktreeCapture';
+import { gitCommandSocketHostOptions } from '../apps/terminay-server/src/gitCommandSocket';
+import type { ServerVaultComposition } from '../packages/server-core/src/settings/vaultComposition';
+import type { ShellProfileCatalogueService } from '../packages/server-core/src/shellProfiles/catalogue';
+import {
+	BoundedChunkQueue,
+	type ByteChunk,
+	createNodePtyFactory,
+	DetachableTerminalConsumerRegistry,
+	type TerminalAuthorization,
+	type TerminalCreateOptions,
+	type TerminalDimensions,
+	type TerminalEvent,
+	type TerminalService,
+	type TerminalServiceOptions,
+	type TerminalSubscription,
+	type Unsubscribe,
+} from '../packages/server-core/src/terminalService/index';
+import type {
+	BinaryQueryHandlerResult,
+	CommandRequest,
+	ConnectionDeliveryDiagnostic,
+	QueryRequest,
+	ServerConnectionLike,
+} from '../packages/server-core/src/types';
+import {
+	createInitialWorkspace,
+	type WorkspaceCommand,
+	WorkspaceStore,
+} from '../packages/server-core/src/workspace';
+import type { TerminalSessionRehome } from '../packages/server-core/src/workspaceProtocol';
+import type { WorkspaceRepository } from '../packages/server-core/src/workspaceRepository';
+import { ServerFolders } from './serverFolders';
+import {
+	type ServerMessagePort,
+	ServerPortTransport,
+	ServerScopedMessagePort,
+} from '../src/shared/serverPortTransport';
+import type {
+	AiTabMetadataGenerateRequest,
+	AiTabMetadataGenerateResult,
+	FileViewerSparseFileSaveRequest,
+	RemoteAccessStatus,
+} from '../src/types/terminay';
+import {
+	type AgentStatusIpcAuthority,
+	createServerAgentStatusIpcAdapter,
+} from './agentStatus/serverAdapter';
+import {
+	resolveTerminalForegroundProcess,
+	resolveTerminalProcessCwd,
+} from './processCwd';
+
+const require = createRequire(import.meta.url);
+type MainServerPortDiagnostics = {
+	acceptedPorts: number;
+	receivedFrames: number;
+	sentFrames: number;
+	lastReceivedType?: string;
+	lastSentType?: string;
+	lastOperation?: string;
+	lastError?: string;
+};
+const MAIN_PORT_DIAGNOSTIC_LOG_LIMIT = 32;
+const MAIN_PORT_FILE_DIAGNOSTIC_LOG_LIMIT = 256;
+const MAIN_PORT_PER_TURN_LIMIT = 256;
+const MAIN_PORT_IDENTICAL_FRAME_LIMIT = 64;
+const mainServerPortDiagnostics: MainServerPortDiagnostics = {
+	acceptedPorts: 0,
+	receivedFrames: 0,
+	sentFrames: 0,
+};
+(
+	globalThis as typeof globalThis & {
+		__terminayMainServerPortDiagnostics?: MainServerPortDiagnostics;
+	}
+).__terminayMainServerPortDiagnostics = mainServerPortDiagnostics;
+writePortDiagnostic({ phase: 'authority-module-initialized' });
+
+export function writePortDiagnostic(
+	value: Readonly<Record<string, unknown>>,
+): void {
+	if (process.env.TERMINAY_TEST !== '1') return;
+	const file = process.env.TERMINAY_PORT_DIAGNOSTIC_FILE?.trim();
+	if (!file) return;
+	try {
+		appendFileSync(
+			file,
+			`${JSON.stringify({ timestamp: Date.now(), ...value })}\n`,
+			{ encoding: 'utf8', mode: 0o600 },
+		);
+	} catch {
+		// Diagnostics must never change production or test control flow.
+	}
+}
+type NodePtyModule = {
+	spawn: Parameters<typeof createNodePtyFactory>[0]['spawn'];
+};
+
+export interface ServerTerminalAuthoritySession {
+	readonly id: string;
+	readonly serverId: string;
+	readonly projectId: string;
+	readonly cwd: string;
+	/** Shell selected when this session was created. Never derive recording
+	 * metadata from a later, mutable Desktop setting. */
+	readonly shellPath: string | null;
+	readonly pid: number | undefined;
+	readonly status: 'running' | 'exited' | 'interrupted';
+}
+
+export interface ServerTerminalRendererEvent {
+	readonly type: 'output' | 'exit' | 'skip';
+	readonly id: string;
+	readonly data?: string;
+	readonly exitCode?: number;
+	readonly signal?: number | null;
+	readonly fromPosition?: number;
+	readonly toPosition?: number;
+	readonly reason?: 'congestion' | 'attachment_closed' | 'hydration';
+}
+
+/**
+ * Host bookkeeping emitted only after server-core has accepted PTY input.
+ * This is intentionally not a protocol event: recording and remote host
+ * integrations observe committed writes without becoming terminal authority.
+ */
+export interface ServerTerminalAcceptedWrite {
+	readonly serverId: string;
+	readonly projectId: string;
+	readonly sessionId: string;
+	readonly data: string | Uint8Array;
+}
+
+/**
+ * Host bookkeeping emitted only after server-core has accepted a resize.
+ * Dimensions are normalized by TerminalService before this callback runs.
+ */
+export interface ServerTerminalAcceptedResize {
+	readonly serverId: string;
+	readonly projectId: string;
+	readonly sessionId: string;
+	readonly cols: number;
+	readonly rows: number;
+}
+
+/**
+ * Deliberately narrow, test-only observation of commands that reached the
+ * authoritative workspace reducer. It omits command-specific fields other
+ * than the sidebar patch E2E needs to assert the preview/commit boundary.
+ */
+export interface ServerWorkspaceTestCommandRecord {
+	readonly operation: 'workspace.command';
+	readonly command?: {
+		readonly type: string;
+		readonly projectId?: string;
+		readonly sidebar?: Readonly<Record<string, unknown>>;
+	};
+}
+
+/** Metadata-only host observation of a failed server-owned file operation. */
+export type ServerFileOperationFailure = FileCatalogOperationFailure;
+
+type ServerTerminalHostObserver<TEvent> = (
+	event: TEvent,
+) => void | Promise<void>;
+
+export interface ServerTerminalAuthorityOptions {
+	readonly serverId: string;
+	readonly dataRoot?: string;
+	readonly extensionHostChildEntrypoint?: string;
+	/** Verified release resources, outside ASAR so extension children can run. */
+	readonly builtInExtensionArtifactRoot?: string;
+	/** Test/host injection; production uses the embedded node-pty factory. */
+	readonly terminalService?: TerminalService;
+	/**
+	 * Keep PTYs in a detached session holder so terminals outlive this process
+	 * (ADR-0035). Requires `dataRoot`. Absent, PTYs are children of this process
+	 * and end with it.
+	 */
+	readonly sessionHolder?: {
+		/** Identifies this build; a holder from another build is drained. */
+		readonly buildId: string;
+		/** Start a detached holder process with the given extra environment,
+		 * returning it so a holder that dies before it is ready fails at once. */
+		readonly launch: SessionHolderLauncher;
+		/** How long sessions keep running with nothing attached; `null` is no limit. */
+		readonly limitMs: number | null;
+	};
+	/** Desktop-owned current shell settings for protocol-created sessions. */
+	readonly resolveDefaultShell?: TerminalServiceOptions['resolveDefaultShell'];
+	readonly maxReplayBytes?: number;
+	/** E2E-only: how long a notification must stay present before it is
+	 * published. Production leaves this unset and gets the manager's own. */
+	readonly notificationSettleMs?: number;
+	/** E2E-only: the clock terminal activity and notifications keep time by,
+	 * so a test can end their periods exactly. Production leaves this unset and
+	 * they use the real one. */
+	readonly clock?: {
+		readonly now: () => number;
+		readonly setTimeout: (handler: () => void, milliseconds: number) => unknown;
+		readonly clearTimeout: (handle: unknown) => void;
+	};
+	/** Web Push to paired devices; see the composition option of the same name. */
+	readonly push?: ServerCoreCompositionOptions['push'];
+	readonly onEvent?: (event: TerminalEvent) => void;
+	/** A terminal's panel was moved to another project and the terminal has
+	 * been re-homed with it. Anything the host issued for the terminal under
+	 * its old project, such as an MCP capability, ends here. */
+	readonly onTerminalRehomed?: (move: TerminalSessionRehome) => void;
+	/** Metadata-only observation of bounded protocol delivery pressure. */
+	readonly onDeliveryDiagnostic?: (
+		diagnostic: ConnectionDeliveryDiagnostic,
+	) => void;
+	/** A session source's typed diagnostic, such as a provider error or a
+	 * degraded process watch. It carries no path or conversation content. */
+	readonly onAgentSessionSourceDiagnostic?: (
+		record: SessionSourceDiagnosticRecord,
+	) => void;
+	/** A registered session source that failed to start. */
+	readonly onAgentSessionSourceStartFailure?: (
+		sourceId: string,
+		error: unknown,
+	) => void;
+	/** Per-harness switches at startup (`agentIntegration.harnesses`). */
+	readonly agentHarnessSwitches?: AgentHarnessSwitches;
+	/** Extension host lifecycle, including the error behind a crash. Without it
+	 * a host that dies leaves no evidence anywhere. */
+	readonly onExtensionHostDiagnostic?: ExtensionHostDiagnosticListener;
+	/** Show a worktree in the OS file manager, for this machine's own windows. */
+	readonly revealPathOnHost?: (path: string) => Promise<void> | void;
+	/** Metadata-only observer for failed server-owned filesystem operations. */
+	readonly onFileOperationFailure?: (
+		failure: ServerFileOperationFailure,
+	) => void;
+	/** Metadata-only observer for Git watches, measurements, and cache
+	 *  mismatches. Reports carry process-local ids, never a path or a ref. */
+	readonly onGitObservation?: (report: GitObservationReport) => void;
+	readonly onWorktreeCaptureObservation?: (
+		report: WorktreeCaptureReport,
+	) => void;
+	/** Metadata-only observer for session-holder lifecycle and held sessions
+	 *  ending. Reports carry no session id, path, credential, or output. */
+	readonly onSessionHolderObservation?: (
+		report: SessionHolderObservationReport,
+	) => void;
+	/** Host-only observer for input that server-core has already accepted. */
+	readonly onAcceptedWrite?: ServerTerminalHostObserver<ServerTerminalAcceptedWrite>;
+	/** Host-only observer for resize that server-core has already accepted. */
+	readonly onAcceptedResize?: ServerTerminalHostObserver<ServerTerminalAcceptedResize>;
+	/** Optional server-owned macro protocol services supplied by the host. */
+	readonly macros?: ServerCoreCompositionOptions['macros'];
+	readonly automations?: ServerCoreCompositionOptions['automations'];
+	/** Compose MCP permission approvals; set by the host that serves MCP. */
+	readonly mcpApprovals?: boolean;
+	/**
+	 * How a chat's MCP capability is minted and revoked, set by the host that
+	 * serves the control socket. Only the agent chat service receives it
+	 * (ADR-0068). Without it, chats can be created only with no MCP reach.
+	 */
+	readonly agentChatMcp?: NonNullable<
+		ServerCoreCompositionOptions['agentChat']
+	>['mcp'];
+	/** Diagnostics for chat sessions: lifecycle only, never text. */
+	readonly onAgentChatDiagnostic?: NonNullable<
+		ServerCoreCompositionOptions['agentChat']
+	>['onDiagnostic'];
+	/** Compose server-owned app windows; needs `mcpApprovals`. */
+	readonly appWindows?: ServerCoreCompositionOptions['appWindows'];
+	/** Compose the registry of user-connected MCP servers. */
+	readonly connectedServers?: ServerCoreCompositionOptions['connectedServers'];
+	/** Optional server-owned recording protocol authority supplied by Desktop. */
+	readonly recordings?: ServerCoreCompositionOptions['recordings'];
+	/** Durable server settings shared by Desktop and browser renderers. */
+	readonly settings?: ServerSettingsRepository;
+	/** Electron-owned OS-protected vault shared by server services and extension hosts. */
+	readonly vault?: ServerVaultComposition;
+	/** Server-owned shell catalogue and target revalidation authority. */
+	readonly shellProfiles?: ShellProfileCatalogueService;
+	readonly defaultProjectRoot?: () => string;
+	/** Host-owned per-session environment added after profile resolution. */
+	readonly terminalLaunchEnvironmentFor?: ServerCoreCompositionOptions['terminalLaunchEnvironmentFor'];
+	/** Already-loaded canonical repository. Production hosts must inject this;
+	 * the in-memory default remains available only to focused authority tests. */
+	readonly workspaceRepository?: WorkspaceRepository /** Desktop provider adapter retained behind the server protocol while the
+	 * canonical AI target registry is wired to workspace presentation state. */;
+	readonly aiMetadata?: {
+		readonly listModels: (
+			provider: 'claudeCode' | 'codex',
+		) => Promise<readonly { readonly id: string; readonly label: string }[]>;
+		readonly generate: (
+			request: AiTabMetadataGenerateRequest,
+		) => Promise<AiTabMetadataGenerateResult>;
+	};
+	/** Selected-server runtime; executable, environment, and paths stay in the server process. */
+	readonly parakeetRuntime?: ServerParakeetRuntime;
+	/** Privileged sparse writer. The authority verifies its project binding
+	 * before delegating the bounded atomic replacement implementation. */
+	readonly saveSparseFile?: (
+		request: FileViewerSparseFileSaveRequest,
+	) => Promise<unknown>;
+	readonly applicationFeatures?: {
+		/** Enables the `mcp-install.*` operations. The command is the exact
+		 * Terminay MCP server launch every install target writes. */
+		readonly mcpInstall?: {
+			readonly serverCommand: () => McpServerCommand;
+		};
+		readonly remoteAccess?: {
+			getStatus(): RemoteAccessStatus | Promise<RemoteAccessStatus>;
+			command(
+				operation: string,
+				value?: string,
+			): Promise<RemoteAccessStatus | boolean | unknown>;
+		};
+	};
+}
+
+interface AuthoritySession {
+	readonly id: string;
+	readonly projectId: string;
+	readonly shellPath: string | null;
+}
+
+/**
+ * Privileged bridge for the embedded Local server's terminal service.
+ *
+ * This class intentionally has no BrowserWindow/webContents ownership model.
+ * Renderer ids are only keys for detachable event subscriptions, so closing a
+ * window cannot kill a PTY. The compatibility event shape is kept here while
+ * the UI finishes moving to TerminayClient's framed terminal protocol.
+ */
+export class ServerTerminalAuthority {
+	readonly service: TerminalService;
+	readonly composition: ServerCoreComposition;
+	private readonly sessionHolder: SessionHolderPtyFactory | undefined;
+	/** Canonical Local activity authority exposed through the same protocol as
+	 * terminal streams; legacy renderer IPC is not its source of truth. */
+	readonly activity: TerminalActivityService;
+	/** The only journal/status authority for server-owned terminals. */
+	readonly agents: AgentStatusService;
+	/** Canonical workspace authority used by the server project operations. */
+	readonly workspace: WorkspaceStore;
+	/** Server-owned Git authority shared by embedded Desktop and remote hosts. */
+	readonly git: GitService;
+
+	private readonly options: ServerTerminalAuthorityOptions;
+	private readonly sessions = new Map<string, AuthoritySession>();
+	private readonly consumers: DetachableTerminalConsumerRegistry;
+	private readonly buffers = new Map<string, BoundedChunkQueue<ByteChunk>>();
+	private readonly listeners = new Set<(event: TerminalEvent) => void>();
+	/** Clients on this machine's renderer ports, as opposed to remote peers. */
+	private readonly embeddedRendererClientIds = new Set<string>();
+	private readonly rendererConnectionsByOwner = new Map<
+		string,
+		ServerConnectionLike
+	>();
+	private readonly maxReplayBytes: number;
+	private readonly fileCatalogProjects = new Map<
+		string,
+		FileCatalogProjectContext
+	>();
+	private readonly documentationProjects = new Map<
+		string,
+		DocumentationProjectContext
+	>();
+	private readonly mdxRuntimeProjects = new Map<
+		string,
+		MdxRuntimeProjectContext
+	>();
+	private readonly fileContentProjects = new Map<
+		string,
+		FileContentProjectContext
+	>();
+	private readonly fileSessionProjects = new Map<string, FileProjectContext>();
+	private readonly fileProjectRoots = new Map<string, string>();
+	/** Folder roots, folder-scoped file services, and the worktree reconciler. */
+	private readonly folders: ServerFolders;
+	private readonly worktreeCapture: ReturnType<
+		typeof createWorktreeCaptureHost
+	>;
+	private readonly agentScope: ProjectAgentScope;
+	/** Starts extension session sources and receives their publications. */
+	readonly agentSources: SessionSourceSupervisor;
+	/** Reduces session snapshots into agent entries. */
+	readonly agentBridge: SessionSourceBridge;
+	/** Extension-published worktree facts (pull requests, checks). */
+	readonly worktreeInsights: WorktreeInsightService;
+	private serviceEventsUnsubscribe: Unsubscribe | undefined;
+	private shuttingDown = false;
+	private shutdownPromise: Promise<void> | undefined;
+	/** Publishes asynchronous state changes from server-owned application features. */
+	private readonly eventJournal: OrderedEventJournal;
+	/** Undefined outside Docker/E2E runs so production performs no recording. */
+	private readonly workspaceCommandTestRecords:
+		| ServerWorkspaceTestCommandRecord[]
+		| undefined;
+	private projectCreationTestRefusals = 0;
+
+	constructor(options: ServerTerminalAuthorityOptions) {
+		if (
+			!options ||
+			typeof options.serverId !== 'string' ||
+			options.serverId.length === 0
+		) {
+			throw new TypeError('serverId is required');
+		}
+		this.options = options;
+		this.workspace =
+			options.workspaceRepository?.workspace ??
+			new WorkspaceStore(createInitialWorkspace(options.serverId));
+		this.workspaceCommandTestRecords =
+			process.env.TERMINAY_TEST === '1' ? [] : undefined;
+		this.installWorkspaceCommandTestObserver();
+		this.activity = new TerminalActivityService({
+			serverId: options.serverId,
+			...options.clock,
+		});
+		this.agents = new AgentStatusService({ activity: this.activity });
+		this.agentScope = new ProjectAgentScope();
+		const agentBridge = new SessionSourceBridge({
+			agents: this.agents,
+			scope: this.agentScope,
+			onDiagnostic: (record) => {
+				try {
+					options.onAgentSessionSourceDiagnostic?.(record);
+				} catch {
+					/* host diagnostics cannot affect session reporting */
+				}
+			},
+		});
+		this.agentBridge = agentBridge;
+		this.agentSources = new SessionSourceSupervisor({
+			bridge: agentBridge,
+			agents: this.agents,
+			...(options.agentHarnessSwitches === undefined
+				? {}
+				: { harnessSwitches: options.agentHarnessSwitches }),
+			onStartFailure: (sourceId, error) => {
+				try {
+					options.onAgentSessionSourceStartFailure?.(sourceId, error);
+				} catch {
+					/* host diagnostics cannot affect supervision */
+				}
+			},
+		});
+		this.git = new GitService({
+			limits: {
+				maxOutputBytes: 512 * 1024,
+				maxDiffBytes: 512 * 1024,
+				maxDiffHunks: 2_000,
+				maxDiffLines: 20_000,
+				maxDiffLineBytes: 16 * 1024,
+				maxStatusEntries: 128,
+				maxWorktrees: 128,
+				maxPathBytes: 4 * 1024,
+			},
+			onObservation: (report) => options.onGitObservation?.(report),
+		});
+		// Extensions publish worktree facts; the Git listing carries them to the
+		// project's clients, and a change re-lists.
+		const git = this.git;
+		this.worktreeInsights = new WorktreeInsightService({
+			...(options.vault === undefined
+				? {}
+				: { vault: serverVaultWorktreeCredentials(options.vault.vault) }),
+			...(options.dataRoot === undefined
+				? {}
+				: {
+						preferences: fileWorktreePromptPreferences(
+							resolve(options.dataRoot, 'worktree-insights.v1.json'),
+						),
+					}),
+			isProjectOpen: (projectId) =>
+				this.workspace.state.projects[projectId] !== undefined,
+			activeProjectIds: () => this.workspace.activeProjectIds(),
+			onProjectChanged: (projectId, worktreeId) =>
+				git.announceWorktreeChange(projectId, worktreeId),
+		});
+		const projectFileObservationHost = fileObservationHostForRoot(
+			(projectId) => this.fileProjectRoots.get(projectId),
+			(failure) => options.onFileOperationFailure?.(failure),
+		);
+		// Which terminal created a worktree: Git in each terminal reports its own
+		// commands to a socket with one address per data directory, so a shell
+		// kept across a restart still reaches the server (ADR-0069).
+		const worktreeCapture = createWorktreeCaptureHost({
+			...gitCommandSocketHostOptions({
+				...(options.dataRoot === undefined
+					? {}
+					: { dataDirectory: options.dataRoot }),
+				serverId: options.serverId,
+				platform: process.platform,
+				temporaryDirectory: tmpdir(),
+				...(process.env.XDG_RUNTIME_DIR
+					? { runtimeDirectory: process.env.XDG_RUNTIME_DIR }
+					: {}),
+			}),
+			workspace: () => this.workspace.state,
+			apply: (commandId, command) => {
+				const applied = this.composition.workspaceOperations?.applyHostCommand(
+					commandId,
+					command,
+				);
+				if (applied === undefined)
+					throw new Error('workspace operation registry is unavailable');
+				return applied;
+			},
+			moveAutomatically: () =>
+				options.settings?.settings.moveTerminalsIntoNewWorktreeFolders !==
+				false,
+			sessions: () => this.service.listSessions(),
+			onCaptured: (captured) => {
+				this.eventJournal.append(FOLDER_TERMINAL_CAPTURED_EVENT, {
+					...captured,
+				});
+			},
+			onObservation: (report) =>
+				options.onWorktreeCaptureObservation?.(report),
+		});
+		this.worktreeCapture = worktreeCapture;
+		// Until the socket is listening, launched terminals simply do not report,
+		// and capture falls back to the process lookup.
+		void worktreeCapture.start();
+		const folders = new ServerFolders({
+			workspace: () => this.workspace.state,
+			git,
+			capture: worktreeCapture.reconcilerHooks,
+			applyHostCommand: (commandId, command) =>
+				this.composition.workspaceOperations?.applyHostCommand(
+					commandId,
+					command,
+				),
+			storage: nodeFileCatalogStorage,
+			observationHost: (root) =>
+				fileObservationHostForRoot(
+					() => root,
+					(failure) => options.onFileOperationFailure?.(failure),
+				),
+			projects: {
+				catalog: (projectId) => this.fileCatalogProjects.get(projectId),
+				content: (projectId) => this.fileContentProjects.get(projectId),
+				session: (projectId) => this.fileSessionProjects.get(projectId),
+				observation: (projectId) =>
+					this.fileProjectRoots.has(projectId)
+						? { projectId, host: projectFileObservationHost }
+						: undefined,
+			},
+		});
+		this.folders = folders;
+		const gitAdapter = new ServerGitAdapter({
+			serverId: options.serverId,
+			git: this.git,
+			onWorktreeMove: folders.onWorktreeMove,
+			resolveProjectRoot: (projectId) =>
+				this.workspace.state.projects[projectId]?.root ?? null,
+			insights: this.worktreeInsights,
+			...(options.revealPathOnHost === undefined
+				? {}
+				: {
+						actions: {
+							reveal: async (request) => {
+								const revealPath = options.revealPathOnHost;
+								// The adapter has already bound and authorized the project.
+								const listing = await git.worktrees({
+									projectId:
+										request.projectId ?? request.authorization.projectId ?? '',
+								});
+								const worktree = listing.worktrees.find(
+									(candidate) =>
+										candidate.id === request.worktreeId &&
+										candidate.repositoryId === request.repositoryId,
+								);
+								if (worktree === undefined || revealPath === undefined)
+									throw new Error('The worktree is no longer available.');
+								await revealPath(worktree.path);
+								return { revealed: true };
+							},
+							// A folder is named by id and need not be in a repository:
+							// its root is whatever the resolver says it is now.
+							revealFolder: async (request) => {
+								const revealPath = options.revealPathOnHost;
+								if (revealPath === undefined)
+									throw new Error('The folder cannot be shown on this host.');
+								const resolved = await folders.roots.resolve(
+									request.projectId,
+									request.folderId,
+								);
+								if (!resolved.root)
+									throw new Error('The folder has no directory to show.');
+								await revealPath(resolved.root);
+								return { revealed: true };
+							},
+						},
+						// Only the reveal action is wired; terminals and project
+						// switching stay with the renderer.
+						hostCapabilities: ['nativeWindows'],
+						canRevealOnHost: (authorization) =>
+							authorization.clientId !== undefined &&
+							this.embeddedRendererClientIds.has(authorization.clientId),
+					}),
+		});
+		const fileCatalogAdapter = new ServerFileCatalogAdapter({
+			serverId: options.serverId,
+			projects: this.fileCatalogProjects,
+			folderScope: folders.catalog.resolve,
+			onOperationFailure: (failure) =>
+				options.onFileOperationFailure?.(failure),
+		});
+		const documentationCatalogAdapter = new ServerDocumentationCatalogAdapter({
+			serverId: options.serverId,
+			projects: this.documentationProjects,
+		});
+		const mdxRuntimeAdapter = new ServerMdxRuntimeAdapter({
+			serverId: options.serverId,
+			projects: this.mdxRuntimeProjects,
+		});
+		const fileContentAdapter = new ServerFileContentAdapter({
+			serverId: options.serverId,
+			projects: this.fileContentProjects,
+			folderScope: folders.content.resolve,
+		});
+		const fileSessionAdapter = new ServerFileAdapter({
+			serverId: options.serverId,
+			projects: this.fileSessionProjects,
+			folderScope: folders.session.resolve,
+		});
+		const eventJournal = new OrderedEventJournal();
+		this.eventJournal = eventJournal;
+		const remoteAccess = options.applicationFeatures?.remoteAccess;
+		const mcpInstall = options.applicationFeatures?.mcpInstall;
+		const payloadText = (
+			request: QueryRequest | CommandRequest,
+			key: string,
+		) => {
+			const value = (request.envelope.payload as Record<string, unknown>)[key];
+			if (typeof value !== 'string' || value.length === 0 || value.length > 512)
+				throw new TypeError(`${key} is invalid`);
+			return value;
+		};
+		const remoteCommand = async (
+			request: CommandRequest,
+			operation: string,
+			key?: string,
+		) => {
+			if (remoteAccess === undefined)
+				throw new Error('Remote access is unavailable on this server.');
+			const result = await remoteAccess.command(
+				operation,
+				key === undefined ? undefined : payloadText(request, key),
+			);
+			this.notifyRemoteAccessChanged();
+			return result as unknown as JsonValue;
+		};
+		const mcpTarget = (request: CommandRequest): string => {
+			const agent = (request.envelope.payload as Record<string, unknown>).agent;
+			if (
+				typeof agent !== 'string' ||
+				agent.length === 0 ||
+				agent.length > 192
+			)
+				throw new TypeError('agent is invalid');
+			return agent;
+		};
+		const fileObservations = new ServerFileObservationAdapter({
+			serverId: options.serverId,
+			eventJournal,
+			host: projectFileObservationHost,
+			folderScope: folders.observation.resolve,
+		});
+		const fileCatalogOperations = fileCatalogAdapter.operations();
+		const documentationCatalogOperations =
+			documentationCatalogAdapter.operations();
+		const mdxRuntimeOperations = mdxRuntimeAdapter.operations();
+		const fileContentOperations = fileContentAdapter.operations();
+		const fileSessionOperations = fileSessionAdapter.operations();
+		this.maxReplayBytes = options.maxReplayBytes ?? 1024 * 1024;
+		if (
+			!Number.isSafeInteger(this.maxReplayBytes) ||
+			this.maxReplayBytes <= 0
+		) {
+			throw new RangeError('maxReplayBytes must be a positive safe integer');
+		}
+		// A per-agent built-in the user had switched off stays off as a harness
+		// switch of the bundled source that replaced it.
+		const onBuiltInWithdrawn = async (
+			record: Readonly<{ extensionId: string; enabled: boolean }>,
+		) => {
+			const switches = withdrawnAgentExtensionSwitches(record);
+			if (switches === undefined || options.settings === undefined) return;
+			const result = await options.settings.apply({
+				command: {
+					type: 'merge',
+					settings: { agentIntegration: { harnesses: { ...switches } } },
+				},
+			});
+			if (result.ok)
+				this.agentSources.setHarnessSwitches(
+					agentHarnessSwitchesFromSettings(result.state.settings),
+				);
+		};
+		const extensionManagement =
+			options.dataRoot === undefined
+				? undefined
+				: options.vault === undefined
+					? createDefaultExtensionManagement({
+							dataRoot: options.dataRoot,
+							authorityLabel: 'This server',
+							agents: this.agentSources,
+							worktrees: this.worktreeInsights,
+							onBuiltInWithdrawn,
+							...(options.onExtensionHostDiagnostic === undefined
+								? {}
+								: { onHostDiagnostic: options.onExtensionHostDiagnostic }),
+							...(options.extensionHostChildEntrypoint === undefined
+								? {}
+								: { childEntrypoint: options.extensionHostChildEntrypoint }),
+							...(options.builtInExtensionArtifactRoot === undefined
+								? {}
+								: { builtInArtifactRoot: options.builtInExtensionArtifactRoot }),
+						})
+					: createProductionExtensionManagement({
+							dataRoot: options.dataRoot,
+							authorityLabel: 'This server',
+							agents: this.agentSources,
+							worktrees: this.worktreeInsights,
+							onBuiltInWithdrawn,
+							...(options.onExtensionHostDiagnostic === undefined
+								? {}
+								: { onHostDiagnostic: options.onExtensionHostDiagnostic }),
+							...(options.extensionHostChildEntrypoint === undefined
+								? {}
+								: { childEntrypoint: options.extensionHostChildEntrypoint }),
+							...(options.builtInExtensionArtifactRoot === undefined
+								? {}
+								: { builtInArtifactRoot: options.builtInExtensionArtifactRoot }),
+							vault: options.vault,
+						});
+		if (extensionManagement !== undefined) {
+			this.agentSources.attach(extensionManagement.hosts);
+			this.worktreeInsights.attach(extensionManagement.hosts);
+		}
+		// Each acts only on a commit that names what it depends on (ADR-0059):
+		// which project a view shows, and which folders exist.
+		this.workspace.subscribe((_event, record) => {
+			if (
+				record.changed.views !== undefined ||
+				record.removed.views !== undefined ||
+				record.changed.projects !== undefined ||
+				record.removed.projects !== undefined
+			)
+				this.worktreeInsights.refreshActivity();
+			if (record.removed.folders !== undefined) folders.workspaceChanged();
+		});
+		const mcpRouter =
+			mcpInstall === undefined
+				? undefined
+				: new McpInstallRouter({
+						hosts: () => extensionManagement?.hosts,
+						serverCommand: mcpInstall.serverCommand,
+					});
+		const parakeetProvider =
+			options.parakeetRuntime === undefined
+				? undefined
+				: new ServerParakeetDictationProvider(
+						options.parakeetRuntime,
+						resolve(
+							options.dataRoot ?? process.cwd(),
+							'dictation',
+							'temporary',
+						),
+					);
+		const openAiProvider = new OpenAiDictationProvider();
+		const dictationProvider = {
+			transcribe: (request: Parameters<typeof openAiProvider.transcribe>[0]) =>
+				request.model === 'mlx-community/parakeet-tdt-0.6b-v3'
+					? parakeetProvider === undefined
+						? Promise.reject(
+								new Error('Parakeet is unavailable on this server'),
+							)
+						: parakeetProvider.transcribe(request)
+					: openAiProvider.transcribe(request),
+		};
+		const openAiSecretId = 'dictation-openai-api-key';
+		const aiTargetAuthority = createWorkspaceAiTargetAuthority({
+			serverId: options.serverId,
+			state: () => this.workspace.state,
+			applyHostCommand: (commandId, command) =>
+				this.composition.workspaceOperations?.applyHostCommand(
+					commandId,
+					command,
+				),
+			getSession: (sessionId) => this.service.getSession(sessionId),
+		});
+		const aiReplay = {
+			read: (
+				target: { readonly sessionId: string },
+				limits: { readonly maxBytes: number; readonly maxChars: number },
+			) => this.aiReplay(target.sessionId, limits),
+		};
+		const hostAiMetadata = options.aiMetadata;
+		// The host provider reduces its own output to a bounded user-facing
+		// message. Carry that message past the service's fixed public vocabulary
+		// for the one request that produced it; raw stdout/stderr never enters it.
+		const metadataFailure = new AsyncLocalStorage<{ message?: string }>();
+		const hostMetadataProvider = (provider: 'claudeCode' | 'codex') => ({
+			generate: async (request: {
+				readonly model: string;
+				readonly target: 'title' | 'note';
+				readonly context: {
+					readonly target: {
+						readonly projectId: string;
+						readonly sessionId: string;
+					};
+					readonly currentTitle: string;
+					readonly existingNote: string;
+					readonly text: string;
+				};
+			}) => {
+				const project =
+					this.workspace.state.projects[request.context.target.projectId];
+				try {
+					const result = await hostAiMetadata!.generate({
+						context: {
+							currentTitle: request.context.currentTitle,
+							existingNote: request.context.existingNote,
+							projectRoot: project?.root ?? '',
+							projectTitle: project?.name ?? '',
+							recentOutput: request.context.text,
+							sessionId: request.context.target.sessionId,
+						},
+						model: request.model,
+						provider,
+						target: request.target,
+					});
+					return result.text;
+				} catch (error) {
+					const store = metadataFailure.getStore();
+					if (store !== undefined)
+						store.message =
+							(error instanceof Error
+								? error.message.replace(/[\0\r\n]+/gu, ' ').slice(0, 256)
+								: '') || 'AI metadata provider failed.';
+					throw error;
+				}
+			},
+		});
+		const metadataAi =
+			hostAiMetadata === undefined
+				? undefined
+				: new AiService({
+						serverId: options.serverId,
+						authority: aiTargetAuthority,
+						replay: aiReplay,
+						providers: {
+							codex: hostMetadataProvider('codex'),
+							'claude-code': hostMetadataProvider('claudeCode'),
+						},
+					});
+		const generateAiMetadata =
+			metadataAi === undefined
+				? undefined
+				: operationEntries(
+						createAiOperationHandlers(metadataAi).commands,
+					).find(
+						([name]) => name === AI_SERVER_OPERATIONS.generateMetadata,
+					)?.[1];
+		const dictationAi =
+			options.vault === undefined
+				? undefined
+				: new AiService({
+						serverId: options.serverId,
+						authority: {
+							...aiTargetAuthority,
+							writeInput: (target, input) =>
+								this.service.input(target.sessionId, input),
+						},
+						replay: aiReplay,
+						dictationProvider,
+						...(parakeetProvider === undefined
+							? {}
+							: { dictationRuntime: parakeetProvider }),
+						credentialResolver: new VaultProviderCredentialResolver({
+							vault: options.vault.vault,
+							bindings: [{ provider: 'openai', secretId: openAiSecretId }],
+						}),
+						dictationCredential: {
+							status: () => ({
+								configured: options
+									.vault!.status()
+									.entries.some((entry) => entry.id === openAiSecretId),
+							}),
+							set: async (value) => {
+								const exists = options
+									.vault!.status()
+									.entries.some((entry) => entry.id === openAiSecretId);
+								await (exists
+									? options.vault!.vault.replace({
+											id: openAiSecretId,
+											label: 'OpenAI API key',
+											value,
+										})
+									: options.vault!.vault.put({
+											id: openAiSecretId,
+											label: 'OpenAI API key',
+											value,
+										}));
+								return { configured: true };
+							},
+							clear: async () => ({
+								configured: !(await options.vault!.vault.remove(openAiSecretId))
+									.deleted,
+							}),
+						},
+						dictationSettings: () =>
+							embeddedDictationSettings(options.settings?.settings),
+					});
+		const dictationOperations =
+			dictationAi === undefined
+				? undefined
+				: dictationOnlyOperations(createAiOperationHandlers(dictationAi));
+		// An injected service owns its own processes; a holder is for the
+		// production path only, and needs somewhere to keep its socket.
+		const sessionHolder =
+			options.sessionHolder === undefined ||
+			options.terminalService !== undefined ||
+			options.dataRoot === undefined
+				? undefined
+				: createSessionHolderPtyFactory({
+						dataRoot: options.dataRoot,
+						buildId: options.sessionHolder.buildId,
+						launch: options.sessionHolder.launch,
+						limitMs: options.sessionHolder.limitMs,
+						requireMutualProof: process.platform === 'win32',
+						onObservation: (report) =>
+							options.onSessionHolderObservation?.(report),
+						resolveCwd: resolveTerminalProcessCwd,
+						resolveForegroundProcess: resolveTerminalForegroundProcess,
+					});
+		this.sessionHolder = sessionHolder;
+		this.composition = createServerCoreComposition({
+			serverId: options.serverId,
+			serverVersion: 'desktop',
+			// Restart recovery is server policy and lives in server-core. Desktop
+			// supplies only the two things that are genuinely its own: rebuilding
+			// its process-local project bindings, and making a session through the
+			// authority that owns replay buffers and consumer registration.
+			...(options.workspaceRepository === undefined
+				? {}
+				: {
+						workspaceStartup: {
+							firstRun: options.workspaceRepository.wasCreated,
+							prepare: () => this.rebuildProjectBindings(),
+							createTerminal: (request) => this.create(request),
+						},
+					}),
+			onConnectionClosed: (_connectionId, clientId) => {
+				mdxRuntimeAdapter.closeClient(clientId);
+			},
+			...(options.terminalService !== undefined &&
+			options.shellProfiles === undefined
+				? { allowUnresolvedTestSessions: true }
+				: {}),
+			// Versioned per-feature capability strings. The bundle's client
+			// negotiates these in the hello; Desktop composes the registries
+			// behind settings, macros, recording, and extensions, so the embedded
+			// server declares them alongside the workspace features.
+			capabilities: [
+				'terminal.v1',
+				'workspace.v1',
+				'files.v1',
+				'agents.v1',
+				'git.v1',
+				'settings.v1',
+				'macros.v1',
+				...(options.automations === undefined ? [] : ['automations.v1']),
+				...(options.mcpApprovals === true ? ['mcp-approvals.v1'] : []),
+				// Agent chats and Pixel run wherever extensions run.
+				...(extensionManagement === undefined ? [] : ['agent-chat.v1']),
+				...(options.mcpApprovals === true && options.appWindows !== undefined
+					? [
+							'app-windows.v1',
+							'app-window-mirror.v1',
+							'app-window-attachments.v1',
+						]
+					: []),
+				'recording.v1',
+				'extensions.v1',
+				...(dictationAi === undefined ? [] : ['dictation.v1']),
+			],
+			authenticate: ({ hello }) => ({
+				clientId: hello.clientId,
+				authScope: 'admin',
+				permissions: [
+					'workspace:write',
+					'extensions:read',
+					'extensions:manage',
+				],
+			}),
+			workspace: this.workspace,
+			workspaceOperations: {
+				prepareProjectRootUpdate: (projectId, root) =>
+					this.prepareProjectRootUpdate(projectId, root),
+				releaseProject: (projectId) => this.releaseProject(projectId),
+				rehomeTerminalSession: (move) => this.rehomeTerminalSession(move),
+			},
+			activity: this.activity,
+			...(options.push === undefined ? {} : { push: options.push }),
+			...(options.notificationSettleMs === undefined &&
+			options.clock === undefined
+				? {}
+				: {
+						notifications: new NotificationManager({
+							...options.clock,
+							...(options.notificationSettleMs === undefined
+								? {}
+								: { settleMs: options.notificationSettleMs }),
+						}),
+					}),
+			agents: this.agents,
+			agentSessions: {
+				supervisor: this.agentSources,
+				bridge: agentBridge,
+				scope: this.agentScope,
+			},
+			git: gitAdapter,
+			folderRoots: folders.roots,
+			gitCommands: worktreeCapture.gitCommands,
+			eventJournal,
+			...(extensionManagement === undefined
+				? {}
+				: {
+						extensions: extensionManagement,
+						// Language intelligence lives where the project files and the
+						// extensions live, which for the embedded server is this process.
+						language: {
+							extensions: extensionManagement.hosts,
+							projects: this.fileSessionProjects,
+							watch: fileObservations,
+						},
+					}),
+			...(extensionManagement === undefined &&
+			options.vault === undefined &&
+			parakeetProvider === undefined
+				? {}
+				: {
+						serviceLifecycle: {
+							stop: async () => {
+								parakeetProvider?.stop();
+								// Stop supervising before draining hosts, so a host stopped
+								// during shutdown cannot schedule a restart behind it.
+								extensionManagement?.stopSupervision();
+								const results = await Promise.allSettled([
+									extensionManagement?.hosts.shutdown(),
+									options.vault?.lock(),
+								]);
+								const failures = results.flatMap((result) =>
+									result.status === 'rejected' ? [result.reason] : [],
+								);
+								if (failures.length > 0)
+									throw new AggregateError(
+										failures,
+										'embedded server service shutdown failed',
+									);
+							},
+						},
+					}),
+			fileObservations,
+			...(options.recordings === undefined
+				? {}
+				: { recordings: options.recordings }),
+			...(options.settings === undefined ? {} : { settings: options.settings }),
+			...(options.mcpApprovals === true ? { mcpApprovals: true } : {}),
+			...(extensionManagement === undefined
+				? {}
+				: {
+						agentChat: {
+							providers: agentChatProviderBridge(extensionManagement.hosts),
+							workRoot: resolve(
+								options.dataRoot ?? join(tmpdir(), 'terminay'),
+								'agent-chat',
+							),
+							...(options.agentChatMcp === undefined
+								? {}
+								: { mcp: options.agentChatMcp }),
+							projectExists: (projectId: string) =>
+								this.workspace.state.projects[projectId] !== undefined,
+							...(options.onAgentChatDiagnostic === undefined
+								? {}
+								: { onDiagnostic: options.onAgentChatDiagnostic }),
+						},
+					}),
+			...(options.appWindows === undefined
+				? {}
+				: { appWindows: options.appWindows }),
+			...(options.connectedServers === undefined
+				? {}
+				: { connectedServers: options.connectedServers }),
+			...(options.shellProfiles === undefined
+				? {}
+				: {
+						shellProfiles: options.shellProfiles,
+						terminalProfiles: options.shellProfiles,
+						terminalLaunchEnvironment: {
+							FORCE_HYPERLINK: '1',
+							...process.env,
+							COLORTERM: 'truecolor',
+						},
+						...(options.terminalLaunchEnvironmentFor === undefined
+							? {}
+							: {
+									terminalLaunchEnvironmentFor:
+										options.terminalLaunchEnvironmentFor,
+								}),
+						terminalEnvironmentCaseInsensitive: process.platform === 'win32',
+						...(process.platform === 'darwin'
+							? { terminalSystemDefaultStartupMode: 'login' as const }
+							: {}),
+					}),
+			operations: {
+				queries: {
+					...(mcpRouter === undefined
+						? {}
+						: {
+								'mcp-install.status': async () =>
+									(await mcpRouter.status()) as unknown as JsonValue,
+							}),
+					...(remoteAccess === undefined
+						? {}
+						: {
+								'remote-access.status': async () =>
+									(await remoteAccess.getStatus()) as unknown as JsonValue,
+							}),
+					...dictationOperations?.queries,
+					...(options.aiMetadata === undefined
+						? {}
+						: {
+								'ai.models.list': (request: QueryRequest) =>
+									this.listAiMetadataModels(request),
+							}),
+					...fileSessionOperations.queries,
+					...fileCatalogOperations.queries,
+					...documentationCatalogOperations.queries,
+					...mdxRuntimeOperations.queries,
+					...fileContentOperations.queries,
+					'file.get-git-diff': (request: QueryRequest) =>
+						this.getFileDiff(request),
+					'file.mutation-revision': (request: QueryRequest) =>
+						this.getFileMutationRevision(request),
+				},
+				commands: {
+					...(mcpRouter === undefined
+						? {}
+						: {
+								'mcp-install.install': (request: CommandRequest) =>
+									mcpRouter.install(
+										mcpTarget(request),
+									) as unknown as Promise<JsonValue>,
+								'mcp-install.uninstall': (request: CommandRequest) =>
+									mcpRouter.uninstall(
+										mcpTarget(request),
+									) as unknown as Promise<JsonValue>,
+							}),
+					...(remoteAccess === undefined
+						? {}
+						: {
+								'remote-access.toggle-server': (request: CommandRequest) =>
+									remoteCommand(request, 'toggle-server'),
+								'remote-access.create-pairing-link': (
+									request: CommandRequest,
+								) => remoteCommand(request, 'create-pairing-link'),
+								'remote-access.revoke-device': (request: CommandRequest) =>
+									remoteCommand(request, 'revoke-device', 'deviceId'),
+								'remote-access.close-connection': (request: CommandRequest) =>
+									remoteCommand(request, 'close-connection', 'connectionId'),
+								'remote-access.approve-device': (request: CommandRequest) =>
+									remoteCommand(request, 'approve-device', 'approvalId'),
+								'remote-access.deny-device': (request: CommandRequest) =>
+									remoteCommand(request, 'deny-device', 'approvalId'),
+								'remote-access.reset-identity': (request: CommandRequest) =>
+									remoteCommand(request, 'reset-identity'),
+							}),
+					...dictationOperations?.commands,
+					...fileSessionOperations.commands,
+					...fileCatalogOperations.commands,
+					...mdxRuntimeOperations.commands,
+					...fileContentOperations.commands,
+					...(generateAiMetadata === undefined
+						? {}
+						: {
+								[AI_SERVER_OPERATIONS.generateMetadata]: (
+									request: CommandRequest,
+								) =>
+									metadataFailure.run({}, async () => {
+										try {
+											return await generateAiMetadata(request);
+										} catch (error) {
+											const message = metadataFailure.getStore()?.message;
+											if (message === undefined) throw error;
+											throw { code: 'unavailable', message, retryable: true };
+										}
+									}),
+							}),
+					...(options.saveSparseFile === undefined
+						? {}
+						: {
+								'file.save-sparse': (request: CommandRequest) =>
+									this.saveSparseFile(request),
+							}),
+				},
+			},
+			...(options.terminalService === undefined
+				? {
+						// Do not load the native module for an injected service. Apart
+						// from making the boundary testable, this prevents an unused
+						// native dependency from becoming part of host-only compositions.
+						...(sessionHolder === undefined
+							? {
+									ptyFactory: createNodePtyFactory(
+										require('node-pty') as NodePtyModule,
+										{
+											resolveCwd: resolveTerminalProcessCwd,
+											resolveForegroundProcess:
+												resolveTerminalForegroundProcess,
+										},
+									),
+								}
+							: { sessionHolder }),
+						terminalOptions: {
+							maxReplayBytes: this.maxReplayBytes,
+							...(options.resolveDefaultShell === undefined
+								? {}
+								: { resolveDefaultShell: options.resolveDefaultShell }),
+						},
+						...(options.macros === undefined ? {} : { macros: options.macros }),
+						...(options.automations === undefined
+							? {}
+							: { automations: options.automations }),
+					}
+				: { terminalService: options.terminalService }),
+		});
+		this.service = this.composition.terminal;
+		// Observe the final composed service in both production and injected-test
+		// modes. Host recording/remote cleanup must not depend on who constructed
+		// the service.
+		this.serviceEventsUnsubscribe = this.service.onEvent((event) =>
+			this.handleEvent(event),
+		);
+		this.consumers = new DetachableTerminalConsumerRegistry(this.service);
+	}
+
+	/**
+	 * E2E-only observability stays at the workspace reducer boundary, after the
+	 * protocol has parsed and authorized a command. The renderer receives no
+	 * workspace capability from this hook: it can only reset and read its own
+	 * redacted observation buffer through the main-process test IPC seam.
+	 */
+	/**
+	 * Test-only: the server closes every embedded renderer connection, as it
+	 * does when it reaps one. The window is told nothing by this hook; what it
+	 * learns, it learns from its byte endpoint.
+	 */
+	async closeRendererConnectionsForTest(): Promise<number> {
+		const connections = [...this.rendererConnectionsByOwner.values()];
+		await Promise.all(connections.map((connection) => connection.close()));
+		return connections.length;
+	}
+
+	/** Test-only: the server refuses this many of the next project creations. */
+	refuseProjectCreationsForTest(count: number): void {
+		this.projectCreationTestRefusals = count;
+	}
+
+	resetWorkspaceCommandTestRecords(): void {
+		this.workspaceCommandTestRecords?.splice(0);
+	}
+
+	getWorkspaceCommandTestRecords(): readonly ServerWorkspaceTestCommandRecord[] {
+		return (this.workspaceCommandTestRecords ?? []).map((record) => {
+			const command = record.command;
+			return {
+				operation: record.operation,
+				...(command === undefined
+					? {}
+					: {
+							command: {
+								type: command.type,
+								...(command.projectId === undefined
+									? {}
+									: { projectId: command.projectId }),
+								...(command.sidebar === undefined
+									? {}
+									: { sidebar: structuredClone(command.sidebar) }),
+							},
+						}),
+			};
+		});
+	}
+
+	private installWorkspaceCommandTestObserver(): void {
+		if (this.workspaceCommandTestRecords === undefined) return;
+		const apply = this.workspace.apply.bind(this.workspace);
+		this.workspace.apply = (envelope) => {
+			this.workspaceCommandTestRecords?.push(
+				workspaceCommandTestRecord(envelope.command),
+			);
+			if (
+				envelope.command.type === 'project.create' &&
+				this.projectCreationTestRefusals > 0
+			) {
+				this.projectCreationTestRefusals -= 1;
+				throw new Error('The server refused this project for the test.');
+			}
+			return apply(envelope);
+		};
+	}
+
+	/**
+	 * Remote access changes after a command returns: for example, the host
+	 * registration acknowledgement from the relay. Publish those changes so
+	 * subscribed Desktop and browser workspaces refresh their status.
+	 */
+	notifyRemoteAccessChanged(): void {
+		this.eventJournal.append('remote-access.changed', { changed: true });
+	}
+
+	/** Complete canonical workspace hydration before the host publishes readiness.
+	 * What a restored workspace contains is decided by the server; starting the
+	 * composition is what applies it. */
+	async initializeWorkspace(): Promise<void> {
+		await this.composition.start();
+	}
+
+	/**
+	 * File/Git/query authorities are process-local, so their bindings are rebuilt
+	 * for every available persisted project before the restored workspace is
+	 * published: PTY creation is not the only operation that requires a canonical
+	 * root. A deleted Local root is a recoverable project condition, not damaged
+	 * workspace persistence — preserve the project identity so the user can repair
+	 * it, but do not let it prevent the rest of Desktop from starting.
+	 */
+	private async rebuildProjectBindings(): Promise<ReadonlySet<string>> {
+		const unavailableProjectIds = new Set<string>();
+		for (const project of Object.values(this.workspace.state.projects)) {
+			// A project with no root folder, or one awaiting its start choice,
+			// has nothing to bind until it is given a root.
+			if (project.rootOrigin === 'none') continue;
+			try {
+				await this.registerProjectRoot(project.id, project.root);
+			} catch (error) {
+				if (!isMissingProjectRootError(error)) throw error;
+				unavailableProjectIds.add(project.id);
+			}
+		}
+		return unavailableProjectIds;
+	}
+
+	private async getFileDiff(
+		request: QueryRequest,
+	): Promise<BinaryQueryHandlerResult> {
+		const payload = protocolPayload(request.envelope.payload);
+		const requestedPath = protocolString(payload.path, 'file path');
+		const projectId = protocolString(payload.projectId, 'project id');
+		const scope = await this.fileRequestScope(
+			projectId,
+			payload.folderId,
+			'file diff project is unavailable',
+		);
+		const canonicalPath = isAbsolute(requestedPath)
+			? await realpath(requestedPath)
+			: await scope.resolver.resolve(requestedPath, { requireFile: true });
+		// In a folder the file must lie in that folder's root; otherwise in the
+		// root of the project the request names.
+		const project =
+			scope.folder === undefined
+				? this.projectForPath(canonicalPath)
+				: { projectId, root: scope.root };
+		if (
+			project.projectId !== projectId ||
+			(canonicalPath !== project.root &&
+				!canonicalPath.startsWith(`${project.root}${sep}`))
+		)
+			throw new Error('file diff target is outside the connected project');
+		const relativePath = relative(project.root, canonicalPath);
+		const result = await this.git.diff(
+			{
+				projectId: project.projectId,
+				path: relativePath,
+				...(scope.folder?.worktreeId === undefined
+					? {}
+					: { worktreeId: scope.folder.worktreeId }),
+			},
+			request.context.signal,
+		);
+		writePortDiagnostic({
+			phase: 'file-diff-result',
+			path: relativePath,
+			state: result.state,
+			bounded: result.bounded,
+			hunks: result.hunks.length,
+		});
+		const value = {
+			compareTarget: 'HEAD',
+			gitAvailable: result.state !== 'git-unavailable',
+			hasDiff: result.patch.trim().length > 0,
+			hunks: result.hunks,
+			isBinary: result.binary,
+			// A bounded diff is still evidence that Git discovered and tracked the
+			// target. Keep Diff available so the client can render its explicit
+			// too-large state instead of presenting the file as untracked.
+			isTracked: result.state === 'ready' || result.state === 'command-error',
+			path: canonicalPath,
+			relativePath,
+			repoRoot: project.root,
+			tooLarge: result.bounded,
+		} as unknown as JsonValue;
+		return {
+			result: { encoding: 'json' },
+			body: new TextEncoder().encode(JSON.stringify(value)),
+		};
+	}
+
+	private async getFileMutationRevision(
+		request: QueryRequest,
+	): Promise<JsonValue> {
+		const payload = protocolPayload(request.envelope.payload);
+		const projectId = protocolString(payload.projectId, 'project id');
+		const path = protocolString(payload.path, 'file path');
+		const scope = await this.fileRequestScope(
+			projectId,
+			payload.folderId,
+			'file mutation project is unavailable',
+		);
+		const canonicalPath = await scope.resolver.resolve(path, {
+			requireFile: true,
+		});
+		const value = await stat(canonicalPath);
+		return { ino: value.ino, mtimeMs: value.mtimeMs, size: value.size };
+	}
+
+	private async listAiMetadataModels(
+		request: QueryRequest,
+	): Promise<JsonValue> {
+		const service = this.options.aiMetadata;
+		if (service === undefined)
+			throw new Error('AI metadata provider is unavailable');
+		const payload = protocolPayload(request.envelope.payload);
+		const provider = protocolString(payload.provider, 'AI provider');
+		if (provider !== 'codex' && provider !== 'claude-code')
+			throw new TypeError('AI metadata provider is invalid');
+		const models = await service.listModels(
+			provider === 'claude-code' ? 'claudeCode' : 'codex',
+		);
+		return {
+			models: models.map((model) => ({ id: model.id, label: model.label })),
+		};
+	}
+
+	private async saveSparseFile(request: CommandRequest): Promise<JsonValue> {
+		const save = this.options.saveSparseFile;
+		if (save === undefined)
+			throw new Error('sparse file saving is unavailable');
+		const payload = protocolPayload(request.envelope.payload);
+		const path = protocolString(payload.path, 'file path');
+		const projectRoot = protocolString(payload.projectRoot, 'project root');
+		const canonicalRoot = await realpath(projectRoot);
+		const canonicalPath = await realpath(path);
+		if (payload.folderId === undefined) {
+			const project = this.projectForPath(canonicalPath);
+			if (project.root !== canonicalRoot)
+				throw new Error('sparse file target is outside the connected project');
+		} else {
+			// The root the client names is checked against the one the server
+			// resolves for the folder; it never decides where the save may land.
+			const folderId = protocolString(payload.folderId, 'folder id');
+			const folder = this.workspace.state.folders[folderId];
+			if (folder === undefined)
+				throw new Error('sparse file target is outside the connected project');
+			const scope = await this.fileRequestScope(
+				folder.projectId,
+				folderId,
+				'sparse file project is unavailable',
+			);
+			if (
+				scope.root !== canonicalRoot ||
+				!canonicalPath.startsWith(`${scope.root}${sep}`)
+			)
+				throw new Error('sparse file target is outside the connected project');
+		}
+		await save(payload as unknown as FileViewerSparseFileSaveRequest);
+		return null;
+	}
+
+	/**
+	 * The resolver and canonical root one file request runs in: the project's
+	 * own, or a folder's when the request names one. A folder's root is resolved
+	 * by the server for this request alone (ADR-0050).
+	 */
+	private async fileRequestScope(
+		projectId: string,
+		folderId: unknown,
+		unavailable: string,
+	): Promise<{
+		readonly resolver: CanonicalProjectPathResolver;
+		readonly root: string;
+		/** Present when the request named a folder. */
+		readonly folder?: { readonly worktreeId?: string };
+	}> {
+		if (folderId === undefined) {
+			const context = this.fileSessionProjects.get(projectId);
+			const root = this.fileProjectRoots.get(projectId);
+			if (context === undefined || root === undefined)
+				throw new Error(unavailable);
+			return { resolver: context.resolver, root };
+		}
+		const context = await this.folders.session.resolve(
+			projectId,
+			protocolString(folderId, 'folder id'),
+		);
+		const root = await context.resolver.root();
+		// Git addresses a worktree by its own id, found from the same listing
+		// the folder's root was confirmed against.
+		const listing = await this.git.worktrees(projectId);
+		const worktreeId = listing.worktrees.find(
+			(worktree) => worktree.path === root,
+		)?.id;
+		return {
+			resolver: context.resolver,
+			root,
+			folder: worktreeId === undefined ? {} : { worktreeId },
+		};
+	}
+
+	private projectForPath(path: string): { projectId: string; root: string } {
+		for (const [projectId, root] of this.fileProjectRoots) {
+			if (path === root || path.startsWith(`${root}${sep}`))
+				return { projectId, root };
+		}
+		throw new Error('file path is outside the connected workspace');
+	}
+
+	/** Register a workspace project's root with the server-owned catalog before
+	 * the first PTY for that project becomes visible.  This is host-to-server
+	 * composition, not a renderer capability: the renderer may request file
+	 * operations only after the authenticated server has established the
+	 * project/root binding. */
+	private async registerProjectRoot(
+		projectId: string,
+		root: string,
+	): Promise<void> {
+		if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(projectId))
+			throw new TypeError('project id is invalid');
+		if (
+			typeof root !== 'string' ||
+			root.length === 0 ||
+			root.length > 4096 ||
+			root.includes('\0')
+		)
+			throw new TypeError('project root is invalid');
+		const resolver = new CanonicalProjectPathResolver(
+			root,
+			nodeFileCatalogStorage,
+		);
+		await resolver.root();
+		this.fileCatalogProjects.set(projectId, {
+			projectId,
+			catalog: new FileCatalog(resolver, nodeFileCatalogStorage),
+		});
+		this.documentationProjects.set(projectId, {
+			projectId,
+			catalog: new DocumentationCatalog(resolver, nodeFileCatalogStorage),
+		});
+		this.mdxRuntimeProjects.set(projectId, {
+			projectId,
+			runtime: new MdxRuntime({
+				projectId,
+				resolver,
+				storage: nodeFileCatalogStorage,
+			}),
+		});
+		this.fileSessionProjects.set(projectId, {
+			projectId,
+			resolver,
+			storage: nodeFileCatalogStorage,
+		});
+		this.fileProjectRoots.set(projectId, await resolver.root());
+		this.agentScope.setProject(projectId, await resolver.root());
+		this.fileContentProjects.set(projectId, {
+			projectId,
+			content: new FileContentStreamService(resolver, nodeFileCatalogStorage),
+		});
+		await this.git.bindProject(projectId, root);
+		this.folders.projectBound(projectId);
+	}
+
+	/**
+	 * Follow a terminal to the project its panel was moved to. The composition
+	 * has already re-homed the terminal itself; this is the embedded host's own
+	 * bookkeeping, plus whatever the host issued under the old project.
+	 */
+	private rehomeTerminalSession(move: TerminalSessionRehome): void {
+		this.consumers.detachSession({
+			serverId: this.service.serverId,
+			projectId: move.sourceProjectId,
+			sessionId: move.sessionId,
+		});
+		const session = this.sessions.get(move.sessionId);
+		if (session !== undefined)
+			this.sessions.set(move.sessionId, {
+				...session,
+				projectId: move.targetProjectId,
+			});
+		this.options.onTerminalRehomed?.(move);
+	}
+
+	/**
+	 * Drop everything this host keeps for a closed project. The composition
+	 * releases Git, file observations, and language sessions itself; these maps
+	 * are the embedded host's own.
+	 */
+	private releaseProject(projectId: string): void {
+		this.mdxRuntimeProjects.get(projectId)?.runtime.disposeAll();
+		this.mdxRuntimeProjects.delete(projectId);
+		this.fileCatalogProjects.delete(projectId);
+		this.documentationProjects.delete(projectId);
+		this.fileContentProjects.delete(projectId);
+		this.fileSessionProjects.delete(projectId);
+		this.fileProjectRoots.delete(projectId);
+		this.folders.projectReleased(projectId);
+		this.agentScope.removeProject(projectId);
+	}
+
+	private async prepareProjectRootUpdate(projectId: string, root: string) {
+		if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(projectId))
+			throw new TypeError('project id is invalid');
+		if (
+			typeof root !== 'string' ||
+			root.length === 0 ||
+			root.length > 4096 ||
+			root.includes('\0')
+		)
+			throw new TypeError('project root is invalid');
+		const resolver = new CanonicalProjectPathResolver(
+			root,
+			nodeFileCatalogStorage,
+		);
+		const canonicalRoot = await resolver.root();
+		const context = {
+			projectId,
+			catalog: new FileCatalog(resolver, nodeFileCatalogStorage),
+		};
+		const documentationContext = {
+			projectId,
+			catalog: new DocumentationCatalog(resolver, nodeFileCatalogStorage),
+		};
+		const mdxRuntimeContext = {
+			projectId,
+			runtime: new MdxRuntime({
+				projectId,
+				resolver,
+				storage: nodeFileCatalogStorage,
+			}),
+		};
+		const contentContext = {
+			projectId,
+			content: new FileContentStreamService(resolver, nodeFileCatalogStorage),
+		};
+		const sessionContext = {
+			projectId,
+			resolver,
+			storage: nodeFileCatalogStorage,
+		};
+		return Object.freeze({
+			canonicalRoot,
+			commit: async () => {
+				this.mdxRuntimeProjects.get(projectId)?.runtime.disposeAll();
+				this.fileProjectRoots.set(projectId, canonicalRoot);
+				this.agentScope.setProject(projectId, canonicalRoot);
+				this.fileCatalogProjects.set(projectId, context);
+				this.documentationProjects.set(projectId, documentationContext);
+				this.mdxRuntimeProjects.set(projectId, mdxRuntimeContext);
+				this.fileContentProjects.set(projectId, contentContext);
+				this.fileSessionProjects.set(projectId, sessionContext);
+				await this.git.bindProject(projectId, canonicalRoot);
+				this.folders.projectBound(projectId);
+			},
+		});
+	}
+
+	onEvent(listener: (event: TerminalEvent) => void): Unsubscribe {
+		this.listeners.add(listener);
+		return () => this.listeners.delete(listener);
+	}
+
+	/** Bind one private, fixed-server MessagePort to the server protocol. */
+	acceptRendererPort(
+		port: ServerMessagePort,
+		options: { readonly ownerId?: string | number } = {},
+	): void {
+		mainServerPortDiagnostics.acceptedPorts += 1;
+		writePortDiagnostic({
+			phase: 'renderer-port-accepted',
+			acceptedPorts: mainServerPortDiagnostics.acceptedPorts,
+			serverId: this.service.serverId,
+		});
+		const ownerId =
+			options.ownerId === undefined ? 'default' : String(options.ownerId);
+		const previous = this.rendererConnectionsByOwner.get(ownerId);
+		if (previous !== undefined) {
+			this.rendererConnectionsByOwner.delete(ownerId);
+			void previous.close();
+		}
+		const scopedPort = new ServerScopedMessagePort(
+			adaptElectronMessagePort(port),
+			this.service.serverId,
+		);
+		const transport = new ServerPortTransport(scopedPort);
+		const clientId = `embedded-renderer-${randomBytes(16).toString('hex')}`;
+		this.embeddedRendererClientIds.add(clientId);
+		const connection = this.composition.core.accept(transport, {
+			authenticatedClient: {
+				clientId,
+				authScope: 'admin',
+				permissions: [
+					'workspace:write',
+					'extensions:read',
+					'extensions:manage',
+				],
+			},
+			onClosed: () => {
+				this.embeddedRendererClientIds.delete(clientId);
+				if (this.rendererConnectionsByOwner.get(ownerId) === connection) {
+					this.rendererConnectionsByOwner.delete(ownerId);
+				}
+			},
+			onDeliveryDiagnostic: this.options.onDeliveryDiagnostic,
+		});
+		this.rendererConnectionsByOwner.set(ownerId, connection);
+		void connection.start().catch((error) => {
+			mainServerPortDiagnostics.lastError =
+				error instanceof Error ? error.message : String(error);
+			if (
+				this.shuttingDown ||
+				(error instanceof Error && error.message === 'server port closed')
+			)
+				return;
+			console.error('[server] renderer connection failed', error);
+		});
+	}
+
+	async create(
+		options: Omit<TerminalCreateOptions, 'serverId'> & {
+			readonly projectId: string;
+			readonly profileId?: string;
+			readonly activePanelId?: string;
+			/** The folder of the project the terminal is created in. Absent means
+			 * the project's General folder. */
+			readonly folderId?: string;
+			readonly projectRootOrigin?: 'explicit' | 'server-default';
+		},
+	): Promise<ServerTerminalAuthoritySession> {
+		await this.composition.start();
+		this.ensureWorkspaceProject(
+			options.projectId,
+			options.cwd,
+			options.projectRootOrigin,
+		);
+		const project = this.workspace.state.projects[options.projectId];
+		if (project === undefined)
+			throw new Error('workspace project was not created');
+		if (project.rootOrigin !== 'none')
+			await this.registerProjectRoot(options.projectId, project.root);
+		const requestedId = options.sessionId;
+		if (requestedId !== undefined)
+			this.buffers.set(requestedId, this.createRecentOutput());
+		const resolver = this.composition.terminalLaunchResolver;
+		if (resolver === undefined && this.options.terminalService === undefined) {
+			throw new Error('canonical terminal launch resolution is unavailable');
+		}
+		let resolvedShellPath: string | null = null;
+		// Only an explicitly injected low-level test service may use the legacy
+		// unresolved creator. Production Desktop always supplies shellProfiles.
+		const handle =
+			resolver === undefined
+				? await this.service.createSession(options)
+				: await (async () => {
+						let identity = this.service.allocateIdentity(
+							options.projectId,
+							options.sessionId,
+						);
+						while (
+							options.sessionId === undefined &&
+							this.workspace.state.terminalSessions[identity.sessionId] !==
+								undefined
+						) {
+							identity = this.service.allocateIdentity(options.projectId);
+						}
+						const resolved = await resolver.resolve({
+							identity,
+							...(options.profileId === undefined
+								? {}
+								: { explicitProfileId: options.profileId }),
+							...(options.cwd === undefined
+								? {}
+								: { explicitCwd: options.cwd }),
+							...(options.activePanelId === undefined
+								? {}
+								: { activePanelId: options.activePanelId }),
+							...(options.folderId === undefined
+								? {}
+								: { folderId: options.folderId }),
+							cols: options.cols,
+							rows: options.rows,
+						});
+						resolvedShellPath = resolved.shellPath;
+						return this.service.createResolvedSession({
+							...resolved,
+							...(options.env === undefined
+								? {}
+								: { env: Object.freeze({ ...resolved.env, ...options.env }) }),
+						});
+					})();
+		const session: AuthoritySession = {
+			id: handle.sessionId,
+			projectId: handle.projectId,
+			shellPath: resolvedShellPath ?? options.shellPath ?? null,
+		};
+		this.sessions.set(handle.sessionId, session);
+		if (!this.buffers.has(handle.sessionId))
+			this.buffers.set(handle.sessionId, this.createRecentOutput());
+		if (this.workspace.state.terminalSessions[handle.sessionId] === undefined) {
+			// A folder deleted while the terminal was spawning falls back to
+			// General instead of failing the creation.
+			const folderId =
+				options.folderId !== undefined &&
+				this.workspace.state.folders[options.folderId]?.projectId ===
+					handle.projectId
+					? options.folderId
+					: undefined;
+			const registered = this.composition.workspaceOperations?.applyHostCommand(
+				`authority:terminal:${handle.sessionId}`.slice(0, 128),
+				{
+					type: 'terminal.createPanel',
+					sessionId: handle.sessionId,
+					projectId: handle.projectId,
+					...(folderId === undefined ? {} : { folderId }),
+					panelId: `p:${handle.sessionId}`.slice(0, 128),
+					title: this.nextTerminalPanelTitle(handle.projectId),
+					cwd: handle.snapshot().cwd,
+					createdAt: handle.snapshot().createdAt,
+					...(handle.snapshot().launch === undefined
+						? {}
+						: { launch: handle.snapshot().launch }),
+				},
+				this.workspace.state.revision,
+			);
+			if (registered === undefined)
+				throw new Error('workspace operation registry is unavailable');
+			if (!registered.ok) {
+				await this.service.kill(handle.snapshot()).catch(() => undefined);
+				this.sessions.delete(handle.sessionId);
+				this.buffers.delete(handle.sessionId);
+				throw new Error(registered.conflict.message);
+			}
+		}
+		const snapshot = this.snapshot(handle.sessionId);
+		if (snapshot === undefined)
+			throw new Error(
+				`Terminal session disappeared during creation: ${handle.sessionId}`,
+			);
+		return snapshot;
+	}
+
+	private nextTerminalPanelTitle(projectId: string): string {
+		const count = Object.values(this.workspace.state.panels).filter(
+			(panel) => panel.projectId === projectId && panel.type === 'terminal',
+		).length;
+		return `Terminal ${count + 1}`;
+	}
+
+	get(id: string): ServerTerminalAuthoritySession | undefined {
+		return this.snapshot(id);
+	}
+
+	async currentCwd(id: string) {
+		const session = this.knownSession(id);
+		if (session === undefined) return null;
+		return this.service.currentCwd({
+			serverId: this.service.serverId,
+			projectId: session.projectId,
+			sessionId: id,
+		});
+	}
+
+	/** Exact server identity for host compatibility adapters. Callers may use
+	 * this only to route a bounded action back into the server-owned service. */
+	agentIdentity(id: string): ActivitySessionIdentity | undefined {
+		const session = this.knownSession(id);
+		return session === undefined
+			? undefined
+			: Object.freeze({
+					serverId: this.service.serverId,
+					projectId: session.projectId,
+					sessionId: session.id,
+				});
+	}
+
+	/** Narrow compatibility adapter for preload IPC. It delegates every read
+	 * and acknowledgement to the composed server authority; it owns no state. */
+	agentStatusIpcAdapter(): AgentStatusIpcAuthority {
+		return createServerAgentStatusIpcAdapter({
+			agents: this.agents,
+			agentIdentity: (id) => this.agentIdentity(id),
+		});
+	}
+
+	getBuffer(id: string): string | null {
+		const bytes = this.buffers.get(id)?.readTail();
+		return bytes === undefined ? null : new TextDecoder().decode(bytes);
+	}
+
+	private aiReplay(
+		sessionId: string,
+		limits: { readonly maxBytes: number; readonly maxChars: number },
+	) {
+		const bytes =
+			this.buffers.get(sessionId)?.readTail() ?? new Uint8Array();
+		const replay = new TerminalReplayBuffer({
+			maxBytes: Math.max(1, bytes.byteLength),
+		});
+		replay.append(bytes);
+		return replay.snapshot(limits);
+	}
+
+	getCwd(id: string): string | null {
+		return this.knownSession(id) === undefined
+			? null
+			: (this.service.getSession(id)?.cwd ?? null);
+	}
+
+	list(): readonly ServerTerminalAuthoritySession[] {
+		return this.service.listSessions().flatMap(({ sessionId }) => {
+			this.knownSession(sessionId);
+			const value = this.snapshot(sessionId);
+			return value === undefined ? [] : [value];
+		});
+	}
+
+	async write(
+		id: string,
+		data: string | Uint8Array,
+		authorization?: TerminalAuthorization,
+	): Promise<void> {
+		const session = this.requireSession(id);
+		await this.service.input(id, data, authorization);
+		this.notifyAcceptedWrite({
+			serverId: this.service.serverId,
+			projectId: session.projectId,
+			sessionId: session.id,
+			data: typeof data === 'string' ? data : new Uint8Array(data),
+		});
+	}
+
+	async resize(
+		id: string,
+		dimensions: TerminalDimensions,
+		authorization?: TerminalAuthorization,
+	): Promise<void> {
+		const session = this.requireSession(id);
+		await this.service.resize(id, dimensions, authorization);
+		const accepted = this.service.getSession(id)?.dimensions;
+		if (accepted === undefined) return;
+		this.notifyAcceptedResize({
+			serverId: this.service.serverId,
+			projectId: session.projectId,
+			sessionId: session.id,
+			cols: accepted.cols,
+			rows: accepted.rows,
+		});
+	}
+
+	/** Wait on the authoritative PTY output boundary. This is deliberately not
+	 * a renderer timer: output resets the quiet window and terminal exit wakes
+	 * every waiter through TerminalService. */
+	async waitForInactivity(
+		id: string,
+		durationMs: number,
+		authorization?: TerminalAuthorization,
+	): Promise<void> {
+		this.requireSession(id);
+		await this.service.waitForInactivity(id, durationMs, { authorization });
+	}
+
+	async kill(id: string, authorization?: TerminalAuthorization): Promise<void> {
+		await this.service.kill(id, authorization);
+	}
+
+	/** Attach one detachable client subscription. Re-attaching replaces only
+	 * that consumer's old stream and never changes PTY ownership. */
+	attachConsumer(
+		id: string,
+		consumerId: string,
+		listener: (event: ServerTerminalRendererEvent) => void,
+		fromPosition = 0,
+	): Unsubscribe {
+		const session = this.requireSession(id);
+		const identity = {
+			serverId: this.service.serverId,
+			projectId: session.projectId,
+			sessionId: id,
+		};
+		let subscription: TerminalSubscription;
+		try {
+			subscription = this.consumers.attach(identity, consumerId, {
+				fromPosition,
+				onEvent: (event) => listener(toRendererEvent(event)),
+			});
+		} catch (error) {
+			// A stale cursor is recoverable: attach from the earliest retained
+			// position rather than making a reload destroy an otherwise healthy PTY.
+			const snapshot = this.service.getSession(id);
+			if (snapshot === undefined || fromPosition <= snapshot.replayFrom)
+				throw error;
+			subscription = this.consumers.attach(identity, consumerId, {
+				fromPosition: snapshot.replayFrom,
+				onEvent: (event) => listener(toRendererEvent(event)),
+			});
+		}
+		return () => {
+			this.consumers.detach(identity, consumerId, subscription);
+		};
+	}
+
+	detachConsumer(id: string, consumerId: string): void {
+		const session = this.knownSession(id);
+		if (session === undefined) return;
+		this.consumers.detach(
+			{
+				serverId: this.service.serverId,
+				projectId: session.projectId,
+				sessionId: id,
+			},
+			consumerId,
+		);
+	}
+
+	isConsumerAttached(id: string, consumerId: string): boolean {
+		const session = this.knownSession(id);
+		return (
+			session !== undefined &&
+			this.consumers.isAttached(
+				{
+					serverId: this.service.serverId,
+					projectId: session.projectId,
+					sessionId: id,
+				},
+				consumerId,
+			)
+		);
+	}
+
+	detachConsumers(consumerId: string): void {
+		this.consumers.detachConsumer(consumerId);
+	}
+
+	/** Temporary compatibility aliases for the legacy IPC caller. The numeric
+	 * value is only encoded as a subscription token; it is never PTY authority. */
+	attachRenderer(
+		id: string,
+		rendererId: number,
+		listener: (event: ServerTerminalRendererEvent) => void,
+		fromPosition = 0,
+	): Unsubscribe {
+		return this.attachConsumer(
+			id,
+			legacyConsumerId(rendererId),
+			listener,
+			fromPosition,
+		);
+	}
+
+	detachRenderer(id: string, rendererId: number): void {
+		this.detachConsumer(id, legacyConsumerId(rendererId));
+	}
+
+	/**
+	 * Move the legacy renderer stream for an already-attached terminal without
+	 * changing terminal ownership. This is intentionally a single authority
+	 * operation: a popout/merge must not detach the previous renderer until the
+	 * destination stream has been created successfully.
+	 *
+	 * The destination receives a replay from the requested cursor, so a newly
+	 * mounted terminal can reconstruct output that arrived while its UI loaded.
+	 */
+	handoffRenderer(
+		id: string,
+		fromRendererId: number,
+		toRendererId: number,
+		listener: (event: ServerTerminalRendererEvent) => void,
+		fromPosition = 0,
+	): Unsubscribe {
+		this.requireSession(id);
+		if (!this.isRendererAttached(id, fromRendererId)) {
+			throw new Error('source renderer is not attached to this terminal');
+		}
+		if (fromRendererId === toRendererId) {
+			throw new TypeError('renderer handoff requires a different destination');
+		}
+		// Attach first. If replay/cursor validation fails, the source remains
+		// attached and can continue to render the still-running server PTY.
+		const detachDestination = this.attachRenderer(
+			id,
+			toRendererId,
+			listener,
+			fromPosition,
+		);
+		this.detachRenderer(id, fromRendererId);
+		return detachDestination;
+	}
+
+	isRendererAttached(id: string, rendererId: number): boolean {
+		return this.isConsumerAttached(id, legacyConsumerId(rendererId));
+	}
+
+	detachRendererAll(rendererId: number): void {
+		this.detachConsumers(legacyConsumerId(rendererId));
+	}
+
+	/** Whether terminals are held outside this process and survive its exit. */
+	get keepsTerminalsAcrossRestart(): boolean {
+		return this.sessionHolder !== undefined;
+	}
+
+	/** Change how long held terminals keep running with nothing attached. */
+	setBackgroundTerminalLimit(limitMs: number | null): void {
+		this.sessionHolder?.setLimit(limitMs);
+	}
+
+	/**
+	 * End every terminal and remove their panels. Call this before `shutdown`
+	 * when the user chose to end their terminals; `shutdown` alone keeps them.
+	 */
+	async endAllTerminalSessions(): Promise<void> {
+		await this.composition.endAllTerminalSessions();
+	}
+
+	async shutdown(): Promise<void> {
+		if (this.shutdownPromise !== undefined) return this.shutdownPromise;
+		this.shuttingDown = true;
+		this.consumers.clear();
+		this.shutdownPromise = (async () => {
+			await this.composition.shutdown();
+		})().finally(() => {
+			this.folders.dispose();
+			this.worktreeCapture.close();
+			this.serviceEventsUnsubscribe?.();
+			this.serviceEventsUnsubscribe = undefined;
+		});
+		return this.shutdownPromise;
+	}
+
+	/** Recent output must be exactly the latest bytes up to the bound, so a
+	 * chunk is dropped only once the chunks after it cover the bound. */
+	private createRecentOutput(): BoundedChunkQueue<ByteChunk> {
+		return new BoundedChunkQueue<ByteChunk>(this.maxReplayBytes, 'cover-bound');
+	}
+
+	private handleEvent(event: TerminalEvent): void {
+		if (event.type === 'output') {
+			// Retain only; recent output is assembled when something reads it, so
+			// observing an event never costs what is already retained (ADR-0044).
+			let recent = this.buffers.get(event.sessionId);
+			if (recent === undefined) {
+				recent = this.createRecentOutput();
+				this.buffers.set(event.sessionId, recent);
+			}
+			recent.push({ bytes: event.bytes.slice() });
+		}
+		if (event.type === 'exit') {
+			// Keep the bounded buffer and session snapshot available for clients
+			// reopening a project after the shell has exited.
+		}
+		this.options.onEvent?.(event);
+		for (const listener of this.listeners) {
+			try {
+				listener(event);
+			} catch {
+				/* observers cannot affect PTY supervision */
+			}
+		}
+	}
+
+	private notifyAcceptedWrite(event: ServerTerminalAcceptedWrite): void {
+		try {
+			void Promise.resolve(this.options.onAcceptedWrite?.(event)).catch(
+				() => {},
+			);
+		} catch {
+			/* host bookkeeping cannot turn an accepted server write into a failure */
+		}
+	}
+
+	private notifyAcceptedResize(event: ServerTerminalAcceptedResize): void {
+		try {
+			void Promise.resolve(this.options.onAcceptedResize?.(event)).catch(
+				() => {},
+			);
+		} catch {
+			/* host bookkeeping cannot turn an accepted server resize into a failure */
+		}
+	}
+
+	private snapshot(id: string): ServerTerminalAuthoritySession | undefined {
+		const session = this.knownSession(id);
+		if (session === undefined) return undefined;
+		const snapshot = this.service.getSession(id);
+		if (snapshot === undefined) return undefined;
+		return Object.freeze({
+			id,
+			serverId: snapshot.serverId,
+			projectId: session.projectId,
+			cwd: snapshot.cwd,
+			shellPath: session.shellPath,
+			pid: snapshot.pid,
+			status: snapshot.status,
+		});
+	}
+
+	private requireSession(id: string): AuthoritySession {
+		const session = this.knownSession(id);
+		if (session === undefined)
+			throw new Error(`Unknown terminal session: ${id}`);
+		return session;
+	}
+
+	/** Sessions opened through the authenticated server MessagePort bypass the
+	 * Desktop compatibility creator. Adopt their immutable server identity on
+	 * first host lookup so test and recording integrations never assume a
+	 * renderer-created session is absent. PTY ownership remains in
+	 * TerminalService; this map only holds host metadata. */
+	private knownSession(id: string): AuthoritySession | undefined {
+		const existing = this.sessions.get(id);
+		if (existing !== undefined) return existing;
+		const snapshot = this.service.getSession(id);
+		if (snapshot === undefined) return undefined;
+		const adopted: AuthoritySession = {
+			id: snapshot.sessionId,
+			projectId: snapshot.projectId,
+			shellPath: null,
+		};
+		this.sessions.set(id, adopted);
+		return adopted;
+	}
+
+	private ensureWorkspaceProject(
+		projectId: string,
+		cwd: string | undefined,
+		rootOrigin: 'explicit' | 'server-default' = cwd === undefined
+			? 'server-default'
+			: 'explicit',
+	): void {
+		if (this.workspace.state.projects[projectId] !== undefined) return;
+		const viewId = this.workspace.state.viewOrder[0];
+		if (viewId === undefined) throw new Error('workspace has no default view');
+		const result = this.workspace.apply({
+			commandId: `authority:project:${projectId}`.slice(0, 128),
+			expectedRevision: this.workspace.state.revision,
+			command: {
+				type: 'project.create',
+				projectId,
+				viewId,
+				root: cwd ?? this.options.defaultProjectRoot?.() ?? '',
+				rootOrigin,
+				name: projectId === 'default' ? 'Project' : projectId,
+			},
+		});
+		if (!result.ok) throw new Error(result.conflict.message);
+	}
+}
+
+function isMissingProjectRootError(error: unknown): boolean {
+	return (
+		typeof error === 'object' &&
+		error !== null &&
+		'code' in error &&
+		(error as { readonly code?: unknown }).code === 'path_missing'
+	);
+}
+
+/** Electron's main-process MessagePortMain is EventEmitter-based, unlike the
+ * DOM MessagePort available in preload/renderer. Normalize it at the one
+ * privileged boundary before sharing the transport implementation. */
+function adaptElectronMessagePort(port: ServerMessagePort): ServerMessagePort {
+	const candidate = port as ServerMessagePort & {
+		on?: (
+			event: 'message' | 'messageerror' | 'close',
+			listener: (event: { readonly data: unknown }) => void,
+		) => void;
+	};
+	if (typeof candidate.on !== 'function') return port;
+	let onmessage: ((event: { readonly data: unknown }) => void) | null = null;
+	let onmessageerror: (() => void) | null = null;
+	let onclose: (() => void) | null = null;
+	let receivedThisTurn = 0;
+	let resetScheduled = false;
+	let lastFrameHash: string | undefined;
+	let identicalFrames = 0;
+	candidate.on('message', (event) => {
+		receivedThisTurn += 1;
+		if (!resetScheduled) {
+			resetScheduled = true;
+			setImmediate(() => {
+				receivedThisTurn = 0;
+				resetScheduled = false;
+			});
+		}
+		const hash = diagnosticFrameHash(event.data);
+		identicalFrames =
+			hash !== undefined && hash === lastFrameHash ? identicalFrames + 1 : 1;
+		lastFrameHash = hash;
+		if (
+			receivedThisTurn > MAIN_PORT_PER_TURN_LIMIT ||
+			identicalFrames > MAIN_PORT_IDENTICAL_FRAME_LIMIT
+		) {
+			const reason =
+				receivedThisTurn > MAIN_PORT_PER_TURN_LIMIT
+					? 'per-turn frame budget exceeded'
+					: 'repeated identical frame budget exceeded';
+			mainServerPortDiagnostics.lastError = reason;
+			writePortDiagnostic({
+				phase: 'connection-closed',
+				reason,
+				receivedThisTurn,
+				identicalFrames,
+			});
+			candidate.close?.();
+			onmessageerror?.();
+			return;
+		}
+		mainServerPortDiagnostics.receivedFrames += 1;
+		recordDiagnosticEnvelope(event.data, 'received');
+		onmessage?.(event);
+	});
+	candidate.on('messageerror', () => {
+		mainServerPortDiagnostics.lastError = 'MessagePortMain messageerror';
+		onmessageerror?.();
+	});
+	candidate.on('close', () => onclose?.());
+	return {
+		get onmessage() {
+			return onmessage;
+		},
+		set onmessage(listener) {
+			onmessage = listener;
+		},
+		get onmessageerror() {
+			return onmessageerror;
+		},
+		set onmessageerror(listener) {
+			onmessageerror = listener;
+		},
+		get onclose() {
+			return onclose;
+		},
+		set onclose(listener) {
+			onclose = listener;
+		},
+		postMessage: (message) => {
+			mainServerPortDiagnostics.sentFrames += 1;
+			recordDiagnosticEnvelope(message, 'sent');
+			candidate.postMessage(message);
+		},
+		start: () => candidate.start?.(),
+		close: () => candidate.close?.(),
+	};
+}
+
+function recordDiagnosticEnvelope(
+	packet: unknown,
+	direction: 'received' | 'sent',
+): void {
+	try {
+		if (typeof packet !== 'object' || packet === null) return;
+		const frame = (packet as { frame?: unknown }).frame;
+		if (!(frame instanceof Uint8Array)) return;
+		const envelope = decodeFrame(frame).envelope;
+		if (direction === 'received')
+			mainServerPortDiagnostics.lastReceivedType = envelope.type;
+		else mainServerPortDiagnostics.lastSentType = envelope.type;
+		if (
+			(envelope.type === 'command' || envelope.type === 'query') &&
+			typeof envelope.operation === 'string'
+		)
+			mainServerPortDiagnostics.lastOperation = envelope.operation;
+		const count =
+			direction === 'received'
+				? mainServerPortDiagnostics.receivedFrames
+				: mainServerPortDiagnostics.sentFrames;
+		const operation =
+			(envelope.type === 'command' || envelope.type === 'query') &&
+			typeof envelope.operation === 'string'
+				? envelope.operation
+				: undefined;
+		if (
+			process.env.TERMINAY_TEST === '1' &&
+			count <= MAIN_PORT_DIAGNOSTIC_LOG_LIMIT
+		) {
+			console.error(
+				`[terminay-port-diagnostic] ${JSON.stringify({
+					direction,
+					count,
+					type: envelope.type,
+					...(operation === undefined ? {} : { operation }),
+				})}`,
+			);
+		}
+		if (count <= MAIN_PORT_FILE_DIAGNOSTIC_LOG_LIMIT) {
+			writePortDiagnostic({
+				phase: 'frame',
+				direction,
+				count,
+				type: envelope.type,
+				...(operation === undefined ? {} : { operation }),
+				...('correlationId' in envelope &&
+				typeof envelope.correlationId === 'string'
+					? { correlationId: envelope.correlationId }
+					: {}),
+			});
+		}
+	} catch (error) {
+		mainServerPortDiagnostics.lastError =
+			error instanceof Error ? error.message : String(error);
+	}
+}
+
+function diagnosticFrameHash(packet: unknown): string | undefined {
+	if (typeof packet !== 'object' || packet === null) return undefined;
+	const frame = (packet as { frame?: unknown }).frame;
+	if (!(frame instanceof Uint8Array)) return undefined;
+	return createHash('sha256').update(frame).digest('hex');
+}
+
+function protocolPayload(value: unknown): Record<string, unknown> {
+	if (typeof value !== 'object' || value === null || Array.isArray(value))
+		throw new TypeError('protocol payload must be an object');
+	return value as Record<string, unknown>;
+}
+
+function protocolString(value: unknown, label: string): string {
+	if (
+		typeof value !== 'string' ||
+		value.length === 0 ||
+		value.length > 4096 ||
+		value.includes('\0')
+	)
+		throw new TypeError(`${label} is invalid`);
+	return value;
+}
+
+/**
+ * Watches and sizes paths under one root. A project and a linked folder differ
+ * only in which root that is, so both are observed through this.
+ */
+function fileObservationHostForRoot(
+	rootOf: (projectId: string) => string | undefined,
+	/** Told when a watch could not start or stopped observing, so a directory
+	 * nobody is watching is on record rather than a silent gap. */
+	onWatchLost?: (failure: ServerFileOperationFailure) => void,
+): FileObservationHost {
+	const lost = (operation: string, error?: unknown) =>
+		onWatchLost?.({
+			operation,
+			code:
+				(error as { code?: unknown } | undefined)?.code === 'ENOENT'
+					? 'path_missing'
+					: 'internal',
+		});
+	return {
+		watch: async ({ projectId, resource, signal, publish }) => {
+			const root = rootOf(projectId);
+			if (root === undefined)
+				throw new Error('file observation project is unavailable');
+			const target = resolve(root, resource);
+			const targetStats = await stat(target).catch((error: unknown) => {
+				lost('files.watch.start', error);
+				throw error;
+			});
+			const watchedDirectory = targetStats.isDirectory()
+				? target
+				: dirname(target);
+			const watchedName = targetStats.isDirectory() ? null : basename(target);
+			const watcher = watchFileSystem(
+				watchedDirectory,
+				{ persistent: false },
+				(eventType, entryName) => {
+					if (
+						watchedName !== null &&
+						entryName !== null &&
+						String(entryName) !== watchedName
+					)
+						return;
+					publish({
+						resource,
+						kind: eventType === 'rename' ? 'renamed' : 'changed',
+						...(entryName === null
+							? {}
+							: { relatedResource: String(entryName) }),
+					});
+				},
+			);
+			let unavailablePublished = false;
+			const publishUnavailable = () => {
+				if (signal.aborted || unavailablePublished) return;
+				unavailablePublished = true;
+				lost('files.watch');
+				publish({ resource, kind: 'unavailable' });
+			};
+			watcher.once('error', publishUnavailable);
+			watcher.once('close', publishUnavailable);
+			signal.addEventListener('abort', () => watcher.close(), {
+				once: true,
+			});
+		},
+		calculateFolderSize: async ({ projectId, resource, signal, progress }) => {
+			const root = rootOf(projectId);
+			if (root === undefined)
+				throw new Error('folder-size project is unavailable');
+			let bytes = 0;
+			let files = 0;
+			let directories = 0;
+			const visit = async (directory: string): Promise<void> => {
+				if (signal.aborted) throw signal.reason;
+				directories += 1;
+				for (const entry of await readdir(directory, {
+					withFileTypes: true,
+				})) {
+					if (signal.aborted) throw signal.reason;
+					const path = resolve(directory, entry.name);
+					if (entry.isDirectory()) await visit(path);
+					else if (entry.isFile()) {
+						files += 1;
+						bytes += (await stat(path)).size;
+					}
+					progress({ bytes, files, directories });
+				}
+			};
+			await visit(resolve(root, resource));
+			return { bytes, files, directories };
+		},
+	};
+}
+
+const nodeFileCatalogStorage: FileCatalogStorage & FileSessionStorage = {
+	realpath: (path) => realpath(path),
+	stat: async (path) => toPathStat(await stat(path)),
+	lstat: async (path) => toPathStat(await lstat(path)),
+	readDirectory: async (path) =>
+		(await readdir(path, { withFileTypes: true })).map((entry) => ({
+			name: entry.name,
+			isDirectory: entry.isDirectory(),
+			isFile: entry.isFile(),
+			isSymbolicLink: entry.isSymbolicLink(),
+		})),
+	readRange: async (path, offset, length) => {
+		const handle = await open(path, 'r');
+		try {
+			const bytes = new Uint8Array(length);
+			const { bytesRead } = await handle.read(bytes, 0, length, offset);
+			return bytes.slice(0, bytesRead);
+		} finally {
+			await handle.close();
+		}
+	},
+	makeDirectory: async (path, signal) => {
+		signal?.throwIfAborted();
+		await mkdir(path);
+		signal?.throwIfAborted();
+	},
+	rename: async (from, to, signal) => {
+		signal?.throwIfAborted();
+		await rename(from, to);
+		signal?.throwIfAborted();
+	},
+	remove: async (path, options, signal) => {
+		signal?.throwIfAborted();
+		await rm(path, { recursive: options?.recursive === true });
+		signal?.throwIfAborted();
+	},
+	atomicWrite: async (path, bytes, signal) => {
+		signal?.throwIfAborted();
+		const temporary = `${path}.terminay-${randomBytes(12).toString('hex')}`;
+		try {
+			await writeFile(temporary, bytes, { flag: 'wx', mode: 0o600 });
+			signal?.throwIfAborted();
+			await rename(temporary, path);
+		} finally {
+			await rm(temporary, { force: true }).catch(() => undefined);
+		}
+		signal?.throwIfAborted();
+	},
+};
+
+function toPathStat(value: {
+	isDirectory(): boolean;
+	isFile(): boolean;
+	isSymbolicLink(): boolean;
+	size: number;
+	mtimeMs: number;
+	mode: number;
+}) {
+	return {
+		isDirectory: value.isDirectory(),
+		isFile: value.isFile(),
+		isSymbolicLink: value.isSymbolicLink(),
+		size: value.size,
+		mtimeMs: value.mtimeMs,
+		mode: value.mode,
+	};
+}
+
+function toRendererEvent(event: TerminalEvent): ServerTerminalRendererEvent {
+	if (event.type === 'output') {
+		return {
+			type: 'output',
+			id: event.sessionId,
+			data: new TextDecoder().decode(event.bytes),
+		};
+	}
+	if (event.type === 'exit') {
+		return {
+			type: 'exit',
+			id: event.sessionId,
+			exitCode: event.exitCode,
+			signal: event.signal,
+		};
+	}
+	return {
+		type: 'skip',
+		id: event.sessionId,
+		fromPosition: event.fromPosition,
+		toPosition: event.toPosition,
+		reason: event.reason,
+	};
+}
+
+function legacyConsumerId(rendererId: number): string {
+	if (!Number.isSafeInteger(rendererId) || rendererId < 0)
+		throw new TypeError('renderer id is invalid');
+	return `legacy-renderer:${rendererId}`;
+}
+
+function workspaceCommandTestRecord(
+	command: WorkspaceCommand,
+): ServerWorkspaceTestCommandRecord {
+	const projectId = 'projectId' in command ? command.projectId : undefined;
+	return Object.freeze({
+		operation: 'workspace.command',
+		command: Object.freeze({
+			type: command.type,
+			...(projectId === undefined ? {} : { projectId }),
+			...(command.type === 'project.sidebar.update'
+				? { sidebar: structuredClone(command.sidebar) }
+				: {}),
+		}),
+	});
+}
+
+function embeddedDictationSettings(
+	settings: Readonly<Record<string, JsonValue>> | undefined,
+) {
+	const value = settings?.dictation;
+	const dictation =
+		typeof value === 'object' && value !== null && !Array.isArray(value)
+			? (value as Record<string, JsonValue>)
+			: {};
+	return {
+		enabled: dictation.enabled !== false,
+		provider: dictation.provider === 'parakeet' ? 'parakeet' : 'disabled',
+		model:
+			typeof dictation.model === 'string' && dictation.model.length > 0
+				? dictation.model
+				: 'mlx-community/parakeet-tdt-0.6b-v3',
+		language: typeof dictation.language === 'string' ? dictation.language : '',
+		prompt: typeof dictation.prompt === 'string' ? dictation.prompt : '',
+	};
+}
+
+function dictationOnlyOperations(
+	operations: ReturnType<typeof createAiOperationHandlers>,
+) {
+	const queryNames = new Set<string>([
+		AI_SERVER_OPERATIONS.status,
+		AI_SERVER_OPERATIONS.runtimeStatus,
+		AI_SERVER_OPERATIONS.credentialStatus,
+	]);
+	const commandNames = new Set<string>([
+		AI_SERVER_OPERATIONS.transcribe,
+		AI_SERVER_OPERATIONS.cancel,
+		AI_SERVER_OPERATIONS.installRuntime,
+		AI_SERVER_OPERATIONS.setCredential,
+		AI_SERVER_OPERATIONS.clearCredential,
+	]);
+	return {
+		queries: Object.fromEntries(
+			operationEntries(operations.queries).filter(([name]) =>
+				queryNames.has(name),
+			),
+		),
+		commands: Object.fromEntries(
+			operationEntries(operations.commands).filter(([name]) =>
+				commandNames.has(name),
+			),
+		),
+		policies: Object.fromEntries(
+			Object.entries(operations.policies ?? {}).filter(
+				([name]) => queryNames.has(name) || commandNames.has(name),
+			),
+		),
+	};
+}
+
+function operationEntries<T>(
+	operations: ReadonlyMap<string, T> | Record<string, T> | undefined,
+): [string, T][] {
+	if (operations === undefined) return [];
+	return operations instanceof Map
+		? [...operations.entries()]
+		: Object.entries(operations);
+}

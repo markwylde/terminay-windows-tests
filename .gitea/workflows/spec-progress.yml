@@ -1,0 +1,59 @@
+name: Update Specification Progress
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - docs/spec-progress.svg
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: specification-progress-main
+  cancel-in-progress: true
+
+jobs:
+  update-widget:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          ref: main
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 24
+
+      - name: Test generator
+        run: node --test scripts/generate-spec-progress.test.mjs
+
+      - name: Generate widget
+        run: node scripts/generate-spec-progress.mjs --update-readme
+
+      - name: Commit updated widget
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet -- docs/spec-progress.svg README.md; then
+            echo "Specification progress is already current."
+            exit 0
+          fi
+
+          test -n "${GITHUB_TOKEN}"
+          git config user.name "Terminay Actions"
+          git config user.email "actions@terminay.com"
+          git add docs/spec-progress.svg README.md
+          git commit -m "docs(specs): update progress widget"
+
+          # Checkout strips its token (persist-credentials: false). Re-apply it
+          # only for this push, using the same extraheader checkout itself uses.
+          AUTH="$(printf 'x-access-token:%s' "${GITHUB_TOKEN}" | base64 | tr -d '\n')"
+          GIT_TERMINAL_PROMPT=0 git -c "http.extraHeader=AUTHORIZATION: basic ${AUTH}" push origin HEAD:main

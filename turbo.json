@@ -1,0 +1,96 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "remoteCache": {
+    "apiUrl": "https://turborepo.i.wylde.net",
+    "teamSlug": "wylde",
+    "signature": true
+  },
+  "globalDependencies": ["package-lock.json"],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", "*.tsbuildinfo"],
+      "env": ["NODE_ENV"]
+    },
+    "typecheck": {
+      "dependsOn": ["^build", "build"],
+      "outputs": [],
+      "cache": false
+    },
+    "compile": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", "*.tsbuildinfo"],
+      "env": ["NODE_ENV"]
+    },
+    "test:ci": {
+      "dependsOn": ["^build", "build"],
+      "outputs": [],
+      "cache": false
+    },
+    "@terminay/client-core#test:ci": {
+      "dependsOn": ["@terminay/protocol-conformance#build", "^build", "build"],
+      "outputs": [],
+      "cache": false
+    },
+    "terminay-builtin-agents#test:ci": {
+      "dependsOn": ["compile", "^build"],
+      "outputs": [],
+      "cache": false
+    },
+    "terminay-language-typescript#test:ci": {
+      "dependsOn": ["compile", "^build"],
+      "outputs": [],
+      "cache": false
+    },
+    "terminay-gitea#test:ci": {
+      "dependsOn": ["compile", "^build"],
+      "outputs": [],
+      "cache": false
+    },
+    "terminay-github#test:ci": {
+      "dependsOn": ["compile", "^build"],
+      "outputs": [],
+      "cache": false
+    },
+    "lint": {
+      "outputs": []
+    },
+    "//#build:dev-desktop": {
+      "dependsOn": [
+        "@terminay/client-core#build",
+        "@terminay/cron#build",
+        "@terminay/desktop#build",
+        "@terminay/extension-api#build",
+        "@terminay/protocol#build",
+        "@terminay/protocol-conformance#build",
+        "@terminay/responsive-ui#build",
+        "@terminay/server#build",
+        "@terminay/server-core#build",
+        "@terminay/ui-bundle#build",
+        "@terminay/web#build",
+        "terminay-builtin-agents#compile",
+        "terminay-language-typescript#compile",
+        "terminay-gitea#compile",
+        "terminay-github#compile"
+      ],
+      "inputs": [
+        "electron/**",
+        "src/**",
+        "public/**",
+        "server.html",
+        "remote.html",
+        "vite.config.ts",
+        "vite.server-ui.config.ts",
+        "vite.server-preload.config.ts",
+        "tsconfig.json",
+        "tsconfig.node.json",
+        "tsconfig.base.json",
+        "package.json",
+        "scripts/development-workspace-aliases.mjs",
+        "scripts/build-ui-bundle-manifest.mjs"
+      ],
+      "outputs": ["dist-web/**", "dist-electron/**", "dist/**"],
+      "env": ["NODE_ENV"]
+    }
+  }
+}

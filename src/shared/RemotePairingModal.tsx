@@ -1,0 +1,220 @@
+import {
+	type ReactNode,
+	useEffect,
+	useState,
+} from 'react';
+import { writeClipboardText } from '../host/nativeActions';
+import { InPageWindow } from './inPageWindow/InPageWindow';
+import './RemotePairingModal.css';
+
+export type PendingPairingApproval = Readonly<{
+	approvalId: string;
+	deviceName: string;
+	matchCode: string;
+	expiresAt: string;
+}>;
+
+export function RemotePairingModal({
+	busy = false,
+	expiresAt,
+	onApprove,
+	onClose,
+	onDeny,
+	pairingUrl,
+	pendingApproval = null,
+	qrCodeDataUrl,
+	statusMessage,
+	success = false,
+}: Readonly<{
+	busy?: boolean;
+	expiresAt?: string | null;
+	onApprove?: (approvalId: string) => void;
+	onClose: () => void;
+	onDeny?: (approvalId: string) => void;
+	pairingUrl?: string | null;
+	/** A device asked to pair: its name and code replace the QR until decided. */
+	pendingApproval?: PendingPairingApproval | null;
+	qrCodeDataUrl?: string | null;
+	statusMessage?: string | null;
+	success?: boolean;
+}>) {
+	const [copied, setCopied] = useState(false);
+	const [generatedQr, setGeneratedQr] = useState<string | null>(null);
+	useEffect(() => {
+		let active = true;
+		if (qrCodeDataUrl || !pairingUrl) {
+			setGeneratedQr(null);
+			return () => {
+				active = false;
+			};
+		}
+		void import('qrcode')
+			.then((module) =>
+				module.default.toDataURL(pairingUrl, {
+					errorCorrectionLevel: 'M',
+					margin: 2,
+					width: 320,
+				}),
+			)
+			.then((dataUrl) => {
+				if (active) setGeneratedQr(dataUrl);
+			})
+			.catch(() => {
+				if (active) setGeneratedQr(null);
+			});
+		return () => {
+			active = false;
+		};
+	}, [pairingUrl, qrCodeDataUrl]);
+	const visibleQr = qrCodeDataUrl ?? generatedQr;
+	let body: ReactNode;
+	if (pendingApproval !== null && !success) {
+		body = (
+			<div className="remote-pairing-modal__content">
+				<section
+					className="remote-pairing-modal__approval"
+					aria-label="Device waiting for approval"
+				>
+					<p className="remote-pairing-modal__approval-kicker">
+						Waiting for your approval
+					</p>
+					<p className="remote-pairing-modal__approval-device">
+						{pendingApproval.deviceName}
+					</p>
+					<p className="remote-pairing-modal__copy">
+						Approve only if the device shows this code.
+					</p>
+					<p
+						className="remote-pairing-modal__match-code"
+					>
+						{pendingApproval.matchCode}
+					</p>
+					<div className="remote-pairing-modal__approval-actions">
+						<button
+							type="button"
+							className="remote-pairing-modal__approve-btn"
+							disabled={busy}
+							onClick={() => onApprove?.(pendingApproval.approvalId)}
+						>
+							Approve
+						</button>
+						<button
+							type="button"
+							className="remote-pairing-modal__deny-btn"
+							disabled={busy}
+							onClick={() => onDeny?.(pendingApproval.approvalId)}
+						>
+							Deny
+						</button>
+					</div>
+					<p className="remote-pairing-modal__expires-text">
+						This request expires{' '}
+						{new Date(pendingApproval.expiresAt).toLocaleTimeString()}.
+					</p>
+				</section>
+			</div>
+		);
+	} else if (visibleQr) {
+		body = (
+			<div className="remote-pairing-modal__content">
+				<div
+					className={
+						success
+							? 'remote-pairing-modal__qr-card remote-pairing-modal__qr-card--success'
+							: 'remote-pairing-modal__qr-card'
+					}
+				>
+					<img
+						key={visibleQr}
+						className="remote-pairing-modal__qr"
+						src={visibleQr}
+						alt="Remote pairing QR code"
+					/>
+					{success ? (
+						<div
+							className="remote-pairing-modal__qr-success"
+							role="status"
+							aria-live="polite"
+						>
+							<svg
+								className="remote-pairing-modal__success-tick"
+								viewBox="0 0 52 52"
+								aria-hidden="true"
+							>
+								<path
+									className="remote-pairing-modal__success-check"
+									d="M14 27.2l7.2 7.2 16.8-16.8"
+								/>
+							</svg>
+							<p className="remote-pairing-modal__success-title">Connected</p>
+						</div>
+					) : null}
+				</div>
+				<div className="remote-pairing-modal__address-section">
+					<div className="remote-pairing-modal__address-label">
+						One-time pairing link
+					</div>
+					<div className="remote-pairing-modal__address-box">
+						<div className="remote-pairing-modal__address-text">
+							{pairingUrl || 'No pairing link available yet.'}
+						</div>
+						{pairingUrl ? (
+							<button
+								type="button"
+								className="remote-pairing-modal__copy-btn"
+								onClick={() => {
+									void writeClipboardText(pairingUrl)
+										.then(() => {
+											setCopied(true);
+											window.setTimeout(() => setCopied(false), 2000);
+										})
+										.catch(() => setCopied(false));
+								}}
+							>
+								{copied ? 'Copied' : 'Copy pairing link'}
+							</button>
+						) : null}
+					</div>
+					{expiresAt ? (
+						<p className="remote-pairing-modal__expires-text">
+							Expires {new Date(expiresAt).toLocaleString()}. A replacement QR
+							appears automatically before then.
+						</p>
+					) : null}
+				</div>
+			</div>
+		);
+	} else if (pairingUrl) {
+		body = (
+			<p className="remote-pairing-modal__copy">
+				{statusMessage ?? 'Preparing the secure WebRTC session…'}
+			</p>
+		);
+	} else {
+		body = (
+			<p className="remote-pairing-modal__copy">
+				Expose this server to generate a pairing link.
+			</p>
+		);
+	}
+
+	return (
+		<InPageWindow
+			kind={{ resizable: false, width: 560 }}
+			name="remote-pairing"
+			title="Pair Device"
+			onClose={onClose}
+		>
+			<div className="remote-pairing-modal">
+				<div className="remote-pairing-modal__container">
+					<p className="remote-pairing-modal__copy">
+						{success
+							? 'That browser is paired. It can reconnect from this server’s stable origin.'
+							: 'Use this one-time link to pair a new browser or Desktop device. That device can reconnect later from this server’s stable origin.'}
+					</p>
+					{body}
+				</div>
+			</div>
+		</InPageWindow>
+	);
+}

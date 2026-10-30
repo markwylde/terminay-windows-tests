@@ -1,0 +1,904 @@
+import assert from 'node:assert/strict';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import { join } from 'node:path';
+import test from 'node:test';
+import { build } from 'esbuild';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+
+/**
+ * What a folder row of the Folders tree draws for its worktree: the pull
+ * request as a link, the checks as the control that opens their list, and how
+ * the worktree stands against the default branch.
+ */
+
+const require = createRequire(import.meta.url);
+const testDirectory = await mkdtemp(join(process.cwd(), '.folders-tree-row-'));
+
+async function bundleModule(entryPoint, outputName) {
+	const outputPath = join(testDirectory, outputName);
+	await build({
+		entryPoints: [entryPoint],
+		outfile: outputPath,
+		bundle: true,
+		format: 'cjs',
+		platform: 'node',
+		external: ['react', 'react-dom'],
+		loader: { '.css': 'empty' },
+		logLevel: 'silent',
+	});
+	return require(outputPath);
+}
+
+const { FoldersTree } = await bundleModule(
+	'src/components/folders/FoldersTree.tsx',
+	'folders-tree.cjs',
+);
+const { worktreeChange, folderTreeWorktrees } = await bundleModule(
+	'src/workspace/folderTreeSources.ts',
+	'folder-tree-sources.cjs',
+);
+const { folderOrderAfterMove, terminalRenameTitle } = await bundleModule(
+	'src/workspace/folderTreeModel.ts',
+	'folder-tree-model.cjs',
+);
+const { FolderDetails, folderDetailsDescription, FOLDER_DETAILS_DELAY_MS } =
+	await bundleModule(
+		'src/components/folders/FolderDetailsTooltip.tsx',
+		'folder-details-tooltip.cjs',
+	);
+const { createHoverDelay } = await bundleModule(
+	'src/workspace/hoverDelay.ts',
+	'hover-delay.cjs',
+);
+const presentation = await bundleModule(
+	'src/components/folders/worktreePropertyPresentation.ts',
+	'worktree-property-presentation.cjs',
+);
+
+const treeCssText = await readFile('src/components/folders/foldersTree.css', 'utf8');
+const treeCss = () => treeCssText;
+
+test.after(async () => {
+	await rm(testDirectory, { recursive: true, force: true });
+});
+
+const checks = {
+	passed: 12,
+	failed: 2,
+	pending: 2,
+	skipped: 0,
+	total: 16,
+	items: [
+		{ name: 'CI / Lint', state: 'passed' },
+		{ name: 'CI / E2E (2/10)', state: 'pending' },
+		{ name: 'CI / Build', state: 'failed', url: 'https://git.example.net/r/1' },
+	],
+};
+
+const linked = (extra = {}) => ({
+	id: 'folder-linked',
+	// A linked folder is named by its worktree's branch, not its directory.
+	name: 'feat/one-project-one-window',
+	label: { text: 'feat/one-project-one-window' },
+	details: {
+		branch: 'feat/one-project-one-window',
+		worktree: 'one-project-one-window',
+		location: '/repo/.worktrees/one-project-one-window',
+	},
+	kind: 'linked',
+	isSelected: false,
+	isDirty: false,
+	worktreePath: '/repo/.worktrees/one-project-one-window',
+	branch: 'feat/one-project-one-window',
+	panels: [],
+	isEmpty: true,
+	...extra,
+});
+
+const render = (folders, props = {}) =>
+	renderToStaticMarkup(
+		React.createElement(FoldersTree, {
+			folders,
+			onSelectFolder: () => {},
+			onSelectPanel: () => {},
+			...props,
+		}),
+	);
+
+test('the checks tone is failed, then pending, then passed', () => {
+	assert.equal(presentation.checksTone(checks), 'failed');
+	assert.equal(presentation.checksTone({ ...checks, failed: 0 }), 'pending');
+	assert.equal(
+		presentation.checksTone({ ...checks, failed: 0, pending: 0 }),
+		'passed',
+	);
+});
+
+test('the pull request and the checks have accessible names with the number and the counts', () => {
+	assert.equal(
+		presentation.checksAccessibleName(checks),
+		'Checks: 2 failed, 12 passed, 2 pending. Show checks',
+	);
+	assert.match(
+		presentation.pullRequestAccessibleName({
+			number: 285,
+			title: 'About window',
+			state: 'open',
+		}),
+		/^Pull request #285, open: About window\. Open in browser$/,
+	);
+});
+
+test('check items list failures first, and passes fill what room is left', () => {
+	assert.deepEqual(
+		presentation.orderedCheckItems(checks).map((item) => item.state),
+		['failed', 'pending', 'passed'],
+	);
+	const many = {
+		...checks,
+		total: 9,
+		items: [
+			...Array.from({ length: 7 }, (_, index) => ({
+				name: `pass ${index}`,
+				state: 'passed',
+			})),
+			{ name: 'broken', state: 'failed' },
+			{ name: 'running', state: 'pending' },
+		],
+	};
+	const { shown, hidden } = presentation.shownCheckItems(many);
+	assert.deepEqual(
+		shown.map((item) => item.name),
+		['broken', 'running', 'pass 0', 'pass 1', 'pass 2', 'pass 3'],
+	);
+	assert.equal(hidden, 3);
+});
+
+const general = (extra = {}) => ({
+	id: 'folder-general',
+	name: 'General',
+	kind: 'general',
+	isSelected: false,
+	isDirty: false,
+	branch: 'main',
+	panels: [],
+	isEmpty: true,
+	...extra,
+});
+
+const terminalRow = (extra = {}) => ({
+	panelId: 'panel-1',
+	sessionId: 'session-1',
+	title: 'Terminal 2',
+	kind: 'terminal',
+	status: 'idle',
+	isActive: false,
+	...extra,
+});
+
+test('the chips say the pull request with its state unless open, and the checks as a count and a word', () => {
+	assert.deepEqual(presentation.pullRequestChip({ number: 350, state: 'open' }), {
+		prefix: 'PR',
+		number: '#350',
+	});
+	assert.deepEqual(presentation.pullRequestChip({ number: 351, state: 'draft' }), {
+		prefix: 'PR',
+		number: '#351',
+		state: 'draft',
+	});
+	assert.equal(
+		presentation.pullRequestChip({ number: 352, state: 'merged' }).state,
+		'merged',
+	);
+	assert.deepEqual(presentation.checksChip(checks), { count: 2, word: 'failed' });
+	assert.deepEqual(presentation.checksChip({ ...checks, failed: 0 }), {
+		count: 2,
+		word: 'running',
+	});
+	assert.deepEqual(
+		presentation.checksChip({ ...checks, failed: 0, pending: 0 }),
+		{ count: 12, word: 'passed' },
+	);
+	// Only a linked folder with work in it and no pull request says so.
+	const noPr = presentation.showsNoPullRequest;
+	assert.equal(noPr({ kind: 'linked', isDirty: true }), true);
+	assert.equal(noPr({ kind: 'linked', isDirty: false }), false);
+	assert.equal(noPr({ kind: 'general', isDirty: true }), false);
+	assert.equal(
+		noPr({ kind: 'linked', isDirty: true, pullRequest: { number: 1 } }),
+		false,
+	);
+	// Pushed and not merged is still work nobody has asked to merge.
+	assert.equal(
+		noPr({ kind: 'linked', isDirty: false, unmerged: { commits: 2 } }),
+		true,
+	);
+	assert.equal(
+		noPr({ kind: 'general', isDirty: false, unmerged: { commits: 2 } }),
+		false,
+	);
+	assert.deepEqual(presentation.unmergedMark({ commits: 4 }), {
+		text: '↑4',
+		label: '4 commits not on the default branch',
+	});
+	assert.deepEqual(presentation.unmergedMark({ commits: 1 }), {
+		text: '↑1',
+		label: '1 commit not on the default branch',
+	});
+	assert.deepEqual(presentation.unmergedMark({ commits: null }), {
+		text: '↑',
+		label: 'Commits not on the default branch',
+	});
+});
+
+test('an unmerged branch ends with its mark whether or not the checkout is dirty, and a merged one has none', () => {
+	const pushed = render([
+		linked({ change: { kind: 'clean' }, unmerged: { commits: 4 } }),
+	]);
+	assert.match(pushed, /class="folders-tree__title"/);
+	assert.equal(pushed.includes('folders-tree__title--dirty'), false);
+	assert.match(
+		pushed,
+		/<span class="folders-tree__name">feat\/one-project-one-window<\/span><span class="folders-tree__unmerged" role="img" aria-label="4 commits not on the default branch" title="4 commits not on the default branch">↑4<\/span>/,
+	);
+	// Nothing unpushed, so no change size; pushed with no pull request says so.
+	assert.equal(pushed.includes('folders-tree__change'), false);
+	assert.match(pushed, /folders-tree__chip--quiet">no PR</);
+
+	const local = render([
+		linked({
+			isDirty: true,
+			change: { kind: 'delta', additions: 12, deletions: 3 },
+			unmerged: { commits: 5 },
+		}),
+	]);
+	assert.match(local, /folders-tree__title folders-tree__title--dirty"/);
+	assert.match(local, /folders-tree__unmerged"[^>]*>↑5</);
+	assert.match(local, /folders-tree__delta--additions">\+12</);
+
+	const merged = render([linked({ change: { kind: 'clean' } })]);
+	assert.equal(merged.includes('folders-tree__unmerged'), false);
+});
+
+test('a linked folder card has one line naming its branch, then its facts line, and General keeps a title and a branch line', () => {
+	const markup = render(
+		[
+			linked({
+				isDirty: true,
+				pullRequest: {
+					number: 350,
+					state: 'open',
+					title: 'One project, one window',
+					url: 'https://git.example.net/pulls/350',
+				},
+				checks: { failed: 0, pending: 0, passed: 26, skipped: 0 },
+				change: { kind: 'delta', additions: 1234, deletions: 7 },
+			}),
+		],
+		{ onOpenLink: () => {}, onFolderMenu: () => {} },
+	);
+	const title = markup.indexOf('class="folders-tree__title folders-tree__title--dirty"');
+	const facts = markup.indexOf('class="folders-tree__facts"');
+	assert.ok(title !== -1 && title < facts, markup);
+	// The branch is said once, on the title line, under the branch icon: there
+	// is no folder icon, no branch line, and the directory is not on the card.
+	assert.equal(markup.includes('folders-tree__branch'), false);
+	assert.equal(markup.includes('lucide-folder'), false);
+	assert.match(markup, /<svg[^>]*lucide-git-branch[^>]*folders-tree__icon/);
+	assert.equal(markup.match(/>feat\/one-project-one-window</g)?.length, 1);
+	assert.equal(markup.includes('>one-project-one-window<'), false);
+	assert.match(markup, /aria-label="Actions for feat\/one-project-one-window"/);
+	// The label has no native tooltip to stack on the details.
+	assert.equal(markup.includes('title="feat/one-project-one-window"'), false);
+
+	const root = render([general()]);
+	assert.match(root, /lucide-folder/);
+	assert.match(root, /<span class="folders-tree__name" title="General">General<\/span>/);
+	assert.match(root, /class="folders-tree__branch"/);
+	assert.match(
+		markup,
+		/<button type="button" class="folders-tree__chip folders-tree__pr folders-tree__pr--open folders-tree__pr--link" aria-label="Pull request #350, open: One project, one window\. Open in browser"[^>]*><span class="folders-tree__chip-extra">PR<\/span><span>#350<\/span><\/button>/,
+	);
+	assert.match(
+		markup,
+		/<button type="button" class="folders-tree__chip folders-tree__checks folders-tree__checks--passed folders-tree__checks--link" aria-label="Checks: 0 failed, 26 passed, 0 pending\. Show checks" aria-expanded="false"[^>]*>.*?<span>26<\/span><span class="folders-tree__chip-extra">passed<\/span><\/button>/,
+	);
+	assert.match(markup, /folders-tree__delta--additions">\+1\.2k</);
+	assert.match(markup, /folders-tree__delta--deletions">−7</);
+	assert.match(markup, /class="folders-tree__row folders-tree__row--folder"[^>]*data-change="delta"/);
+	// One facts line, and the checks are not listed until they are opened.
+	assert.equal(markup.match(/class="folders-tree__facts"/g)?.length, 1);
+	assert.equal(markup.match(/folders-tree__checks-list/g), null);
+	assert.equal(markup.includes('no PR'), false);
+});
+
+test('a branch takes the accent only when its checkout is dirty, and a dirty linked folder with no pull request says so', () => {
+	const dirty = render([linked({ isDirty: true, change: { kind: 'changed' } })]);
+	assert.match(dirty, /folders-tree__title folders-tree__title--dirty"/);
+	assert.match(dirty, /folders-tree__change--changed">changed</);
+	assert.match(dirty, /folders-tree__chip--quiet">no PR</);
+
+	const clean = render([linked({ change: { kind: 'clean' } })]);
+	assert.match(clean, /class="folders-tree__title"/);
+	assert.equal(clean.includes('folders-tree__title--dirty'), false);
+	// Clean draws no chip and no facts line; the header still says which it is.
+	assert.equal(clean.includes('folders-tree__facts'), false);
+	assert.match(clean, /data-change="clean"/);
+	assert.equal(clean.includes('>clean<'), false);
+
+	const merged = render([
+		linked({
+			change: { kind: 'clean' },
+			pullRequest: { number: 352, state: 'merged', title: 'Banner' },
+		}),
+	]);
+	assert.match(
+		merged,
+		/folders-tree__pr--merged"[^>]*><span class="folders-tree__chip-extra">PR<\/span><span>#352<\/span><span>merged<\/span>/,
+	);
+	assert.equal(merged.includes('folders-tree__title--dirty'), false);
+
+	// General is measured like any other checkout, and never asked for a pull request.
+	const root = render([
+		general({ isDirty: true, change: { kind: 'delta', additions: 4, deletions: 1 } }),
+	]);
+	assert.match(root, /folders-tree__branch folders-tree__branch--dirty"/);
+	assert.match(root, /folders-tree__delta--additions">\+4</);
+	assert.equal(root.includes('no PR'), false);
+
+	const plain = render([
+		{ id: 'p', name: 'Servers', kind: 'plain', isSelected: false, isDirty: false, panels: [], isEmpty: true },
+	]);
+	assert.equal(plain.includes('folders-tree__branch'), false);
+	assert.equal(plain.includes('folders-tree__facts'), false);
+});
+
+test('every card ends with New terminal where one can be made, and an empty folder shows no placeholder', () => {
+	const markup = render(
+		[general(), linked({ panels: [terminalRow()], isEmpty: false })],
+		{ onNewTerminal: () => {} },
+	);
+	assert.equal(markup.match(/class="folders-tree__new-terminal"/g)?.length, 2);
+	assert.match(markup, /aria-label="New terminal in General"/);
+	assert.match(markup, /aria-label="New terminal in feat\/one-project-one-window"/);
+	assert.equal(markup.includes('No terminals yet'), false);
+	// The row is the last thing in its card.
+	assert.match(markup, /<\/button><\/fieldset><\/div><\/div>(<div class="folders-tree__folder"|<\/div>$)/);
+	// Without a way to make one there is no row.
+	assert.equal(render([general()]).includes('New terminal'), false);
+});
+
+test('every title is a drag handle where folders can be reordered, General included, and a peek has none', () => {
+	const folders = [
+		general(),
+		linked(),
+		{ id: 'p', name: 'Servers', kind: 'plain', isSelected: false, isDirty: false, panels: [], isEmpty: true },
+	];
+	const markup = render(folders, { onReorderFolders: () => {} });
+	assert.equal(markup.match(/data-folder-drag-handle="true"/g)?.length, 3);
+	// There is no grip: the title line is what a card is carried by.
+	assert.equal(markup.includes('folders-tree__grip'), false);
+	assert.equal(render(folders, { variant: 'peek' }).includes('data-folder-drag-handle'), false);
+	assert.equal(render(folders).includes('data-folder-drag-handle'), false);
+});
+
+test('a folder has a toggle where it can be collapsed, and collapsed it is its title line and one status', () => {
+	const working = terminalRow({ panelId: 'a', sessionId: 'a', status: 'working' });
+	const waiting = terminalRow({ panelId: 'b', sessionId: 'b', status: 'waiting', title: 'needs you' });
+	const folders = [
+		general({ branch: 'main', isEmpty: false, panels: [working, waiting] }),
+		linked({ isEmpty: false, panels: [terminalRow({ title: 'quiet one' })] }),
+	];
+	const props = { onToggleFolderCollapsed: () => {}, onNewTerminal: () => {} };
+
+	const open = render(folders, props);
+	assert.equal(open.match(/class="folders-tree__toggle"/g)?.length, 2);
+	assert.match(open, /aria-label="Collapse General"/);
+	assert.equal(open.match(/data-folder-header="true"[^>]*aria-expanded="true"|aria-expanded="true"[^>]*data-folder-header="true"/g)?.length, 2);
+	assert.match(open, /class="folders-tree__branch/);
+	assert.match(open, />needs you</);
+	// Open, each terminal says its own state and the title says none.
+	assert.equal(open.includes('folders-tree__attention'), false);
+
+	const closed = render(folders, {
+		...props,
+		collapsedFolderIds: new Set(folders.map((folder) => folder.id)),
+	});
+	assert.match(closed, /aria-label="Expand General"/);
+	assert.equal(closed.match(/data-folder-collapsed="true"/g)?.length, 2);
+	// Everything beneath the title line is gone: the branch, the rows, the
+	// new-terminal row.
+	assert.equal(closed.includes('folders-tree__branch'), false);
+	assert.equal(closed.includes('folders-tree__facts'), false);
+	assert.equal(closed.includes('folders-tree__row--panel'), false);
+	assert.equal(closed.includes('New terminal'), false);
+	// One state for the folder: the most urgent of its terminals. The folder
+	// whose terminals are all idle shows none.
+	const attention = [...closed.matchAll(/<[^>]*folders-tree__attention[^>]*>/g)].map(([tag]) => tag);
+	assert.equal(attention.length, 1);
+	assert.match(attention[0], /data-agent-state="waiting"/);
+
+	// Without a way to collapse there is no toggle, as in a peek.
+	assert.equal(render(folders).includes('folders-tree__toggle'), false);
+});
+
+test('any folder moves to any place, General included, and a place past either end is that end', () => {
+	const ids = ['general', 'alpha', 'beta', 'gamma'];
+	assert.deepEqual(folderOrderAfterMove(ids, 'gamma', 1), ['general', 'gamma', 'alpha', 'beta']);
+	assert.deepEqual(folderOrderAfterMove(ids, 'gamma', 0), ['gamma', 'general', 'alpha', 'beta']);
+	assert.deepEqual(folderOrderAfterMove(ids, 'gamma', -5), ['gamma', 'general', 'alpha', 'beta']);
+	assert.deepEqual(folderOrderAfterMove(ids, 'alpha', 2), ['general', 'beta', 'alpha', 'gamma']);
+	assert.deepEqual(folderOrderAfterMove(ids, 'alpha', 99), ['general', 'beta', 'gamma', 'alpha']);
+	assert.deepEqual(folderOrderAfterMove(ids, 'alpha', 1), ids);
+	assert.deepEqual(folderOrderAfterMove(ids, 'general', 3), ['alpha', 'beta', 'gamma', 'general']);
+	assert.deepEqual(folderOrderAfterMove(ids, 'general', 1), ['alpha', 'general', 'beta', 'gamma']);
+	assert.deepEqual(folderOrderAfterMove(ids, 'general', -1), ids);
+	assert.deepEqual(folderOrderAfterMove(ids, 'missing', 2), ids);
+});
+
+test("a rename typed into a terminal's row saves the trimmed name, and nothing for a blank or unchanged one", () => {
+	assert.equal(terminalRenameTitle('Terminal 1', 'api server'), 'api server');
+	assert.equal(terminalRenameTitle('Terminal 1', '  logs  '), 'logs');
+	assert.equal(terminalRenameTitle('Terminal 1', ''), null);
+	assert.equal(terminalRenameTitle('Terminal 1', '   '), null);
+	assert.equal(terminalRenameTitle('Terminal 1', 'Terminal 1'), null);
+	assert.equal(terminalRenameTitle('Terminal 1', ' Terminal 1 '), null);
+});
+
+test("the selected folder's header band is tinted whether or not one of its rows is active", () => {
+	const withActive = render([
+		linked({
+			isSelected: true,
+			isEmpty: false,
+			panels: [terminalRow({ isActive: true })],
+		}),
+		general(),
+	]);
+	assert.equal(withActive.match(/folders-tree__row--folder folders-tree__row--selected"/g)?.length, 1);
+	assert.match(withActive, /folders-tree__row--terminal folders-tree__row--active"/);
+
+	const alone = render([linked({ isSelected: true })]);
+	assert.match(alone, /folders-tree__row--folder folders-tree__row--selected"/);
+	assert.equal(alone.includes('folders-tree__row--active'), false);
+
+	const css = treeCss();
+	assert.match(css, /\.folders-tree__row--selected,\s*\.folders-tree__row--selected:hover\s*\{[^}]*--project-color/);
+	assert.equal(css.includes('selected-alone'), false);
+});
+
+test("a folder's title line ends with a count of all its tabs, then its menu", () => {
+	const markup = render(
+		[
+			general({
+				isEmpty: false,
+				panels: [
+					terminalRow({ panelId: 'a', sessionId: 'a' }),
+					terminalRow({ panelId: 'b', sessionId: 'b' }),
+					{ kind: 'file', panelId: 'f', title: 'README.md', isActive: false },
+				],
+			}),
+			linked({ panels: [terminalRow()], isEmpty: false }),
+			linked({ id: 'empty', panels: [], isEmpty: true }),
+		],
+		{ onFolderMenu: () => {} },
+	);
+	const counts = [...markup.matchAll(/class="folders-tree__count"[^>]*aria-label="([^"]+)"[^>]*>(\d+)</g)].map(
+		([, label, count]) => [label, count],
+	);
+	assert.deepEqual(counts, [
+		['3 tabs', '3'],
+		['1 tab', '1'],
+		['0 tabs', '0'],
+	]);
+	// The count sits on the title line, directly before the menu button.
+	assert.match(markup, /class="folders-tree__count"[^>]*>3<\/span><button type="button" class="folders-tree__menu"/);
+	// The title line has no button that makes a terminal: that is the last row's.
+	const titles = [...markup.matchAll(/<span class="folders-tree__title"[^>]*>(.*?)<\/span><\/div>/g)].join('');
+	assert.equal(titles.includes('New terminal'), false);
+});
+
+test('the New terminal row offers the shell first, then each launcher in order, and a peek has no row', () => {
+	const launchers = [
+		{ id: 'x/launch-claude-code', displayName: 'Claude Code', icon: 'agent-claude-code' },
+		{ id: 'x/launch-codex', displayName: 'Codex', icon: 'agent-codex' },
+		{ id: 'y/launch-other', displayName: 'Other', icon: 'not-on-the-allowlist' },
+	];
+	const markup = render([general()], {
+		onNewTerminal: () => {},
+		onLaunchTerminal: () => {},
+		launchers,
+	});
+	const buttons = [...markup.matchAll(/class="folders-tree__launcher" aria-label="([^"]+)" title="([^"]+)" data-launcher-id="([^"]+)"/g)].map(
+		([, label, title, id]) => [label, title, id],
+	);
+	assert.deepEqual(buttons, [
+		['Shell', 'New terminal', 'shell'],
+		['Claude Code', 'New Claude Code terminal', 'x/launch-claude-code'],
+		['Codex', 'New Codex terminal', 'x/launch-codex'],
+		['Other', 'New Other terminal', 'y/launch-other'],
+	]);
+	assert.match(markup, /<fieldset class="folders-tree__launchers" aria-label="New terminal in General with"/);
+	assert.match(markup, /launcher-icon--agent-claude-code/);
+	assert.match(markup, /launcher-icon--agent-codex/);
+	// An id the client does not know draws as a terminal.
+	assert.equal(markup.match(/launcher-icon--terminal/g)?.length, 2);
+
+	// With no way to launch, only the shell is offered.
+	const shellOnly = render([general()], { onNewTerminal: () => {}, launchers });
+	assert.equal(shellOnly.match(/class="folders-tree__launcher"/g)?.length, 1);
+
+	// A peek lists and offers nothing.
+	const peek = render([general()], { variant: 'peek', launchers });
+	assert.equal(peek.includes('folders-tree__launcher'), false);
+	assert.equal(peek.includes('New terminal'), false);
+
+	// The buttons are in the document always and revealed on hover or focus,
+	// and always shown where there is no hover.
+	const css = treeCss();
+	assert.match(css, /\.folders-tree__new-terminal-row:hover \.folders-tree__launchers,\s*\.folders-tree__new-terminal-row:focus-within \.folders-tree__launchers/);
+	assert.match(css, /@media \(hover: none\)\s*\{\s*\.folders-tree__launchers\s*\{\s*opacity: 1/);
+});
+
+test('folders are full-width square blocks with a gutter, and titles are drawn as pane titles', () => {
+	const css = treeCss();
+	const block = css.match(/\.folders-tree__folder \{([^}]*)\}/)[1];
+	assert.equal(/margin|border-radius/.test(block), false);
+	assert.match(css.match(/\.folders-tree \{([^}]*)\}/)[1], /gap: 6px/);
+	const title = css.match(/\.folders-tree__row--folder \.folders-tree__name \{([^}]*)\}/)[1];
+	assert.match(title, /font-size: 11px/);
+	assert.match(title, /font-weight: 600/);
+	assert.match(title, /text-transform: uppercase/);
+	assert.match(title, /letter-spacing: 0\.05em/);
+	// The upper case is drawing only: the text and its tooltip keep their case.
+	assert.match(render([general()]), /title="General">General</);
+});
+
+test('a card that only reports, as in a peek, shows the same facts with nothing to press', () => {
+	const markup = render(
+		[
+			linked({
+				isDirty: true,
+				pullRequest: {
+					number: 350,
+					state: 'draft',
+					title: 'Draft',
+					url: 'https://git.example.net/pulls/350',
+				},
+				checks: { failed: 1, pending: 2, passed: 3, skipped: 0 },
+				change: { kind: 'changed' },
+			}),
+		],
+		{ variant: 'peek' },
+	);
+	assert.equal(markup.includes('<button'), false);
+	assert.match(markup, /folders-tree__pr folders-tree__pr--draft"[^>]*>.*?<span>#350<\/span><span>draft<\/span>/);
+	// Failures are the number shown when there are any.
+	assert.match(markup, /folders-tree__checks--failed"[^>]*>.*?<span>1<\/span>/);
+	assert.match(markup, /folders-tree__title--dirty/);
+	assert.equal(markup.includes('New terminal'), false);
+});
+
+test('a worktree is clean only with nothing unpushed and no working-tree entry; a missing one is missing', () => {
+	const worktree = {
+		isPrunable: false,
+		isDirtyBranch: false,
+		aheadOfMainCount: 0,
+		hasUnpushedCommits: false,
+		entries: [],
+		lineAdditions: 0,
+		lineDeletions: 0,
+		unpushedLineAdditions: 0,
+		unpushedLineDeletions: 0,
+	};
+	assert.deepEqual(worktreeChange(worktree), { kind: 'clean' });
+	assert.deepEqual(worktreeChange({ ...worktree, unpushedLineAdditions: 3 }), {
+		kind: 'delta',
+		additions: 3,
+		deletions: 0,
+	});
+	// Unpushed commits with no measured size.
+	assert.deepEqual(worktreeChange({ ...worktree, hasUnpushedCommits: true }), {
+		kind: 'changed',
+	});
+	// Pushed work the default branch lacks is not a change on this machine.
+	assert.deepEqual(
+		worktreeChange({
+			...worktree,
+			isDirtyBranch: true,
+			lineAdditions: 247,
+			lineDeletions: 13,
+		}),
+		{ kind: 'clean' },
+	);
+	assert.deepEqual(worktreeChange({ ...worktree, entries: [{}] }), {
+		kind: 'changed',
+	});
+	// A registration with no working tree is not clean, whatever its counts.
+	assert.deepEqual(worktreeChange({ ...worktree, isPrunable: true }), {
+		kind: 'missing',
+	});
+	assert.equal(
+		folderTreeWorktrees({
+			gitAvailable: true,
+			repoRoot: '/repo',
+			defaultBranch: 'main',
+			worktrees: [{ ...worktree, path: '/repo', branch: 'main' }],
+		})[0].change.kind,
+		'clean',
+	);
+});
+
+test('the forge sign-in prompt is asked by the workspace, once, wherever the sidebar is', async () => {
+	const app = await readFile('src/App.tsx', 'utf8');
+	const changesPane = await readFile(
+		'src/components/git-panel/ChangesPane.tsx',
+		'utf8',
+	);
+	// One place draws it, and it is not the pane that only exists while the
+	// sidebar is open on the Explorer group.
+	assert.equal(app.match(/<WorktreeSignInDialog/g)?.length, 1);
+	assert.doesNotMatch(changesPane, /WorktreeSignInDialog|signIn/);
+	const sidebar = app.slice(
+		app.indexOf('\t\t\t\t\tnavigation={'),
+		app.indexOf('\t\t\t\t\tcontent={'),
+	);
+	assert.ok(sidebar.length > 0, 'expected the sidebar slot of the workspace');
+	assert.doesNotMatch(sidebar, /WorktreeSignInDialog/);
+	assert.match(
+		app,
+		/isActive && worktreePanelStatus\?\.signIn !== undefined \? \(\s*<WorktreeSignInDialog/,
+	);
+});
+
+test('a plain folder and a clean General show no facts line: General its branch alone, a plain folder nothing', () => {
+	const markup = render([
+		{
+			id: 'general',
+			name: 'General',
+			kind: 'general',
+			isSelected: true,
+			isDirty: false,
+			branch: 'main',
+			panels: [],
+			isEmpty: true,
+		},
+		{
+			id: 'plain',
+			name: 'Servers',
+			kind: 'plain',
+			isSelected: false,
+			isDirty: false,
+			panels: [],
+			isEmpty: true,
+		},
+	]);
+	assert.equal(markup.includes('folders-tree__change'), false);
+	assert.equal(markup.includes('folders-tree__pr'), false);
+	assert.equal(markup.includes('folders-tree__facts'), false);
+	assert.equal(markup.match(/class="folders-tree__branch"/g)?.length, 1);
+});
+
+test('a shared branch is followed by the worktree directory, and the names of the controls say both', () => {
+	const markup = render(
+		[
+			linked({
+				name: 'main (hotfix-copy)',
+				label: { text: 'main', suffix: 'hotfix-copy' },
+				unmerged: { commits: 2 },
+			}),
+		],
+		{ onFolderMenu: () => {}, onNewTerminal: () => {}, onReorderFolders: () => {} },
+	);
+	assert.match(
+		markup,
+		/<span class="folders-tree__name">main<span class="folders-tree__label-suffix"> hotfix-copy<\/span><\/span><span class="folders-tree__unmerged"/,
+	);
+	assert.match(markup, /aria-label="Actions for main \(hotfix-copy\)"/);
+	assert.match(markup, /aria-label="New terminal in main \(hotfix-copy\)"/);
+});
+
+test('the details say the branch, the worktree, and the location on three labelled lines, and describe the card', () => {
+	const details = {
+		branch: 'feat/reorder-rows',
+		worktree: 'reorder-rows',
+		location: '/Users/mark/Projects/terminay/.claude/worktrees/reorder-rows',
+	};
+	const markup = renderToStaticMarkup(React.createElement(FolderDetails, { details }));
+	assert.equal(
+		markup,
+		'<dl class="folders-tree-details__lines">' +
+			'<dt>Branch</dt><dd>feat/reorder-rows</dd>' +
+			'<dt>Worktree</dt><dd>reorder-rows</dd>' +
+			'<dt>Location</dt><dd class="folders-tree-details__location"><bdi>/Users/mark/Projects/terminay/.claude/worktrees/reorder-rows</bdi></dd>' +
+			'</dl>',
+	);
+	const detached = renderToStaticMarkup(
+		React.createElement(FolderDetails, {
+			details: { ...details, branch: 'detached at 16be2864' },
+		}),
+	);
+	assert.match(detached, /<dt>Branch<\/dt><dd>detached at 16be2864<\/dd>/);
+
+	// A linked card is described by them; General and a plain folder are not,
+	// and nothing is drawn until the pointer or the focus has rested.
+	const card = render([linked({ details })]);
+	assert.match(
+		card,
+		new RegExp(`aria-description="${folderDetailsDescription(details).replaceAll('.', '\\.')}"`),
+	);
+	assert.equal(card.includes('folders-tree-details'), false);
+	const others = render([
+		general(),
+		{ id: 'p', name: 'Servers', kind: 'plain', isSelected: false, isDirty: false, panels: [], isEmpty: true },
+	]);
+	assert.equal(others.includes('aria-description'), false);
+});
+
+test('the details open after a full second of rest and not before, and whatever ends the rest closes or cancels them', () => {
+	assert.equal(FOLDER_DETAILS_DELAY_MS, 1_000);
+	let now = 0;
+	let scheduled = [];
+	const timers = {
+		set: (run, delayMs) => {
+			const handle = { run, at: now + delayMs };
+			scheduled.push(handle);
+			return handle;
+		},
+		clear: (handle) => {
+			scheduled = scheduled.filter((candidate) => candidate !== handle);
+		},
+	};
+	const advance = (ms) => {
+		now += ms;
+		for (const handle of scheduled.filter((candidate) => candidate.at <= now)) {
+			scheduled = scheduled.filter((candidate) => candidate !== handle);
+			handle.run();
+		}
+	};
+	const events = [];
+	const delay = createHoverDelay(
+		FOLDER_DETAILS_DELAY_MS,
+		() => events.push('open'),
+		() => events.push('close'),
+		timers,
+	);
+
+	delay.rest();
+	advance(900);
+	assert.deepEqual(events, []);
+	advance(100);
+	assert.deepEqual(events, ['open']);
+	// Resting again while open neither reopens nor starts a second wait.
+	delay.rest();
+	assert.equal(scheduled.length, 0);
+	delay.end();
+	assert.deepEqual(events, ['open', 'close']);
+
+	// Passing over: the rest ends inside the second, and nothing ever opens.
+	delay.rest();
+	advance(999);
+	delay.end();
+	advance(5_000);
+	assert.deepEqual(events, ['open', 'close']);
+	assert.equal(scheduled.length, 0);
+
+	// Ending a rest that never began does nothing.
+	delay.end();
+	assert.deepEqual(events, ['open', 'close']);
+
+	// One wait per rest, however often the pointer reports itself.
+	delay.rest();
+	delay.rest();
+	assert.equal(scheduled.length, 1);
+	advance(1_000);
+	assert.deepEqual(events, ['open', 'close', 'open']);
+});
+
+test('a worktree being deleted says so beneath its label, in place of its facts', () => {
+	const facts = {
+		isDirty: true,
+		change: { kind: 'delta', additions: 4, deletions: 1 },
+		pullRequest: { number: 352, state: 'open', title: 'Banner' },
+	};
+	const markup = render([linked({ ...facts, isDeleting: true })]);
+	assert.match(
+		markup,
+		/class="folders-tree__deleting" role="status">Deleting…</,
+	);
+	assert.match(
+		markup,
+		/class="folders-tree__row folders-tree__row--folder"[^>]*aria-busy="true"/,
+	);
+	// The whole card is dimmed, not only its head.
+	assert.match(
+		markup,
+		/class="folders-tree__folder folders-tree__folder--deleting"/,
+	);
+	// The label stays, and comes before the line that says it is going.
+	assert.ok(
+		markup.indexOf('feat/one-project-one-window') <
+			markup.indexOf('folders-tree__deleting'),
+	);
+	assert.equal(markup.includes('folders-tree__facts'), false);
+
+	const idle = render([linked({ ...facts, isDeleting: false })]);
+	assert.equal(idle.includes('folders-tree__deleting'), false);
+	assert.equal(idle.includes('folders-tree__folder--deleting'), false);
+	assert.equal(idle.includes('aria-busy'), false);
+	assert.match(idle, /class="folders-tree__facts"/);
+});
+
+test('a worktree being pulled shows a spinner and Pulling… in place of its facts, undimmed', () => {
+	const facts = {
+		isDirty: true,
+		change: { kind: 'delta', additions: 4, deletions: 1 },
+		pullRequest: { number: 352, state: 'open', title: 'Banner' },
+	};
+	const markup = render([linked({ ...facts, isPulling: true })]);
+	assert.match(
+		markup,
+		/class="folders-tree__pulling" role="status"><svg[^>]*folders-tree__pulling-spinner[^>]*>.*?<\/svg><span>Pulling…<\/span>/,
+	);
+	assert.match(
+		markup,
+		/class="folders-tree__row folders-tree__row--folder"[^>]*aria-busy="true"/,
+	);
+	assert.ok(
+		markup.indexOf('feat/one-project-one-window') <
+			markup.indexOf('folders-tree__pulling'),
+	);
+	assert.equal(markup.includes('folders-tree__facts'), false);
+	// The folder is staying, so its card is not dimmed.
+	assert.equal(markup.includes('folders-tree__folder--deleting'), false);
+
+	// A removal outranks a pull.
+	const both = render([linked({ ...facts, isPulling: true, isDeleting: true })]);
+	assert.match(both, /Deleting…/);
+	assert.equal(both.includes('folders-tree__pulling'), false);
+
+	const idle = render([linked({ ...facts, isPulling: false })]);
+	assert.equal(idle.includes('folders-tree__pulling'), false);
+	assert.equal(idle.includes('aria-busy'), false);
+	assert.match(idle, /class="folders-tree__facts"/);
+});
+
+test('a file or folder tab is a row with its kind icon, and is neither renamed nor dragged', () => {
+	const markup = render(
+		[
+			linked({
+				isSelected: true,
+				isEmpty: false,
+				panels: [
+					terminalRow(),
+					{ kind: 'file', panelId: 'file-1', title: 'notes.md', isActive: true },
+					{ kind: 'folder', panelId: 'folder-1', title: 'src', isActive: false },
+				],
+			}),
+		],
+		{ onRenameTerminal: () => {}, onTerminalDrag: () => {}, onTerminalMenu: () => {} },
+	);
+	const rows = [
+		...markup.matchAll(/<div class="folders-tree__row folders-tree__row--panel[^>]*>/g),
+	].map(([row]) => row);
+	assert.equal(rows.length, 3);
+	// In panel order, each saying what it is.
+	assert.deepEqual(
+		rows.map((row) => /data-folder-panel-kind="(\w+)"/.exec(row)?.[1]),
+		['terminal', 'file', 'folder'],
+	);
+	// The focused file is the active row, so the folder is not tinted alone.
+	assert.match(rows[1], /folders-tree__row--file folders-tree__row--active"/);
+	assert.match(rows[1], /aria-selected="true"/);
+	assert.equal(markup.includes('folders-tree__row--selected-alone'), false);
+	// Only the terminal has a session, a status, and a row that can be carried.
+	assert.match(rows[0], /data-folder-terminal-session="session-1"/);
+	assert.match(rows[0], /draggable="true"/);
+	for (const row of rows.slice(1)) {
+		assert.equal(row.includes('data-folder-terminal-session'), false);
+		assert.match(row, /draggable="false"/);
+	}
+	assert.equal((markup.match(/folders-tree__kind/g) ?? []).length, 2);
+	assert.match(markup, /title="notes\.md"/);
+});

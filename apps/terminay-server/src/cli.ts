@@ -1,0 +1,2330 @@
+import { randomBytes } from 'node:crypto';
+import {
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	statSync,
+	watch as watchFileSystem,
+	writeFileSync,
+} from 'node:fs';
+import {
+	lstat,
+	mkdir,
+	open,
+	readdir,
+	readFile,
+	realpath,
+	rename,
+	rm,
+	stat,
+	writeFile,
+} from 'node:fs/promises';
+import { createConnection } from 'node:net';
+import { tmpdir } from 'node:os';
+import { gitCommandSocketHostOptions } from './gitCommandSocket.js';
+import { basename, dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import type { JsonValue } from '@terminay/protocol';
+import { FEATURE_CAPABILITIES } from '@terminay/protocol';
+import {
+	AgentStatusService,
+	AiService,
+	AutomationRepository,
+	AutomationRunLog,
+	agentHarnessSwitchesFromSettings,
+	agentIntegrationEnabledFromSettings,
+	backgroundTerminalLimitMs,
+	CanonicalProjectPathResolver,
+	createAutomationFileBackends,
+	createNodePtyFactory,
+	createSessionHolderPtyFactory,
+	launchDetachedSessionHolder,
+	readHolderRecords,
+	sessionHolderEnabled as isSessionHolderEnabled,
+	createNodeShellDiscoveryHost,
+	createProductionExtensionManagement,
+	createServerAiProviderAdapters,
+	createWorkspaceAiTargetAuthority,
+	createServerCoreComposition,
+	ServerUpgradeService,
+	createWorktreeCaptureHost,
+	FOLDER_TERMINAL_CAPTURED_EVENT,
+	DocumentationCatalog,
+	FileCatalog,
+	FileContentStreamService,
+	type FileObservationHost,
+	FileWorkspaceStateBackend,
+	fileWorktreePromptPreferences,
+	GitService,
+	MacroRepository,
+	MdxRuntime,
+	type NodePtyModuleLike,
+	type SessionHolderObservationReport,
+	OpenAiDictationProvider,
+	OrderedEventJournal,
+	openCanonicalWorkspace,
+	ParakeetRuntime,
+	ProjectAgentScope,
+	RecordingService,
+	type RemoteRegisteredDevice,
+	type ServerCoreComposition,
+	ServerDocumentationCatalogAdapter,
+	ServerFileAdapter,
+	ServerFileCatalogAdapter,
+	ServerFileContentAdapter,
+	ServerFileObservationAdapter,
+	ServerGitAdapter,
+	ServerMdxRuntimeAdapter,
+	ServerParakeetDictationProvider,
+	ServerRecordingAdapter,
+	type ServerRuntimeServices,
+	ServerSettingsRepository,
+	SessionSourceBridge,
+	SessionSourceSupervisor,
+	ShellProfileCatalogueService,
+	ShellProfileDiscoveryService,
+	createFilePushEnrolmentPersistence,
+	PushEnrolmentStore,
+	pushOriginForSessionOrigin,
+	type ServerCoreCompositionOptions,
+	serverVaultWorktreeCredentials,
+	TerminalActivityService,
+	TerminalReplayRegistry,
+	VaultProviderCredentialResolver,
+	WorktreeInsightService,
+	withdrawnAgentExtensionSwitches,
+} from '@terminay/server-core';
+import * as nodePty from 'node-pty';
+import {
+	allowedWebOrigins,
+	formatServerHelp,
+	parseServerCliOptions,
+	type ServerCliOptions,
+} from './cliOptions.js';
+import {
+	createFolderFileScope,
+	createStandaloneFolders,
+	type StandaloneFolders,
+} from './folders.js';
+import { createStandaloneVaultComposition } from './headlessVault.js';
+import {
+	createLocalUiServer,
+	createServerHealthServer,
+	createServerRemoteExposure,
+	createStandaloneServer,
+	DataRootInUseError,
+	DataRootLockUnavailableError,
+	describeDataRootInUse,
+	describeDataRootLockUnavailable,
+	FileDataRootLease,
+	type LocalUiServer,
+	resolveStandaloneServerIdentity,
+	runServerMcpStdio,
+	type ServerPairingHandoff,
+	type ServerRemoteExposure,
+} from './index.js';
+import { resolveTerminalProcessCwd } from './processCwd.js';
+import { assertStandaloneReleaseIntegrity } from './releaseIntegrity.js';
+import { assertAdvertisedPortIsBindable } from './remote/advertisedIcePort.js';
+import {
+	approvalSocketPath,
+	type PairingHandoffSummary,
+	sendApprovalSocketRequest,
+	startApprovalSocket,
+} from './remote/approvalSocket.js';
+import { relaySessionId } from './remote/directSessionId.js';
+import {
+	createDirectSignalingRelay,
+	type DirectSignalingRelay,
+} from './remote/directSignalingRelay.js';
+import { loadOrCreateDirectTlsCertificate } from './remote/directTlsCertificate.js';
+import { createHostedDiagnosticLogger } from './remote/hostedDiagnosticLog.js';
+import {
+	loadOrCreateHostedHostKey,
+	rotateHostedHostKey,
+} from './remote/hostedHostKey.js';
+import {
+	parseHostedIceServers,
+	startHostedPairingHost,
+} from './remote/hostedPairingHost.js';
+import { HostedDevicePresence } from './remote/hostedPeerLifecycle.js';
+import { loadHostedUiArchive } from './remote/hostedUiArchive.js';
+import {
+	createPairingOperationQueue,
+	createSharedPairingHandoffRotator,
+} from './remote/pairingOperationQueue.js';
+import { pairingUrlForEndpoint } from './remote/publicPairingUrl.js';
+import { releaseUpgraderFromEnvironment } from './releaseUpgrader.js';
+import { loadOrCreateSessionOrigin } from './remote/sessionOrigin.js';
+
+declare const process: {
+	readonly argv: readonly string[];
+	readonly execPath: string;
+	readonly env: Readonly<Record<string, string | undefined>>;
+	readonly platform: NodeJS.Platform;
+	readonly stdout: { write(value: string): void };
+	readonly stderr: { write(value: string): void };
+	cwd(): string;
+	on(signal: 'SIGINT' | 'SIGTERM', listener: () => void): void;
+	kill(pid: number, signal: number | string): void;
+	exit(code?: number): never;
+	exitCode?: number;
+};
+
+type StandaloneRuntime = ReturnType<typeof createStandaloneServer>;
+const MAX_STANDALONE_FOLDER_SIZE_ENTRIES = 50_000;
+
+await assertStandaloneReleaseIntegrity();
+
+let options = parseServerCliOptions(process.argv.slice(2), process.env);
+if (options.command === 'help') process.stdout.write(formatServerHelp());
+else if (options.command === 'version')
+	process.stdout.write(`${options.serverVersion}\n`);
+else if (options.command === 'mcp') {
+	runServerMcpStdio({
+		socketPath: process.env.TERMINAY_CONTROL_SOCKET ?? '',
+		token: process.env.TERMINAY_CONTROL_TOKEN ?? '',
+	}).catch((error: unknown) => {
+		process.stderr.write(
+			`terminay mcp failed: ${error instanceof Error ? error.message : String(error)}\n`,
+		);
+		process.exitCode = 1;
+	});
+} else {
+	// The lease is acquired before resolving or opening any durable server
+	// authority. It prevents two standalone processes from concurrently owning
+	// one workspace, while identity resolution gives separate roots distinct
+	// authorities without breaking a legacy workspace's canonical id.
+	const standaloneLease =
+		options.command === 'start' ? new FileDataRootLease() : undefined;
+	if (standaloneLease !== undefined) {
+		try {
+			await standaloneLease.acquire(options.dataRoot);
+		} catch (error) {
+			// An operator's mistake to fix, not a crash to debug: say what to do
+			// and leave the stack trace out of the container log.
+			if (error instanceof DataRootInUseError) {
+				process.stderr.write(
+					describeDataRootInUse(error, {
+						container: process.env.TERMINAY_MANAGED_BY === 'container',
+					}),
+				);
+			} else if (error instanceof DataRootLockUnavailableError) {
+				process.stderr.write(describeDataRootLockUnavailable(error));
+			} else throw error;
+			process.exit(1);
+		}
+		try {
+			options = await resolveStandaloneServerIdentity(options);
+		} catch (error) {
+			await standaloneLease.release(options.dataRoot).catch(() => undefined);
+			throw error;
+		}
+	}
+	// Each paired device's push enrolment (ADR-0060). It ends with the device's
+	// trust, so it is pruned whenever the device registry is written.
+	const pushEnrolments = new PushEnrolmentStore(
+		createFilePushEnrolmentPersistence(
+			join(options.dataRoot, 'push-enrolments.v1.json'),
+		),
+	);
+	const storedDevices = createRemoteDevicePersistence(options.dataRoot);
+	const devicePersistence: RemoteDevicePersistence = {
+		load: storedDevices.load,
+		save: (records) => {
+			storedDevices.save(records);
+			const trusted = new Set(
+				records
+					.filter((device) => device.revokedAt === null)
+					.map((device) => device.deviceId),
+			);
+			for (const deviceId of pushEnrolments.deviceIds())
+				if (!trusted.has(deviceId)) pushEnrolments.remove(deviceId);
+		},
+	};
+	// `--expose hosted` is the administrator's standing decision for this data
+	// root, so the server provisions its own hosted session origin exactly as
+	// Desktop does for its embedded server, rather than advertising the
+	// unroutable per-server placeholder.
+	const exposeHosted = options.exposeModes.includes('hosted');
+	// An advertised address exists because the addresses this server can observe
+	// about itself do not reach clients. Starting anyway, with a candidate whose
+	// port nothing is listening on, produces exactly the silent ICE failure the
+	// option was added to remove — so an unbindable port stops the server here,
+	// while the operator is still watching.
+	if (options.advertiseAddress !== undefined && options.command === 'start') {
+		await assertAdvertisedPortIsBindable(options.advertiseAddress);
+	} else if (options.icePort !== undefined && options.command === 'start') {
+		// A range pinned with no advertised address is published for the same
+		// reason and fails the same silent way when its first port is taken.
+		await assertAdvertisedPortIsBindable({
+			host: '0.0.0.0',
+			port: options.icePort,
+		});
+	}
+	if (
+		options.command === 'start' &&
+		options.publicHost !== undefined &&
+		options.advertiseAddress === undefined
+	) {
+		// A name or a loopback address can name the direct origin but cannot be an
+		// ICE candidate. Say so once, where the operator is looking, rather than
+		// leaving a browser to hang in `checking` with nothing to explain it.
+		process.stderr.write(
+			'[terminay-server] the public host names the direct origin only: no advertised ICE candidate was derived from it. Browsers and phones need a routable literal address.\n',
+		);
+	}
+	const sessionOrigin =
+		exposeHosted && !options.remoteOriginExplicit && options.command === 'start'
+			? loadOrCreateSessionOrigin(options.dataRoot, options.hostedDomain)
+			: options.remoteOrigin;
+	// Both exposure modes hand a client the same compact fragment; they differ
+	// only in the origin the client reaches the room through.
+	const pairingUrlFormat =
+		options.exposeModes.length > 0
+			? 'hosted-compact'
+			: pairingUrlFormatForOrigin(sessionOrigin, options.hostedDomain);
+	const remote = createRemoteExposure(
+		options.serverId,
+		sessionOrigin,
+		devicePersistence.load(),
+		pairingUrlFormat,
+	);
+	let protocolReady = false;
+	if (
+		options.command === 'approve' ||
+		options.command === 'deny' ||
+		options.command === 'approvals'
+	) {
+		await runApprovalCommand(options);
+	} else if (options.command === 'reset-identity') {
+		await runResetIdentityCommand(options, remote, devicePersistence);
+	} else if (options.command === 'end-sessions') {
+		await runEndSessionsCommand(options);
+	} else if (options.command === 'status') {
+		const runtime = createRuntime(options, remote);
+		// Presence only, as for paths: the public host is an address.
+		process.stdout.write(
+			`${JSON.stringify({
+				...runtime.diagnostics(),
+				publicHostConfigured: options.publicHost !== undefined,
+				...(options.serverRevision === undefined
+					? {}
+					: { revision: options.serverRevision }),
+			})}\n`,
+		);
+	} else if (options.command === 'pairing') {
+		await runPairingCommand(options);
+	} else {
+		try {
+			// Pairing material is the sole local HTTP credential. It is delivered in
+			// the URL fragment and never copied into a second readiness field.
+			const handoff = remote.start();
+			const credentials = createProtocolCredentials(remote);
+			const serverComposition = await createServerComposition(
+				options,
+				() => {
+					if (runtime === undefined)
+						throw new Error('server runtime is not composed');
+					return runtimeHealth(runtime, protocolReady);
+				},
+				{
+					enrolments: pushEnrolments,
+					// Posted to the manager host beside this server's hosted session
+					// origin. A server exposed only by direct signaling has none.
+					origin: () =>
+						exposeHosted ? pushOriginForSessionOrigin(sessionOrigin) : undefined,
+				},
+			);
+			const composition = serverComposition.core;
+			let runtime: StandaloneRuntime | undefined;
+			const pairingHosts: {
+				close(): Promise<void>;
+				mintPairing(): Promise<void>;
+				waitForPairingRefresh(): Promise<void>;
+			}[] = [];
+			let approvalSocket: { close(): Promise<void> } | undefined;
+			// Every exposure mode advertises the same room, so exactly one of them
+			// mints the replacement and the others re-register what it minted. The
+			// generation counter is what keeps a second mode from rotating again on
+			// its way to the room it was just told about.
+			let sharedHandoff = handoff;
+			const rotateShared = createSharedPairingHandoffRotator({
+				modes: options.exposeModes,
+				initialHandoff: handoff,
+				rotate: () => {
+					sharedHandoff = remote.rotate();
+					return sharedHandoff;
+				},
+			});
+			const pairingOperations = createPairingOperationQueue();
+			const pairingRoomOperations = createPairingOperationQueue();
+			// The direct endpoint is served by this process on the origin it
+			// advertises, so it must have a listener to live on and that listener must
+			// answer on the advertised port. Fail before anything opens rather than
+			// advertising a URL nothing answers.
+			const direct = options.exposeModes.includes('direct')
+				? await createDirectExposure(options)
+				: undefined;
+			// The first approval-triggered refresh must rotate exactly once, then
+			// each other exposure mode re-registers that same replacement room.
+			// Pending devices are announced as metadata-only lines so a headless
+			// operator can compare the match code and run `terminay-server approve`.
+			const announceApproval = createHostedDiagnosticLogger(options.logSink);
+			remote.onApprovalRequested((pending) => {
+				announceApproval({
+					type: 'approval-pending',
+					approvalId: pending.approvalId,
+					deviceName: pending.deviceName,
+					matchCode: pending.matchCode,
+					expiresAt: new Date(pending.expiresAt).toISOString(),
+				});
+			});
+			const uiServer =
+				options.endpoint === 'disabled'
+					? undefined
+					: createProtocolServer(
+							options,
+							handoff.pairingToken,
+							handoff.expiresAt,
+							composition,
+							remote,
+							credentials,
+							devicePersistence.save,
+							direct,
+						);
+			runtime = createRuntime(options, remote, uiServer, {
+				vault: serverComposition.vault.vault,
+				extensionSecrets: serverComposition.vault.extensionSecrets,
+				extensionHosts: serverComposition.extensions.hosts,
+			});
+
+			// A runtime without a listener has no event-loop handle of its own. Keep
+			// the CLI in the foreground until SIGINT/SIGTERM so local launches and
+			// container entrypoints have one stable lifecycle.
+			const foregroundLease = setInterval(() => undefined, 60_000);
+			const healthServer =
+				options.healthPort === undefined
+					? undefined
+					: createServerHealthServer({
+							port: options.healthPort,
+							health: () => runtime!.health(),
+							...(options.healthHost === undefined
+								? {}
+								: { host: options.healthHost }),
+						});
+			const start = async (): Promise<void> => {
+				try {
+					const healthAddress = await healthServer?.start();
+					// Start journal observation before creating the default session.
+					await composition.start();
+					const health = await runtime!.start();
+					await waitForProtocolEndpoint(uiServer);
+					approvalSocket = await startApprovalSocket({
+						socketPath: approvalSocketPath(options.dataRoot),
+						authority: {
+							listPendingApprovals: () => remote.listPendingApprovals(),
+							approveEnrollment: (approvalId) =>
+								pairingOperations.run(async () => {
+									const resolution = remote.approveEnrollment(approvalId);
+									await Promise.all(
+										pairingHosts.map((host) => host.waitForPairingRefresh()),
+									);
+									return resolution;
+								}),
+							denyEnrollment: (approvalId) =>
+								pairingOperations.run(async () => {
+									const resolution = remote.denyEnrollment(approvalId);
+									await Promise.all(
+										pairingHosts.map((host) => host.waitForPairingRefresh()),
+									);
+									return resolution;
+								}),
+							exposureModes: () => options.exposeModes,
+							// Service metadata for an operator with no service unit to
+							// ask: readiness, build, and reachability, and nothing else.
+							serverStatus: () => {
+								const current = runtime!.health();
+								const advertised = options.advertiseAddress;
+								return {
+									ready: current.ready && protocolReady,
+									version: current.version,
+									...(options.serverRevision === undefined
+										? {}
+										: { revision: options.serverRevision }),
+									exposeModes: options.exposeModes,
+									...(options.publicHost === undefined
+										? {}
+										: { publicHost: options.publicHost.host }),
+									...(advertised === undefined
+										? {}
+										: {
+												advertiseAddress: `${
+													advertised.host.includes(':') &&
+													!advertised.host.startsWith('[')
+														? `[${advertised.host}]`
+														: advertised.host
+												}:${advertised.port}`,
+											}),
+								};
+							},
+							pairingHandoffs: (rotate) =>
+								pairingOperations.run(async () => {
+									// Minting a replacement room registers it on every mode.
+									// Live peers and reconnect registration are untouched.
+									if (rotate) {
+										for (const host of pairingHosts) await host.mintPairing();
+									}
+									return exposureHandoffs(options, sharedHandoff, direct);
+								}),
+						},
+					});
+					const rendererDirectory = process.env.TERMINAY_UI_RENDERER_DIRECTORY;
+					// A server nobody exposed may legitimately have no workspace UI: it
+					// is a protocol-only deployment. An exposed one may not. Without
+					// this, it pairs a device, connects every lane, and serves a
+					// placeholder — which from the device is indistinguishable from a
+					// broken network, and this process is the only party that knows
+					// the difference.
+					if (
+						options.exposeModes.length > 0 &&
+						rendererDirectory === undefined
+					) {
+						throw new Error(
+							'this server is exposed but has no workspace UI configured, so a paired device would receive an empty page. Set TERMINAY_UI_RENDERER_DIRECTORY to the ui directory shipped in this release.',
+						);
+					}
+					// Hosted and direct exposure share one host key, one device
+					// registry, and one approval queue: they are two ways for a client
+					// to reach the same room on the same server, not two servers.
+					const devicePresence = new HostedDevicePresence();
+					const startPairingHost = (
+						mode: 'hosted' | 'direct',
+						modeHandoff: ServerPairingHandoff,
+						signal: {
+							connectHost?: string;
+							insecureTls?: boolean;
+							signalingOnlyConnectHost?: boolean;
+						},
+						relaySessionId?: string,
+					) =>
+						startHostedPairingHost({
+							...(relaySessionId === undefined
+								? {}
+								: { sessionId: relaySessionId }),
+							rotateHandoff: async () =>
+								handoffForMode(mode, await rotateShared(mode), direct),
+							serializePairingRefresh: (operation) =>
+								pairingRoomOperations.run(operation),
+							acceptApplication: (transport, authenticatedClient) =>
+								composition.core.accept(transport, { authenticatedClient }),
+							// Remote device connected trigger (automations).
+							// It fires for a device's first window, through either host.
+							devicePresence,
+							onPeerConnected: (peer) => {
+								if (!peer.firstWindowOfDevice) return;
+								composition.onConnectionAdmitted({
+									connectionId: peer.connectionId,
+									deviceId: peer.deviceId,
+									deviceName: peer.deviceName,
+								});
+							},
+							handoff: modeHandoff,
+							hostKey: loadOrCreateHostedHostKey(
+								join(options.dataRoot, 'remote-host-key.v1.json'),
+							),
+							onDiagnostic: createHostedDiagnosticLogger(options.logSink),
+							persistDevices: devicePersistence.save,
+							remote,
+							serverId: options.serverId,
+							signal,
+							iceServers: parseHostedIceServers(
+								process.env.TERMINAY_WEBRTC_ICE_SERVERS,
+							),
+							...(options.advertiseAddress === undefined
+								? {}
+								: { advertiseAddress: options.advertiseAddress }),
+							...(options.icePort === undefined &&
+							options.advertiseAddress === undefined
+								? {}
+								: {
+										icePortRange: {
+											firstPort:
+												options.advertiseAddress?.port ??
+												(options.icePort as number),
+											span: options.icePortSpan,
+										},
+									}),
+							webrtcRuntimeRoot: resolveWebRtcRuntimeRoot(
+								process.cwd(),
+								process.env,
+							),
+							...(rendererDirectory
+								? {
+										getUiArchive: () => loadHostedUiArchive(rendererDirectory),
+									}
+								: {}),
+						});
+					if (pairingUrlFormat === 'hosted-compact' && !directOnly(options)) {
+						pairingHosts.push(
+							await startPairingHost(
+								'hosted',
+								handoff,
+								hostedSignalOptions(process.env),
+							),
+						);
+					}
+					if (direct !== undefined) {
+						// The direct host reaches its own relay over the loopback
+						// interface and does not verify the certificate it just minted:
+						// the transport transcript, not TLS, authenticates this endpoint.
+						// That shortcut is for the signaling socket only — the media
+						// candidates it offers must be the ones a remote client can
+						// actually reach.
+						pairingHosts.push(
+							await startPairingHost(
+								'direct',
+								directHandoff(handoff, direct.directOrigin),
+								{
+									connectHost: '127.0.0.1',
+									insecureTls: true,
+									signalingOnlyConnectHost: true,
+								},
+								relaySessionId(direct.directOrigin),
+							),
+						);
+					}
+					protocolReady = true;
+					process.stdout.write(
+						`${JSON.stringify({
+							ready: health.ready && protocolReady,
+							serverId: health.serverId,
+							version: health.version,
+							...(options.serverRevision === undefined
+								? {}
+								: { revision: options.serverRevision }),
+							endpoint: runtime!.config.localEndpoint ?? null,
+							protocolEndpoint: uiServer?.address?.origin ?? null,
+							dataRoot: runtime!.config.dataRoot,
+							logSink: runtime!.config.logSink ?? null,
+							healthEndpoint: healthAddress?.origin ?? null,
+							pairing: publicPairing(
+								handoff,
+								options.publicOrigin ?? uiServer?.address?.origin,
+							),
+							exposure: options.exposeModes,
+							handoffs: exposureHandoffs(options, sharedHandoff, direct),
+						})}\n`,
+					);
+				} catch (error) {
+					clearInterval(foregroundLease);
+					for (const host of pairingHosts)
+						await host.close().catch(() => undefined);
+					await direct?.close().catch(() => undefined);
+					await approvalSocket?.close().catch(() => undefined);
+					await runtime!.stop().catch(() => undefined);
+					await composition.shutdown().catch(() => undefined);
+					await healthServer?.stop().catch(() => undefined);
+					await standaloneLease
+						?.release(options.dataRoot)
+						.catch(() => undefined);
+					process.stderr.write(
+						`${error instanceof Error ? error.message : 'server failed'}\n`,
+					);
+					process.exitCode = 1;
+				}
+			};
+			void start();
+			let shutdownStarted = false;
+			const shutdown = () => {
+				if (shutdownStarted) return;
+				shutdownStarted = true;
+				clearInterval(foregroundLease);
+				protocolReady = false;
+				void (async () => {
+					// Runtime owns the listeners/remote exposure; composition owns the
+					// terminal and hook authority. They must be stopped in this order,
+					// never concurrently, to avoid double-stopping a PTY or hook server.
+					for (const host of pairingHosts)
+						await host.close().catch(() => undefined);
+					await direct?.close().catch(() => undefined);
+					await approvalSocket?.close().catch(() => undefined);
+					await runtime!.stop();
+					await composition.shutdown();
+					await healthServer?.stop();
+					await standaloneLease?.release(options.dataRoot);
+				})()
+					.then(() => process.exit(0))
+					.catch((error: unknown) => {
+						process.stderr.write(
+							`${error instanceof Error ? error.message : 'server shutdown failed'}\n`,
+						);
+						process.exit(1);
+					});
+			};
+			process.on('SIGINT', shutdown);
+			process.on('SIGTERM', shutdown);
+		} catch (error) {
+			await standaloneLease?.release(options.dataRoot).catch(() => undefined);
+			throw error;
+		}
+	}
+}
+
+function createRuntime(
+	options: ServerCliOptions,
+	remote: ServerRemoteExposure,
+	uiServer?: LocalUiServer,
+	serverServices: Pick<
+		ServerRuntimeServices,
+		'vault' | 'extensionSecrets' | 'extensionHosts'
+	> = {},
+): StandaloneRuntime {
+	return createStandaloneServer({
+		serverId: options.serverId,
+		serverVersion: options.serverVersion,
+		dataRoot: options.dataRoot,
+		localEndpoint: options.endpoint,
+		exposureModes: options.exposeModes,
+		...(options.logSink === undefined ? {} : { logSink: options.logSink }),
+		...(options.uiBundle === undefined ? {} : { uiBundle: options.uiBundle }),
+		services: {
+			remoteExposure: remote,
+			...serverServices,
+		},
+		...(uiServer === undefined ? {} : { uiServer }),
+	});
+}
+
+function createRemoteExposure(
+	serverId: string,
+	sessionOrigin: string,
+	initialDevices: readonly RemoteRegisteredDevice[],
+	pairingUrlFormat: 'standalone' | 'hosted-compact',
+): ServerRemoteExposure {
+	const exposure = createServerRemoteExposure({
+		serverId,
+		sessionOrigin,
+		pairingUrlFormat,
+	});
+	exposure.devices.restore(initialDevices);
+	return exposure;
+}
+
+async function createServerComposition(
+	options: ServerCliOptions,
+	health: () => JsonValue,
+	push: NonNullable<ServerCoreCompositionOptions['push']>,
+): Promise<
+	Readonly<{
+		core: ServerCoreComposition;
+		workspaceWasCreated: boolean;
+		vault: Awaited<ReturnType<typeof createStandaloneVaultComposition>>;
+		extensions: ReturnType<typeof createProductionExtensionManagement>;
+	}>
+> {
+	const eventJournal = new OrderedEventJournal();
+	const activity = new TerminalActivityService({ serverId: options.serverId });
+	const agents = new AgentStatusService({
+		activity,
+		enabled: options.agentIntegrationEnabled,
+	});
+	const agentScope = new ProjectAgentScope();
+	const agentBridge = new SessionSourceBridge({
+		agents,
+		scope: agentScope,
+		onDiagnostic: ({ sourceId, diagnostic }) => {
+			process.stderr.write(
+				`[terminay-server] agent source ${sourceId}: ${diagnostic.code}: ${diagnostic.message}\n`,
+			);
+		},
+	});
+	const agentSources = new SessionSourceSupervisor({
+		bridge: agentBridge,
+		agents,
+		onStartFailure: (sourceId, error) => {
+			process.stderr.write(
+				`[terminay-server] agent source ${sourceId} failed to start: ${error instanceof Error ? error.message : String(error)}\n`,
+			);
+		},
+	});
+	const workspaceRepository = await openCanonicalWorkspace({
+		backend: new FileWorkspaceStateBackend(
+			join(options.dataRoot, 'workspace.v3.json'),
+		),
+		serverId: options.serverId,
+		defaultProjectRoot: options.projectRoot,
+	});
+	const workspace = workspaceRepository.workspace;
+	const gitService = new GitService({
+		limits: {
+			maxOutputBytes: 512 * 1024,
+			maxDiffBytes: 512 * 1024,
+			maxDiffHunks: 2_000,
+			maxDiffLines: 20_000,
+			maxDiffLineBytes: 16 * 1024,
+			maxStatusEntries: 128,
+			maxWorktrees: 128,
+			maxPathBytes: 4 * 1024,
+		},
+		// The service log is this server's own; reports name repositories and
+		// worktrees by process-local ids and carry no path or ref.
+		onObservation: (report) => {
+			process.stderr.write(
+				`[terminay-server] git observation ${JSON.stringify(report)}\n`,
+			);
+		},
+	});
+	let composition: ServerCoreComposition;
+	// One linked folder per worktree of each project's repository, driven by
+	// the Git service's own events.
+	// Which terminal created a worktree: Git in each terminal reports its own
+	// commands to a socket with one address per data directory, so a shell
+	// kept across a restart still reaches the server (ADR-0069).
+	const worktreeCapture = createWorktreeCaptureHost({
+		...gitCommandSocketHostOptions({
+			dataDirectory: options.dataRoot,
+			serverId: options.serverId,
+			platform: process.platform,
+			temporaryDirectory: tmpdir(),
+			...(process.env.XDG_RUNTIME_DIR
+				? { runtimeDirectory: process.env.XDG_RUNTIME_DIR }
+				: {}),
+		}),
+		workspace: () => workspace.state,
+		apply: (commandId, command) => {
+			const applied = composition.workspaceOperations?.applyHostCommand(
+				commandId,
+				command,
+			);
+			if (applied === undefined)
+				throw new Error('workspace host commands are unavailable');
+			return applied;
+		},
+		moveAutomatically: () =>
+			settings.settings.moveTerminalsIntoNewWorktreeFolders !== false,
+		sessions: () => composition.terminal.listSessions(),
+		onCaptured: (captured) => {
+			eventJournal.append(FOLDER_TERMINAL_CAPTURED_EVENT, { ...captured });
+		},
+	});
+	await worktreeCapture.start();
+	const folders = createStandaloneFolders({
+		workspace,
+		git: gitService,
+		applyHostCommand: (commandId, command) =>
+			composition.workspaceOperations?.applyHostCommand(commandId, command),
+		capture: worktreeCapture.reconcilerHooks,
+		onError: (projectId, error) => {
+			process.stderr.write(
+				`[terminay-server] folder reconciliation for ${projectId} failed: ${error instanceof Error ? error.message : String(error)}\n`,
+			);
+		},
+	});
+	const files = createDefaultProjectFileServices(
+		options.serverId,
+		options.projectRoot,
+		eventJournal,
+		gitService,
+		workspace,
+		folders,
+	);
+	const settings = createStandaloneSettingsRepository(options.dataRoot);
+	await settings.load();
+	// The command-line switch decides agent status for this run; the harness
+	// switches follow the server settings live.
+	const applyAgentSettings = (value: unknown) => {
+		if (options.agentIntegrationEnabled)
+			agents.setIntegrationEnabled(agentIntegrationEnabledFromSettings(value));
+		agentSources.setHarnessSwitches(agentHarnessSwitchesFromSettings(value));
+	};
+	applyAgentSettings(settings.settings);
+	settings.onChange((state) => applyAgentSettings(state.settings));
+	const shellProfiles = new ShellProfileCatalogueService({
+		settings,
+		discovery: new ShellProfileDiscoveryService(
+			await createNodeShellDiscoveryHost(process.env),
+		),
+		projectReferences: (profileId) =>
+			Object.values(workspace.state.projects)
+				.filter((project) => project.defaultShellProfileId === profileId)
+				.map((project) => project.id),
+	});
+	const macros = createStandaloneMacroRepository(options.dataRoot);
+	// Automations: automations.v1.json + automation-runs.v1.json in the data root.
+	const automationBackends = createAutomationFileBackends(options.dataRoot);
+	const automations = new AutomationRepository(automationBackends.definitions, {
+		resolveMacro: async (macroId) =>
+			(await macros.load()).macros.find((macro) => macro.id === macroId),
+	});
+	const automationRuns = new AutomationRunLog(automationBackends.runs);
+	const recordings = new ServerRecordingAdapter(
+		new RecordingService({
+			serverId: options.serverId,
+			recordingRoot: join(options.dataRoot, 'recordings'),
+			homeDirectory: options.dataRoot,
+			libraryIndexPath: join(options.dataRoot, 'recording-roots.v1.json'),
+		}),
+		{ serverId: options.serverId },
+	);
+	const vault = await createStandaloneVaultComposition({
+		dataRoot: options.dataRoot,
+		serverId: options.serverId,
+		...(options.vaultUnlockFd === undefined
+			? {}
+			: { unlockFd: options.vaultUnlockFd }),
+	});
+	// Extensions publish worktree facts (pull requests, checks); the Git
+	// listing carries them to the project's clients, and a change re-lists.
+	const worktreeInsights = new WorktreeInsightService({
+		vault: serverVaultWorktreeCredentials(vault.vault),
+		preferences: fileWorktreePromptPreferences(
+			join(options.dataRoot, 'worktree-insights.v1.json'),
+		),
+		isProjectOpen: (projectId) =>
+			workspace.state.projects[projectId] !== undefined,
+		activeProjectIds: () => workspace.activeProjectIds(),
+		onProjectChanged: (projectId, worktreeId) =>
+			gitService.announceWorktreeChange(projectId, worktreeId),
+		onError: (message) => {
+			process.stderr.write(`[terminay-server] ${message}\n`);
+		},
+	});
+	const extensions = createProductionExtensionManagement({
+		dataRoot: options.dataRoot,
+		authorityLabel: 'This server',
+		builtInArtifactRoot: resolveBuiltInExtensionArtifactRoot(),
+		vault,
+		agents: agentSources,
+		worktrees: worktreeInsights,
+		// A per-agent built-in the user had switched off stays off as a harness
+		// switch of the bundled source that replaced it.
+		onBuiltInWithdrawn: async (record) => {
+			const switches = withdrawnAgentExtensionSwitches(record);
+			if (switches === undefined) return;
+			await settings.apply({
+				command: {
+					type: 'merge',
+					settings: { agentIntegration: { harnesses: { ...switches } } },
+				},
+			});
+		},
+	});
+	agentSources.attach(extensions.hosts);
+	worktreeInsights.attach(extensions.hosts);
+	workspace.subscribe(() => worktreeInsights.refreshActivity());
+	const git = new ServerGitAdapter({
+		serverId: options.serverId,
+		git: gitService,
+		resolveProjectRoot: (projectId) =>
+			workspace.state.projects[projectId]?.root ?? null,
+		insights: worktreeInsights,
+		// A worktree renamed or moved through Terminay keeps its folder.
+		onWorktreeMove: folders.onWorktreeMove,
+	});
+	const parakeetRuntime = new ParakeetRuntime({
+		rootDirectory: join(options.dataRoot, 'dictation', 'parakeet'),
+	});
+	const parakeetProvider = new ServerParakeetDictationProvider(
+		parakeetRuntime,
+		join(options.dataRoot, 'dictation', 'temporary'),
+	);
+	const openAiProvider = new OpenAiDictationProvider();
+	const openAiSecretId = 'dictation-openai-api-key';
+	const ai = new AiService({
+		serverId: options.serverId,
+		authority: {
+			...createWorkspaceAiTargetAuthority({
+				serverId: options.serverId,
+				state: () => workspace.state,
+				applyHostCommand: (commandId, command) =>
+					composition.workspaceOperations?.applyHostCommand(
+						commandId,
+						command,
+					),
+				getSession: (sessionId) => composition.terminal.getSession(sessionId),
+			}),
+			writeInput: (target, input) =>
+				composition.terminal.input(target.sessionId, input),
+		},
+		replay: new TerminalReplayRegistry(),
+		dictationProvider: {
+			transcribe: (request) =>
+				request.model === 'mlx-community/parakeet-tdt-0.6b-v3'
+					? parakeetProvider.transcribe(request)
+					: openAiProvider.transcribe(request),
+		},
+		dictationRuntime: parakeetProvider,
+		credentialResolver: new VaultProviderCredentialResolver({
+			vault: vault.vault,
+			bindings: [{ provider: 'openai', secretId: openAiSecretId }],
+		}),
+		dictationCredential: {
+			status: () => ({
+				configured: vault
+					.status()
+					.entries.some((entry) => entry.id === openAiSecretId),
+			}),
+			set: async (value) => {
+				const exists = vault
+					.status()
+					.entries.some((entry) => entry.id === openAiSecretId);
+				await (exists
+					? vault.vault.replace({
+							id: openAiSecretId,
+							label: 'OpenAI API key',
+							value,
+						})
+					: vault.vault.put({
+							id: openAiSecretId,
+							label: 'OpenAI API key',
+							value,
+						}));
+				return { configured: true };
+			},
+			clear: async () => ({
+				configured: !(await vault.vault.remove(openAiSecretId)).deleted,
+			}),
+		},
+		dictationSettings: () => standaloneDictationSettings(settings.settings),
+		providers: selectAiProviders(
+			options.aiProviders,
+			createServerAiProviderAdapters({
+				cwd: options.projectRoot,
+				// Authentication belongs to provider-owned login/keychain state. Never
+				// copy API keys or arbitrary server environment into the child.
+				environment: safeAiProviderEnvironment(process.env),
+			}),
+		),
+	});
+	// Only a standalone server started from a release has an upgrader: its
+	// launcher names the one that release ships. Started from a checkout there
+	// is none, and nothing is checked or offered.
+	const upgrader =
+		options.command === 'start'
+			? releaseUpgraderFromEnvironment(process.env)
+			: undefined;
+	const serverUpgrade = new ServerUpgradeService({
+		serverVersion: options.serverVersion,
+		...(upgrader === undefined ? {} : { upgrader }),
+		// Clients are never shown a failed check; the operator's log is.
+		onDiagnostic: (diagnostic) => {
+			process.stderr.write(
+				`[terminay-server] server upgrade ${diagnostic.kind}: ${diagnostic.message}\n`,
+			);
+		},
+	});
+	composition = createServerCoreComposition({
+		serverId: options.serverId,
+		serverVersion: options.serverVersion,
+		capabilities: [
+			FEATURE_CAPABILITIES.terminal,
+			FEATURE_CAPABILITIES.workspace,
+			FEATURE_CAPABILITIES.files,
+			FEATURE_CAPABILITIES.agents,
+			FEATURE_CAPABILITIES.settings,
+			FEATURE_CAPABILITIES.macros,
+			FEATURE_CAPABILITIES.automations,
+			FEATURE_CAPABILITIES.recording,
+			FEATURE_CAPABILITIES.extensions,
+			FEATURE_CAPABILITIES.git,
+			FEATURE_CAPABILITIES.dictation,
+			FEATURE_CAPABILITIES.health,
+			FEATURE_CAPABILITIES.heartbeat,
+		],
+		eventJournal,
+		onConnectionClosed: (_connectionId, clientId) => {
+			files.mdxRuntime.closeClient(clientId);
+		},
+		authenticate: ({ hello }) => ({
+			clientId: hello.clientId,
+			authScope: 'admin',
+			permissions: ['workspace:write', 'extensions:read', 'extensions:manage'],
+		}),
+		...(sessionHolderEnabled(options)
+			? {
+					sessionHolder: createSessionHolderPtyFactory({
+						dataRoot: options.dataRoot,
+						buildId: sessionHolderBuildId(options),
+						launch: ({ env }) =>
+							launchDetachedSessionHolder(
+								process.execPath,
+								[sessionHolderEntryPath()],
+								{ ...process.env, ...env },
+							),
+						// The configured limit replaces this once settings have loaded.
+						limitMs: backgroundTerminalLimitMs(undefined),
+						onObservation: logSessionHolderObservation,
+						resolveCwd: resolveTerminalProcessCwd,
+					}),
+				}
+			: {
+					ptyFactory: createNodePtyFactory(
+						nodePty as unknown as NodePtyModuleLike,
+						{ resolveCwd: resolveTerminalProcessCwd },
+					),
+				}),
+		activity,
+		push,
+		serverUpgrade,
+		agents,
+		agentSessions: {
+			supervisor: agentSources,
+			bridge: agentBridge,
+			scope: agentScope,
+		},
+		workspace,
+		workspaceOperations: {
+			prepareProjectRootUpdate: async (projectId, root) => {
+				const prepared = await files.prepareProjectRootUpdate(projectId, root);
+				return Object.freeze({
+					canonicalRoot: prepared.canonicalRoot,
+					commit: () => {
+						prepared.commit();
+						agentScope.setProject(projectId, prepared.canonicalRoot);
+						// Preparing bound the project to Git at its new root.
+						folders.projectBound(projectId);
+					},
+				});
+			},
+			// Git, file observations, and language sessions are released by the
+			// composition; these are this host's own per-project records.
+			releaseProject: (projectId) => {
+				files.releaseProject(projectId);
+				agentScope.removeProject(projectId);
+				folders.releaseProject(projectId);
+			},
+		},
+		// What a restored workspace contains is server policy; this supplies only
+		// the act of making a session. Without it a restart republished the
+		// previous process's terminal panels as tabs that could say nothing but
+		// that they had exited.
+		workspaceStartup: {
+			firstRun: workspaceRepository.wasCreated,
+			createTerminal: async (request) => {
+				const resolver = composition.terminalLaunchResolver;
+				if (resolver === undefined)
+					throw new Error('canonical terminal launch resolver is unavailable');
+				const launch = await resolver.resolve({
+					identity: composition.terminal.allocateIdentity(
+						request.projectId,
+						request.sessionId,
+					),
+					cols: request.cols,
+					rows: request.rows,
+				});
+				return composition.terminal.createResolvedSession(launch);
+			},
+		},
+		fileObservations: files.observations,
+		// Language intelligence exists only where both the project files and the
+		// extensions live, which on this server is the same process.
+		language: {
+			extensions: extensions.hosts,
+			projects: files.projects,
+			watch: files.observations,
+		},
+		settings,
+		terminalProfiles: shellProfiles,
+		shellProfiles,
+		terminalLaunchEnvironment: {
+			...process.env,
+			COLORTERM: 'truecolor',
+		},
+		terminalEnvironmentCaseInsensitive: process.platform === 'win32',
+		...(process.platform === 'darwin'
+			? { terminalSystemDefaultStartupMode: 'login' as const }
+			: {}),
+		recordings,
+		extensions,
+		git,
+		folderRoots: folders.roots,
+		gitCommands: worktreeCapture.gitCommands,
+		ai,
+		serviceLifecycle: {
+			start: async () => {
+				await gitService.bindProject('default', options.projectRoot);
+				folders.projectBound('default');
+				agentScope.setProject(
+					'default',
+					await realpath(options.projectRoot).catch(() => options.projectRoot),
+				);
+			},
+			stop: () => {
+				worktreeCapture.close();
+			},
+		},
+		automations: { repository: automations, runLog: automationRuns },
+		macros: {
+			repository: macros,
+			environmentFor: (request, target) => {
+				const authorization = {
+					...target,
+					clientId: request.context.clientId,
+					scope:
+						request.context.authScope === 'admin'
+							? ('admin' as const)
+							: ('write' as const),
+				};
+				return {
+					target,
+					write: (_candidate, bytes) =>
+						composition.terminal.input(target, bytes, authorization),
+					key: (_candidate, key) =>
+						composition.terminal.input(
+							target,
+							macroKeyBytes(key),
+							authorization,
+						),
+					waitForInactivity: (_candidate, milliseconds, signal) =>
+						composition.terminal.waitForInactivity(target, milliseconds, {
+							authorization,
+							signal,
+						}),
+				};
+			},
+		},
+		terminalOptions: {
+			defaultEnvironment: process.env,
+			maxReplayBytes: 4 * 1024 * 1024,
+			maxQueuedOutputBytes: 512 * 1024,
+		},
+		operations: {
+			queries: {
+				...files.session.operations().queries,
+				...files.content.operations().queries,
+				...files.catalog.operations().queries,
+				...files.documentation.operations().queries,
+				...files.mdxRuntime.operations().queries,
+				'server.health': () => health(),
+			},
+			commands: {
+				...files.session.operations().commands,
+				...files.catalog.operations().commands,
+				...files.mdxRuntime.operations().commands,
+			},
+		},
+	});
+	return Object.freeze({
+		core: composition,
+		vault,
+		extensions,
+		workspaceWasCreated: workspaceRepository.wasCreated,
+	});
+}
+
+function standaloneDictationSettings(
+	settings: Readonly<Record<string, JsonValue>>,
+) {
+	const value = settings.dictation;
+	const dictation =
+		typeof value === 'object' && value !== null && !Array.isArray(value)
+			? (value as Record<string, JsonValue>)
+			: {};
+	return {
+		enabled: dictation.enabled !== false,
+		provider: dictation.provider === 'parakeet' ? 'parakeet' : 'disabled',
+		model:
+			typeof dictation.model === 'string' && dictation.model.length > 0
+				? dictation.model
+				: 'mlx-community/parakeet-tdt-0.6b-v3',
+		language: typeof dictation.language === 'string' ? dictation.language : '',
+		prompt: typeof dictation.prompt === 'string' ? dictation.prompt : '',
+	};
+}
+
+function selectAiProviders(
+	enabled: readonly ('codex' | 'claude-code')[],
+	available: ReturnType<typeof createServerAiProviderAdapters>,
+): ReturnType<typeof createServerAiProviderAdapters> {
+	return Object.fromEntries(
+		enabled.flatMap((provider) => {
+			const adapter = available[provider];
+			return adapter === undefined ? [] : [[provider, adapter]];
+		}),
+	) as ReturnType<typeof createServerAiProviderAdapters>;
+}
+
+function safeAiProviderEnvironment(
+	environment: Readonly<Record<string, string | undefined>>,
+): Readonly<Record<string, string | undefined>> {
+	const allowed = [
+		'PATH',
+		'HOME',
+		'USER',
+		'LOGNAME',
+		'SHELL',
+		'TMPDIR',
+		'TEMP',
+		'TMP',
+		'TERMINAY_CODEX_COMMAND',
+		'TERMINAY_CLAUDE_CODE_COMMAND',
+		'TERMINAY_CODEX_MODELS_JSON',
+		'TERMINAY_CLAUDE_CODE_MODELS_JSON',
+	] as const;
+	return Object.fromEntries(
+		allowed.flatMap((key) => {
+			const value = environment[key];
+			return value === undefined ? [] : [[key, value]];
+		}),
+	);
+}
+
+function createStandaloneSettingsRepository(
+	dataRoot: string,
+): ServerSettingsRepository {
+	const path = join(dataRoot, 'settings.v1.json');
+	return new ServerSettingsRepository({
+		load: async () => {
+			try {
+				return JSON.parse(await readFile(path, 'utf8')) as unknown;
+			} catch (error) {
+				if ((error as { code?: string }).code === 'ENOENT') return undefined;
+				throw error;
+			}
+		},
+		backup: async (source) => {
+			const backupPath = `${path}.pre-migration.json`;
+			await mkdir(dirname(backupPath), { recursive: true, mode: 0o700 });
+			try {
+				await writeFile(backupPath, JSON.stringify(source), {
+					encoding: 'utf8',
+					mode: 0o600,
+					flag: 'wx',
+				});
+			} catch (error) {
+				if ((error as { code?: string }).code !== 'EEXIST') throw error;
+			}
+		},
+		commit: async (state) => {
+			await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+			const temporary = `${path}.${randomBytes(8).toString('hex')}.tmp`;
+			await writeFile(temporary, JSON.stringify(state), {
+				encoding: 'utf8',
+				mode: 0o600,
+				flag: 'wx',
+			});
+			await rename(temporary, path);
+		},
+	});
+}
+
+function createStandaloneMacroRepository(dataRoot: string): MacroRepository {
+	const path = join(dataRoot, 'macros.v1.json');
+	return new MacroRepository({
+		load: async () => {
+			try {
+				return JSON.parse(await readFile(path, 'utf8')) as unknown;
+			} catch (error) {
+				if ((error as { code?: string }).code === 'ENOENT') return undefined;
+				throw error;
+			}
+		},
+		commit: async (state) => {
+			await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+			const temporary = `${path}.${randomBytes(8).toString('hex')}.tmp`;
+			await writeFile(temporary, JSON.stringify(state), {
+				encoding: 'utf8',
+				mode: 0o600,
+				flag: 'wx',
+			});
+			await rename(temporary, path);
+		},
+	});
+}
+
+function macroKeyBytes(key: string): Uint8Array {
+	const value = (
+		{
+			Enter: '\r',
+			Tab: '\t',
+			Escape: '\u001b',
+			Backspace: '\u007f',
+			ArrowUp: '\u001b[A',
+			ArrowDown: '\u001b[B',
+			ArrowRight: '\u001b[C',
+			ArrowLeft: '\u001b[D',
+		} as Readonly<Record<string, string>>
+	)[key];
+	if (value === undefined)
+		throw new Error('macro key is unavailable at the standalone PTY boundary');
+	return new TextEncoder().encode(value);
+}
+
+function createDefaultProjectFileServices(
+	serverId: string,
+	projectRoot: string,
+	eventJournal: InstanceType<typeof OrderedEventJournal>,
+	gitService: GitService,
+	workspace: Parameters<typeof createFolderFileScope>[0]['workspace'],
+	folders: Pick<StandaloneFolders, 'roots'>,
+): {
+	/** The canonical per-project resolvers, shared with language sessions. */
+	readonly projects: ReadonlyMap<
+		string,
+		{
+			readonly projectId: string;
+			readonly resolver: CanonicalProjectPathResolver;
+		}
+	>;
+	readonly session: ServerFileAdapter;
+	readonly content: ServerFileContentAdapter;
+	readonly catalog: ServerFileCatalogAdapter;
+	readonly documentation: ServerDocumentationCatalogAdapter;
+	readonly mdxRuntime: ServerMdxRuntimeAdapter;
+	readonly observations: ServerFileObservationAdapter;
+	/** Drop a closed project's resolvers, catalogs, and MDX runtime. */
+	readonly releaseProject: (projectId: string) => void;
+	readonly prepareProjectRootUpdate: (
+		projectId: string,
+		root: string,
+	) => Promise<{
+		readonly canonicalRoot: string;
+		readonly commit: () => void;
+	}>;
+} {
+	const storage = {
+		realpath: (path: string) => realpath(path),
+		stat: async (path: string) => toPathStat(await stat(path)),
+		lstat: async (path: string) => toPathStat(await lstat(path)),
+		readRange: async (
+			path: string,
+			offset: number,
+			length: number,
+			signal?: AbortSignal,
+		): Promise<Uint8Array> => {
+			throwIfAborted(signal);
+			const handle = await open(path, 'r');
+			try {
+				const bytes = Buffer.allocUnsafe(length);
+				const result = await handle.read(bytes, 0, length, offset);
+				throwIfAborted(signal);
+				return new Uint8Array(bytes.subarray(0, result.bytesRead));
+			} finally {
+				await handle.close();
+			}
+		},
+		readDirectory: async (path: string, signal?: AbortSignal) => {
+			throwIfAborted(signal);
+			const entries = await readdir(path, { withFileTypes: true });
+			throwIfAborted(signal);
+			return entries.map((entry) => ({
+				name: entry.name,
+				isDirectory: entry.isDirectory(),
+				isFile: entry.isFile(),
+				isSymbolicLink: entry.isSymbolicLink(),
+			}));
+		},
+		makeDirectory: async (
+			path: string,
+			signal?: AbortSignal,
+		): Promise<void> => {
+			throwIfAborted(signal);
+			await mkdir(path);
+			throwIfAborted(signal);
+		},
+		rename: async (
+			from: string,
+			to: string,
+			signal?: AbortSignal,
+		): Promise<void> => {
+			throwIfAborted(signal);
+			await rename(from, to);
+			throwIfAborted(signal);
+		},
+		remove: async (
+			path: string,
+			options?: { readonly recursive?: boolean },
+			signal?: AbortSignal,
+		): Promise<void> => {
+			throwIfAborted(signal);
+			await rm(path, { recursive: options?.recursive === true });
+			throwIfAborted(signal);
+		},
+		atomicWrite: async (
+			path: string,
+			bytes: Uint8Array,
+			signal?: AbortSignal,
+		): Promise<void> => {
+			throwIfAborted(signal);
+			const temporary = `${path}.terminay-${randomBytes(12).toString('hex')}`;
+			try {
+				await writeFile(temporary, bytes, { flag: 'wx', mode: 0o600 });
+				throwIfAborted(signal);
+				await rename(temporary, path);
+			} finally {
+				await rm(temporary, { force: true }).catch(() => undefined);
+			}
+			throwIfAborted(signal);
+		},
+	};
+	const resolver = new CanonicalProjectPathResolver(projectRoot, storage);
+	const content = new FileContentStreamService(resolver, storage);
+	const catalog = new FileCatalog(resolver, storage);
+	const sessionProjects = new Map([
+		['default', { projectId: 'default', resolver, storage }],
+	]);
+	const contentProjects = new Map([
+		['default', { projectId: 'default', content }],
+	]);
+	const catalogProjects = new Map([
+		['default', { projectId: 'default', catalog }],
+	]);
+	const documentationProjects = new Map([
+		[
+			'default',
+			{
+				projectId: 'default',
+				catalog: new DocumentationCatalog(resolver, storage),
+			},
+		],
+	]);
+	const mdxRuntimeProjects = new Map([
+		[
+			'default',
+			{
+				projectId: 'default',
+				runtime: new MdxRuntime({ projectId: 'default', resolver, storage }),
+			},
+		],
+	]);
+	const observationHost = createStandaloneFileObservationHost(
+		sessionProjects,
+		storage,
+	);
+	const mdxRuntime = new ServerMdxRuntimeAdapter({
+		serverId,
+		projects: mdxRuntimeProjects,
+	});
+	// Files, content, the catalog, and observations follow a request's folder.
+	// Documentation, the MDX runtime, and language sessions stay on the project.
+	const folderScope = createFolderFileScope({
+		roots: folders.roots,
+		workspace,
+		storage,
+		projectContext: (projectId) => {
+			const session = sessionProjects.get(projectId);
+			const projectContent = contentProjects.get(projectId);
+			const projectCatalog = catalogProjects.get(projectId);
+			if (
+				session === undefined ||
+				projectContent === undefined ||
+				projectCatalog === undefined
+			)
+				return undefined;
+			return {
+				...session,
+				content: projectContent.content,
+				catalog: projectCatalog.catalog,
+				host: observationHost,
+			};
+		},
+		observationHost: (projects) =>
+			createStandaloneFileObservationHost(projects, storage),
+	});
+	return {
+		projects: sessionProjects,
+		session: new ServerFileAdapter({
+			serverId,
+			projects: sessionProjects,
+			folderScope: folderScope.resolve,
+		}),
+		content: new ServerFileContentAdapter({
+			serverId,
+			projects: contentProjects,
+			folderScope: folderScope.resolve,
+		}),
+		catalog: new ServerFileCatalogAdapter({
+			serverId,
+			projects: catalogProjects,
+			folderScope: folderScope.resolve,
+		}),
+		documentation: new ServerDocumentationCatalogAdapter({
+			serverId,
+			projects: documentationProjects,
+		}),
+		mdxRuntime,
+		observations: new ServerFileObservationAdapter({
+			serverId,
+			host: observationHost,
+			folderScope: folderScope.resolve,
+			eventJournal,
+		}),
+		releaseProject: (projectId) => {
+			mdxRuntime.disposeProject(projectId);
+			sessionProjects.delete(projectId);
+			contentProjects.delete(projectId);
+			catalogProjects.delete(projectId);
+			documentationProjects.delete(projectId);
+			mdxRuntimeProjects.delete(projectId);
+			folderScope.releaseProject(projectId);
+		},
+		prepareProjectRootUpdate: async (projectId, root) => {
+			const nextResolver = new CanonicalProjectPathResolver(root, storage);
+			const canonicalRoot = await nextResolver.root();
+			await gitService.bindProject(projectId, canonicalRoot);
+			const nextContent = new FileContentStreamService(nextResolver, storage);
+			const nextCatalog = new FileCatalog(nextResolver, storage);
+			const nextDocumentationCatalog = new DocumentationCatalog(
+				nextResolver,
+				storage,
+			);
+			const nextMdxRuntime = new MdxRuntime({
+				projectId,
+				resolver: nextResolver,
+				storage,
+			});
+			return Object.freeze({
+				canonicalRoot,
+				commit: () => {
+					mdxRuntime.disposeProject(projectId);
+					sessionProjects.set(projectId, {
+						projectId,
+						resolver: nextResolver,
+						storage,
+					});
+					contentProjects.set(projectId, { projectId, content: nextContent });
+					catalogProjects.set(projectId, { projectId, catalog: nextCatalog });
+					documentationProjects.set(projectId, {
+						projectId,
+						catalog: nextDocumentationCatalog,
+					});
+					mdxRuntimeProjects.set(projectId, {
+						projectId,
+						runtime: nextMdxRuntime,
+					});
+				},
+			});
+		},
+	};
+}
+
+function createStandaloneFileObservationHost(
+	projects: ReadonlyMap<
+		string,
+		{ readonly resolver: CanonicalProjectPathResolver }
+	>,
+	storage: {
+		readonly lstat: (path: string) => Promise<{
+			readonly isDirectory: boolean;
+			readonly isFile: boolean;
+			readonly isSymbolicLink: boolean;
+			readonly size: number;
+		}>;
+		readonly readDirectory: (
+			path: string,
+			signal?: AbortSignal,
+		) => Promise<
+			readonly { readonly name: string; readonly isDirectory: boolean }[]
+		>;
+	},
+): FileObservationHost {
+	const project = (
+		projectId: string,
+	): { readonly resolver: CanonicalProjectPathResolver } => {
+		const value = projects.get(projectId);
+		if (value === undefined)
+			throw new Error('file observation project is unavailable');
+		return value;
+	};
+	const resolveResource = (
+		projectId: string,
+		resource: string,
+	): Promise<string> =>
+		resource === ''
+			? project(projectId).resolver.root()
+			: project(projectId).resolver.resolve(resource);
+	return {
+		async watch({ projectId, resource, signal, publish }) {
+			const canonical = await resolveResource(projectId, resource);
+			const canonicalStat = await storage.lstat(canonical);
+			throwIfAborted(signal);
+			const watchRoot = canonicalStat.isDirectory
+				? canonical
+				: dirname(canonical);
+			const watchedFileName = canonicalStat.isDirectory
+				? undefined
+				: basename(canonical);
+			const watcher = watchFileSystem(
+				watchRoot,
+				{ persistent: false },
+				(_event, fileName) => {
+					if (signal.aborted) return;
+					const leaf = String(fileName ?? '');
+					if (
+						watchedFileName !== undefined &&
+						leaf !== '' &&
+						leaf !== watchedFileName
+					)
+						return;
+					publish({
+						resource:
+							watchedFileName === undefined && leaf.length > 0
+								? joinResource(resource, leaf)
+								: resource,
+						kind: 'changed',
+					});
+				},
+			);
+			const close = (): void => watcher.close();
+			signal.addEventListener('abort', close, { once: true });
+			watcher.once('close', () => signal.removeEventListener('abort', close));
+			watcher.once('error', () => {
+				signal.removeEventListener('abort', close);
+			});
+		},
+		async calculateFolderSize({ projectId, resource, signal, progress }) {
+			const root = await resolveResource(projectId, resource);
+			const rootStat = await storage.lstat(root);
+			if (rootStat.isFile) {
+				const result = { bytes: rootStat.size, files: 1, directories: 0 };
+				progress(result);
+				return result;
+			}
+			if (!rootStat.isDirectory)
+				throw new Error('folder-size target is not a directory');
+			const stack = [root];
+			let bytes = 0;
+			let files = 0;
+			let directories = 0;
+			let visited = 0;
+			while (stack.length > 0) {
+				throwIfAborted(signal);
+				if (++visited > MAX_STANDALONE_FOLDER_SIZE_ENTRIES) {
+					throw new Error('folder-size entry limit reached');
+				}
+				const current = stack.pop()!;
+				const entries = await storage.readDirectory(current, signal);
+				directories += 1;
+				for (const entry of entries) {
+					throwIfAborted(signal);
+					const child = join(current, entry.name);
+					const childStat = await storage.lstat(child);
+					if (childStat.isSymbolicLink) continue;
+					if (childStat.isDirectory) stack.push(child);
+					else if (childStat.isFile) {
+						files += 1;
+						bytes += childStat.size;
+					}
+				}
+				progress({ bytes, files, directories });
+			}
+			return { bytes, files, directories };
+		},
+	};
+}
+
+function joinResource(parent: string, child: string): string {
+	const normalizedChild = child
+		.replace(/\\/g, '/')
+		.split('/')
+		.filter(Boolean)
+		.join('/');
+	return parent.length === 0 ? normalizedChild : `${parent}/${normalizedChild}`;
+}
+
+function toPathStat(value: {
+	readonly isDirectory: () => boolean;
+	readonly isFile: () => boolean;
+	readonly isSymbolicLink: () => boolean;
+	readonly size: number;
+	readonly mtimeMs: number;
+	readonly mode: number;
+}) {
+	return {
+		isDirectory: value.isDirectory(),
+		isFile: value.isFile(),
+		isSymbolicLink: value.isSymbolicLink(),
+		size: value.size,
+		mtimeMs: value.mtimeMs,
+		mode: value.mode,
+	};
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted === true)
+		throw signal.reason instanceof Error
+			? signal.reason
+			: new DOMException('The operation was aborted', 'AbortError');
+}
+
+function createProtocolServer(
+	options: ServerCliOptions,
+	authToken: string,
+	handoffExpiresAt: number,
+	composition: ServerCoreComposition,
+	remote: ServerRemoteExposure,
+	credentials: ProtocolCredentials,
+	persistDevices: (records: readonly RemoteRegisteredDevice[]) => void,
+	direct?: DirectExposure,
+): LocalUiServer {
+	return createLocalUiServer({
+		// The signaling endpoint is served beside the authenticated protocol on
+		// this listener, and terminates TLS with the server's own certificate.
+		...(direct === undefined
+			? {}
+			: { tls: direct.tls, signalingUpgrade: direct.signalingUpgrade }),
+		...(options.uiBundle === undefined
+			? {}
+			: { rootDirectory: options.uiBundle }),
+		serverId: options.serverId,
+		serverVersion: options.serverVersion,
+		authToken,
+		authTokenExpiresAt: handoffExpiresAt,
+		acceptCredential: credentials.accept,
+		protocolAuthenticatedClientForCredential: (credential, clientId) => ({
+			clientId: credentials.clientId(credential) ?? clientId,
+			authScope: 'admin',
+			permissions: ['workspace:write', 'extensions:read', 'extensions:manage'],
+		}),
+		deviceAuthentication: {
+			enroll: ({
+				pairingSessionId,
+				pairingToken,
+				pairingExpiresAt,
+				deviceName,
+				publicKeyPem,
+			}) => {
+				// Loopback HTTP enrollment is same-machine: the one-time fragment is
+				// the whole authority there, so no approval step applies. As on the
+				// approved transport path, enrollment answers with the device and a
+				// one-use ticket for its first connection.
+				if (!validPairingExpiry(pairingExpiresAt))
+					throw new Error('pairing authority is invalid');
+				const device = remote.enrollDevice({
+					pairingSessionId,
+					pairingToken,
+					deviceName,
+					publicKeyPem,
+				});
+				persistDevices(remote.devices.list());
+				return {
+					deviceId: device.deviceId,
+					deviceName: device.deviceName,
+					ticket: remote.issueConnectionTicket(device.deviceId).ticket,
+				};
+			},
+			// The client checks the challenge against the origin it dialled, so a
+			// challenge names this listener's origin and is redeemable only there.
+			challenge: ({ deviceId, sessionOrigin }) => {
+				const pending = remote.createDeviceChallenge(deviceId, sessionOrigin);
+				return { ...pending.challenge, signingInput: pending.signingInput };
+			},
+			verify: ({ deviceId, challengeId, deviceSignature, sessionOrigin }) => {
+				const ticket = remote.verifyDeviceSignature({
+					deviceId,
+					challengeId,
+					deviceSignature,
+					sessionOrigin,
+				});
+				return { ticket: ticket.ticket, expiresAt: ticket.expiresAt };
+			},
+		},
+		...(options.httpHost === undefined ? {} : { host: options.httpHost }),
+		...(options.httpPort === undefined ? {} : { port: options.httpPort }),
+		allowedWebOrigins: allowedWebOrigins(options.webOrigin),
+		protocolCore: composition.core,
+		capabilities: composition.coreOptions.capabilities,
+		...(composition.coreOptions.limits === undefined
+			? {}
+			: { limits: composition.coreOptions.limits }),
+	});
+}
+
+interface ProtocolCredentials {
+	readonly accept: (token: string) => boolean;
+	readonly clientId: (token: string) => string | undefined;
+}
+
+/** The device authority mints one-use application tickets. This small cache
+ * only carries the authenticated device id across LocalUiServer's credential
+ * callbacks; it never stores a credential or survives process shutdown. */
+function createProtocolCredentials(
+	remote: ServerRemoteExposure,
+): ProtocolCredentials {
+	const accepted = new Map<string, string>();
+	return {
+		accept: (ticket) => {
+			try {
+				const result = remote.consumeConnectionTicket(ticket);
+				accepted.set(ticket, result.deviceId);
+				return true;
+			} catch {
+				return false;
+			}
+		},
+		clientId: (ticket) => accepted.get(ticket),
+	};
+}
+
+interface RemoteDevicePersistence {
+	readonly load: () => readonly RemoteRegisteredDevice[];
+	readonly save: (records: readonly RemoteRegisteredDevice[]) => void;
+}
+
+/** Device public keys and non-secret metadata are the complete durable remote
+ * credential record. Pairing fragments, signatures, and tickets are never
+ * serialized. Unknown schemas start clean; this is intentionally a cutover. */
+function createRemoteDevicePersistence(
+	dataRoot: string,
+): RemoteDevicePersistence {
+	const file = join(dataRoot, 'remote-devices.v1.json');
+	return {
+		load: () => {
+			try {
+				const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
+				if (!Array.isArray(parsed)) return [];
+				return parsed as readonly RemoteRegisteredDevice[];
+			} catch (error) {
+				if (isMissingFile(error)) return [];
+				throw error;
+			}
+		},
+		save: (records) => {
+			mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+			const temporary = `${file}.tmp`;
+			writeFileSync(temporary, JSON.stringify(records), {
+				encoding: 'utf8',
+				mode: 0o600,
+			});
+			renameSync(temporary, file);
+		},
+	};
+}
+
+function isMissingFile(error: unknown): boolean {
+	return (
+		typeof error === 'object' &&
+		error !== null &&
+		(error as { code?: unknown }).code === 'ENOENT'
+	);
+}
+
+function validPairingExpiry(value: string): boolean {
+	const parsed = Date.parse(value);
+	return Number.isSafeInteger(parsed) && parsed > Date.now() - 60_000;
+}
+
+async function runApprovalCommand(options: ServerCliOptions): Promise<void> {
+	const socketPath = approvalSocketPath(options.dataRoot);
+	const request =
+		options.command === 'approvals'
+			? ({ op: 'list' } as const)
+			: ({
+					op: options.command === 'approve' ? 'approve' : 'deny',
+					approvalId: options.approvalId!,
+				} as const);
+	const response = await sendApprovalSocketRequest(socketPath, request);
+	process.stdout.write(`${JSON.stringify(response)}\n`);
+	if (!response.ok) process.exitCode = 1;
+}
+
+/**
+ * Ask the running server for its live pairing handoff.
+ *
+ * The room a client must join is one the server has registered with a relay,
+ * so only that process can name it. This command is a client of the owner-only
+ * socket in the data root; it mints nothing of its own and fails with a clear
+ * message when no server owns the root.
+ */
+async function runPairingCommand(options: ServerCliOptions): Promise<void> {
+	let response: Awaited<ReturnType<typeof sendApprovalSocketRequest>>;
+	try {
+		response = await sendApprovalSocketRequest(
+			approvalSocketPath(options.dataRoot),
+			{
+				op: 'pairing',
+			},
+		);
+	} catch (error) {
+		process.stderr.write(
+			`${error instanceof Error ? error.message : 'no running server owns this data root'}\n`,
+		);
+		process.exitCode = 1;
+		return;
+	}
+	if (!response.ok) {
+		process.stderr.write(`${response.error}\n`);
+		process.exitCode = 1;
+		return;
+	}
+	if (!('handoffs' in response)) {
+		process.stderr.write(
+			'the running server did not return a pairing handoff\n',
+		);
+		process.exitCode = 1;
+		return;
+	}
+	if (response.exposure === 'off' || response.handoffs.length === 0) {
+		process.stdout.write(
+			`${JSON.stringify({ serverId: options.serverId, exposure: 'off' })}\n`,
+		);
+		return;
+	}
+	for (const handoff of response.handoffs) {
+		process.stdout.write(
+			`${JSON.stringify({ ...handoff, requiresApproval: true })}\n`,
+		);
+	}
+}
+
+/**
+ * End every terminal session a session holder is keeping for this data root,
+ * and leave no holder running. Requires a stopped server: a holder serves one
+ * server at a time, so a running server's sessions are that server's to end.
+ */
+async function runEndSessionsCommand(options: ServerCliOptions): Promise<void> {
+	const before = readHolderRecords(options.dataRoot).filter((record) =>
+		holderProcessIsAlive(record.pid),
+	);
+	const holders = createSessionHolderPtyFactory({
+		dataRoot: options.dataRoot,
+		// Never the build of a real server: every holder found is drained, and
+		// nothing is ever launched from here.
+		buildId: 'end-sessions',
+		launch: () => {
+			throw new Error('end-sessions never starts a session holder');
+		},
+		limitMs: null,
+	});
+	const held = await holders.start();
+	await holders.endAll();
+	const remaining = readHolderRecords(options.dataRoot).filter((record) =>
+		holderProcessIsAlive(record.pid),
+	);
+	process.stdout.write(
+		`${JSON.stringify({
+			holders: before.length,
+			sessions: held.length,
+			remaining: remaining.length,
+		})}\n`,
+	);
+	if (remaining.length > 0) {
+		process.stderr.write(
+			'a session holder is still attached to a running server; stop the server first\n',
+		);
+		process.exitCode = 1;
+	}
+}
+
+function holderProcessIsAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as { code?: string }).code === 'EPERM';
+	}
+}
+
+/** Rotate the host key and revoke every device. Requires a stopped server so
+ * the live host cannot keep advertising the retired key. */
+async function runResetIdentityCommand(
+	options: ServerCliOptions,
+	remote: ServerRemoteExposure,
+	devicePersistence: RemoteDevicePersistence,
+): Promise<void> {
+	const revoked = await remote.revokeAllDevices();
+	devicePersistence.save(remote.devices.list());
+	const key = rotateHostedHostKey(
+		join(options.dataRoot, 'remote-host-key.v1.json'),
+	);
+	process.stdout.write(
+		`${JSON.stringify({ serverId: options.serverId, identityReset: true, revokedDevices: revoked, hostPublicKey: key.publicKey })}\n`,
+	);
+}
+
+function runtimeHealth(
+	runtime: StandaloneRuntime,
+	protocolReady = true,
+): JsonValue {
+	const health = runtime.health();
+	return {
+		phase: health.phase,
+		serverId: health.serverId,
+		version: health.version,
+		ready: health.ready && protocolReady,
+		uptimeMs: health.uptimeMs,
+	};
+}
+
+async function waitForProtocolEndpoint(
+	uiServer: LocalUiServer | undefined,
+): Promise<void> {
+	if (uiServer === undefined) return;
+	const address = uiServer.address;
+	if (address === undefined) throw new Error('protocol endpoint is not bound');
+	const host =
+		address.host === '0.0.0.0' || address.host === '::'
+			? '127.0.0.1'
+			: address.host;
+	const deadline = Date.now() + 5_000;
+	let lastError: unknown;
+	while (Date.now() < deadline) {
+		try {
+			await new Promise<void>((resolve, reject) => {
+				const socket = createConnection({ host, port: address.port });
+				socket.once('connect', () => {
+					socket.end();
+					resolve();
+				});
+				socket.once('error', reject);
+				socket.setTimeout(500, () => {
+					socket.destroy(new Error('protocol endpoint probe timed out'));
+				});
+			});
+			return;
+		} catch (error) {
+			lastError = error;
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+	}
+	throw new Error(
+		`protocol endpoint did not accept connections${lastError instanceof Error ? `: ${lastError.message}` : ''}`,
+	);
+}
+
+function publicPairing(
+	handoff: ServerPairingHandoff,
+	protocolEndpoint?: string,
+): Record<string, unknown> {
+	const pairingUrl =
+		protocolEndpoint === undefined
+			? handoff.pairingUrl
+			: pairingUrlForEndpoint(handoff, protocolEndpoint);
+	return {
+		pairingExpiresAt: handoff.pairingExpiresAt,
+		pairingSessionId: handoff.pairingSessionId,
+		pairingUrl,
+		expiresInSeconds: Math.max(
+			1,
+			Math.ceil((handoff.expiresAt - Date.now()) / 1000),
+		),
+		requiresApproval: true,
+	};
+}
+
+/** The same room as this mode's client reaches it. */
+function handoffForMode(
+	mode: 'hosted' | 'direct',
+	handoff: ServerPairingHandoff,
+	direct: DirectExposure | undefined,
+): ServerPairingHandoff {
+	return mode === 'direct' && direct !== undefined
+		? directHandoff(handoff, direct.directOrigin)
+		: handoff;
+}
+
+/**
+ * One live pairing handoff per enabled exposure mode. The hosted and direct
+ * modes share one exposure, so they share a room and differ only in the origin
+ * a client reaches it through. With no mode enabled this is empty: the server
+ * is not remotely reachable, whatever local pairing URL readiness also carries.
+ */
+function exposureHandoffs(
+	options: ServerCliOptions,
+	handoff: ServerPairingHandoff,
+	direct: DirectExposure | undefined,
+): readonly PairingHandoffSummary[] {
+	return Object.freeze(
+		options.exposeModes.map((mode) =>
+			Object.freeze({
+				mode,
+				pairingUrl: handoffForMode(mode, handoff, direct).pairingUrl,
+				pairingExpiresAt: handoff.pairingExpiresAt,
+				serverId: options.serverId,
+			}),
+		),
+	);
+}
+
+interface DirectExposure {
+	readonly directOrigin: string;
+	readonly tls: { readonly cert: string; readonly key: string };
+	readonly certificateFingerprint: string;
+	readonly signalingUpgrade: {
+		readonly path: string;
+		readonly handle: DirectSignalingRelay['handleUpgrade'];
+	};
+	close(): Promise<void>;
+}
+
+/**
+ * Compose the server's own data-blind signaling endpoint.
+ *
+ * The endpoint lives on the authenticated HTTP listener, so one port serves the
+ * UI archive, health, and signaling. That listener must therefore exist and
+ * must answer on exactly the port the direct origin advertises; anything else
+ * would publish a pairing URL that nothing answers.
+ */
+async function createDirectExposure(
+	options: ServerCliOptions,
+): Promise<DirectExposure> {
+	const directOrigin = options.directOrigin as string;
+	if (options.endpoint === 'disabled') {
+		throw new Error(
+			'--expose direct needs the authenticated HTTP listener; --endpoint disabled turns it off',
+		);
+	}
+	const advertised = new URL(directOrigin);
+	const advertisedPort = advertised.port === '' ? 443 : Number(advertised.port);
+	if (options.httpPort === undefined || options.httpPort !== advertisedPort) {
+		throw new Error(
+			`--expose direct requires --http-port ${advertisedPort} to match --direct-origin ${directOrigin}`,
+		);
+	}
+	const certificate = await loadOrCreateDirectTlsCertificate(
+		options.dataRoot,
+		directOrigin,
+	);
+	// The manager origin is the public connection-manager host, which must never
+	// be able to accept a signaling upgrade. It is always the hosted domain's
+	// manager, never this listener.
+	const managerOrigin = `https://app.${options.hostedDomain}`;
+	if (managerOrigin === directOrigin) {
+		throw new Error(
+			'--direct-origin must not be the hosted connection-manager origin',
+		);
+	}
+	const relay = createDirectSignalingRelay({
+		sessionOrigin: directOrigin,
+		managerOrigin,
+	});
+	return Object.freeze({
+		directOrigin,
+		tls: { cert: certificate.cert, key: certificate.key },
+		certificateFingerprint: certificate.fingerprint,
+		signalingUpgrade: {
+			path: relay.signalingPath,
+			handle: relay.handleUpgrade,
+		},
+		close: () => relay.close(),
+	}) as DirectExposure;
+}
+
+/**
+ * The same room, reached through the server's own origin. Hosted and direct
+ * links carry the same fragment, so a device that paired one way reconnects the
+ * other without pairing again.
+ */
+function directHandoff(
+	handoff: ServerPairingHandoff,
+	directOrigin: string,
+): ServerPairingHandoff {
+	return Object.freeze({
+		...handoff,
+		sessionOrigin: directOrigin,
+		pairingUrl: directPairingUrl(handoff, directOrigin),
+	});
+}
+
+/** True when the operator asked for direct exposure and nothing else. */
+function directOnly(options: ServerCliOptions): boolean {
+	return (
+		options.exposeModes.includes('direct') &&
+		!options.exposeModes.includes('hosted')
+	);
+}
+
+/**
+ * A direct pairing link points at the server's own signaling listener. It keeps
+ * the hosted `/v1/` grammar and the secret in the fragment, so a client parses
+ * and pairs with it exactly as it does a hosted link, and no secret is ever put
+ * where an HTTPS request line could carry it.
+ */
+function directPairingUrl(
+	handoff: ServerPairingHandoff,
+	directOrigin: string,
+): string {
+	const advertised = new URL(handoff.pairingUrl);
+	const direct = new URL('/v1/', directOrigin);
+	const hostName = advertised.searchParams.get('hostName');
+	if (hostName !== null) direct.searchParams.set('hostName', hostName);
+	direct.hash = advertised.hash;
+	return direct.toString();
+}
+
+function pairingUrlFormatForOrigin(
+	sessionOrigin: string,
+	hostedDomain: string,
+): 'standalone' | 'hosted-compact' {
+	try {
+		const url = new URL(sessionOrigin);
+		const domain = hostedDomain.toLowerCase();
+		const host = (domain.includes(':') ? url.host : url.hostname).toLowerCase();
+		if (host.endsWith(`.${domain}`) && host !== `app.${domain}`)
+			return 'hosted-compact';
+	} catch {
+		// Fall through to the standalone local-HTTP pairing fragment.
+	}
+	return 'standalone';
+}
+
+function resolveWebRtcRuntimeRoot(
+	cwd: string,
+	env: Readonly<Record<string, string | undefined>>,
+): string {
+	const configured = env.TERMINAY_WEBRTC_RUNTIME_ROOT?.trim();
+	if (configured) return resolve(configured);
+	return resolve(cwd, '../../build/webrtc-runtime');
+}
+
+/** Whether this server keeps its terminals in a session holder (ADR-0035). */
+/**
+ * The service log is this server's own; reports name a holder by process id
+ * and start time and carry no session id, path, or credential.
+ */
+function logSessionHolderObservation(
+	report: SessionHolderObservationReport,
+): void {
+	process.stderr.write(
+		`[terminay-server] session holder ${JSON.stringify(report)}\n`,
+	);
+}
+
+function sessionHolderEnabled(options: ServerCliOptions): boolean {
+	return isSessionHolderEnabled({
+		dataRoot: options.dataRoot,
+		env: process.env,
+		platform: process.platform,
+	});
+}
+
+/** The holder entry ships beside this file in every artifact. */
+function sessionHolderEntryPath(): string {
+	return join(dirname(fileURLToPath(import.meta.url)), 'sessionHolderEntry.js');
+}
+
+/** Changes whenever the holder this build would start changes. */
+function sessionHolderBuildId(options: ServerCliOptions): string {
+	let stamp = 'unbuilt';
+	try {
+		stamp = String(statSync(sessionHolderEntryPath()).mtimeMs);
+	} catch {
+		/* a missing entry fails at launch, with a clearer error */
+	}
+	return `${options.serverVersion}:${options.serverRevision ?? ''}:${stamp}`;
+}
+
+/** The standalone npm package carries the same staged artifact bytes as the
+ * Electron resource bundle. This lookup is module-relative, never cwd based. */
+function resolveBuiltInExtensionArtifactRoot(): string {
+	const configured = process.env.TERMINAY_BUILTIN_EXTENSIONS_ROOT?.trim();
+	if (configured) return resolve(configured);
+	return resolve(
+		dirname(fileURLToPath(import.meta.url)),
+		'built-in-extensions',
+	);
+}
+
+function hostedSignalOptions(
+	env: Readonly<Record<string, string | undefined>>,
+): {
+	connectHost?: string;
+	insecureTls?: boolean;
+} {
+	const connectHost = env.TERMINAY_SIGNAL_CONNECT_HOST?.trim();
+	return {
+		...(connectHost ? { connectHost } : {}),
+		...(env.TERMINAY_SIGNAL_INSECURE_TLS === '1' ? { insecureTls: true } : {}),
+	};
+}

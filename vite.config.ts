@@ -1,0 +1,108 @@
+import { defineConfig } from 'vite'
+import path from 'node:path'
+import electron from 'vite-plugin-electron/simple'
+import react from '@vitejs/plugin-react'
+import { developmentWorkspaceAliases } from './scripts/development-workspace-aliases.mjs'
+
+const useDevelopmentWorkspaceSources =
+  process.env.TERMINAY_DEVELOPMENT_SOURCE_WORKSPACES === '1'
+
+const nodeBuiltins = [
+  'node:fs',
+  'node:fs/promises',
+  'node:path',
+  'node:crypto',
+  'node:child_process',
+  'node:util',
+  'node:http',
+  'node:https',
+  'node:os',
+  'node:net',
+  'node:tls',
+  'node:stream',
+  'node:buffer',
+  'node:events',
+  'node:url',
+  'node:zlib',
+  'node:module',
+  'node:process',
+  'node-pty',
+  'electron-updater',
+  'esbuild',
+  'qrcode',
+  'selfsigned',
+  'ws',
+]
+
+const appInput = {
+  remote: path.join(__dirname, 'remote.html'),
+}
+
+const electronInput = {
+  main: path.join(__dirname, 'electron/main.ts'),
+  extensionHostEntry: path.join(__dirname, 'packages/server-core/src/extensions/child.ts'),
+  // The Desktop MCP adapter is a renderer-free Node entry launched from the
+  // packaged application's unpacked resources.
+  serverMcpEntry: path.join(__dirname, 'apps/terminay-server/src/desktopMcpEntry.ts'),
+  // The detached session holder (ADR-0035). It runs under Electron's Node mode
+  // from unpacked resources and outlives the application process.
+  sessionHolderEntry: path.join(__dirname, 'apps/terminay-server/src/sessionHolderEntry.ts'),
+}
+
+export default defineConfig({
+	// vite-plugin-electron launches Electron against this fixed renderer origin.
+	// Falling back to 5174 starts an app that cannot attach to its renderer.
+	server: {
+		port: 5173,
+		strictPort: true,
+	},
+  build: {
+    // Nothing reads the gzip size report; computing it costs seconds per build.
+    reportCompressedSize: false,
+    // The desktop bootstrap must execute before any dependency graph work.
+    // Vite's preload helper otherwise gates the dynamic renderer import on
+    // stylesheet/module preload events in Electron.
+    modulePreload: false,
+    rollupOptions: {
+      input: appInput,
+    },
+    rolldownOptions: {
+      input: appInput,
+    },
+  },
+  plugins: [
+    react(),
+    electron({
+      main: {
+        entry: 'electron/main.ts',
+        vite: {
+          resolve: {
+            alias: [
+              ...(useDevelopmentWorkspaceSources
+                ? developmentWorkspaceAliases(__dirname)
+                : []),
+              {
+                find: 'tslib',
+                replacement: path.join(__dirname, 'node_modules/tslib/tslib.es6.mjs'),
+              },
+            ],
+          },
+          build: {
+            rolldownOptions: {
+              input: electronInput,
+              external: nodeBuiltins,
+            },
+            rollupOptions: {
+              input: electronInput,
+              external: nodeBuiltins,
+            },
+          },
+        },
+      },
+      // The only root renderer entry is remote.html, which is a browser-only
+      // host and imports no Electron renderer APIs. Avoid the expensive CJS
+      // shim plugin across its production and development dependency graphs.
+      renderer: undefined,
+    }),
+  ],
+})

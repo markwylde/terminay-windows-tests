@@ -1,0 +1,361 @@
+import type {
+	TerminayHostAction,
+	TerminayHostActionRequest,
+	TerminayHostContext,
+	TerminayHostMenuAccelerator,
+} from '@terminay/protocol';
+import type { AppUpdateStatus } from '../types/terminay';
+
+type NativeHostBridge = Readonly<{
+	getContext(): Promise<TerminayHostContext>;
+	requestAction(request: TerminayHostActionRequest): Promise<unknown>;
+	resolveDroppedFilePath?(file: File): string | undefined;
+	readTerminalClipboard?(): Promise<string>;
+}>;
+
+function bridge(): NativeHostBridge | undefined {
+	if (typeof window === 'undefined') return undefined;
+	return window.terminayHost as unknown as NativeHostBridge | undefined;
+}
+
+async function request(
+	action: TerminayHostAction,
+): Promise<
+	Readonly<{ handled: false }> | Readonly<{ handled: true; result: unknown }>
+> {
+	const host = bridge();
+	if (host === undefined) return { handled: false };
+	const context = await host.getContext();
+	const result = await host.requestAction({
+		schemaVersion: 1,
+		bridgeVersion: 1,
+		sourceId: context.sourceId,
+		windowId: context.windowId,
+		profileId: context.profileId,
+		serverId: context.serverId,
+		userGesture: true,
+		action,
+	});
+	return { handled: true, result };
+}
+
+/** Desktop consumes pairing fragments in Electron, where durable credentials
+ * remain in safeStorage. Browser hosts deliberately fall through to their
+ * exact-origin pairing flow. */
+export async function pairDesktopConnection(
+	pairingUrl: string,
+	attemptId: string,
+): Promise<boolean> {
+	return (await request({ type: 'connection.pair', pairingUrl, attemptId }))
+		.handled;
+}
+
+/** Abandon an in-flight Desktop pairing attempt; its `pairDesktopConnection`
+ * call then rejects. */
+export async function cancelDesktopPairing(attemptId: string): Promise<void> {
+	await request({ type: 'connection.pair-cancel', attemptId });
+}
+
+/** Clipboard writes are semantic user actions. Desktop owns the privileged
+ * write; browser sessions use their exact-origin Clipboard API. */
+export async function writeClipboardText(text: string): Promise<void> {
+	// Safari grants the clipboard only to a call made synchronously inside the
+	// gesture that asked for it; awaiting an absent Desktop bridge first spends
+	// that activation and the write is refused. With no bridge there is nothing
+	// to ask, so go straight to the browser.
+	if (bridge() === undefined) {
+		await navigator.clipboard.writeText(text);
+		return;
+	}
+	if ((await request({ type: 'clipboard.write', text })).handled) return;
+	await navigator.clipboard.writeText(text);
+}
+
+/** Clipboard reads remain an exact-document, user-gesture browser capability.
+ * They are deliberately not elevated through the privileged Desktop host. */
+export async function readClipboardText(): Promise<string> {
+	if (navigator.clipboard?.readText === undefined) return '';
+	return navigator.clipboard.readText();
+}
+
+export function canReadClipboardText(): boolean {
+	return navigator.clipboard?.readText !== undefined;
+}
+
+export function canReadClipboardItems(): boolean {
+	return navigator.clipboard?.read !== undefined;
+}
+
+/** A Desktop terminal paste can safely read native clipboard formats within a
+ * real user gesture. Browser hosts remain on their exact-origin text route. */
+export async function readTerminalClipboard(): Promise<string> {
+	try {
+		const readDesktopClipboard = bridge()?.readTerminalClipboard;
+		if (readDesktopClipboard !== undefined) {
+			const text = await readDesktopClipboard();
+			if (text.length > 0) return text;
+		}
+	} catch {
+		// Browser text paste remains a recoverable fallback when the narrow
+		// Desktop bridge cannot consume this particular interaction.
+	}
+	return readClipboardText();
+}
+
+export function canReadTerminalClipboard(): boolean {
+	return (
+		bridge()?.readTerminalClipboard !== undefined ||
+		canReadClipboardText() ||
+		canReadClipboardItems()
+	);
+}
+
+export function canUseDesktopTerminalClipboard(): boolean {
+	return bridge()?.readTerminalClipboard !== undefined;
+}
+
+/** Desktop-only native File lookup for user-initiated terminal drops. Browser
+ * clients never receive a local pathname and use their server upload flow. */
+export function resolveDesktopDroppedFilePath(file: unknown): string | undefined {
+	if (!(file instanceof File)) return undefined;
+	try {
+		return bridge()?.resolveDroppedFilePath?.(file);
+	} catch {
+		return undefined;
+	}
+}
+
+/** External navigation is privileged in Desktop and ordinary browser
+ * navigation elsewhere. Only credential-free HTTP and HTTPS URLs pass the
+ * protocol parser. */
+export async function openExternalUrl(url: string): Promise<void> {
+	// Safari treats a window opened after an await as an unrequested popup and
+	// blocks it silently, so a browser client must open inside the activation
+	// that is still live. Only Desktop has a bridge worth asking first.
+	if (bridge() === undefined) {
+		window.open(url, '_blank', 'noopener,noreferrer');
+		return;
+	}
+	if ((await request({ type: 'os.open-external', url })).handled) return;
+	window.open(url, '_blank', 'noopener,noreferrer');
+}
+
+/** Preview content never receives a filesystem path. Desktop receives only a
+ * capped byte payload and asks the user for a destination; browser clients use
+ * the ordinary, user-visible Blob download flow. */
+export async function savePreviewDownload(input: {
+	readonly bytes: Uint8Array;
+	readonly filename: string;
+	readonly mimeType: string;
+}): Promise<void> {
+	if (input.bytes.byteLength === 0 || input.bytes.byteLength > 16 * 1024 * 1024)
+		throw new Error('Preview downloads are limited to 16 MiB.');
+	const response = await request({
+		type: 'preview.download',
+		filename: safeDownloadFilename(input.filename),
+		mimeType: input.mimeType,
+		bytesBase64: base64(input.bytes),
+	});
+	if (response.handled) return;
+	const copy = input.bytes.buffer.slice(input.bytes.byteOffset, input.bytes.byteOffset + input.bytes.byteLength) as ArrayBuffer;
+	const url = URL.createObjectURL(new Blob([copy], { type: input.mimeType }));
+	const anchor = document.createElement('a');
+	anchor.href = url;
+	anchor.download = safeDownloadFilename(input.filename);
+	anchor.rel = 'noopener noreferrer';
+	document.body.append(anchor);
+	anchor.click();
+	anchor.remove();
+	window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function safeDownloadFilename(value: string): string {
+	const result = [...value].map((character) => {
+		const code = character.codePointAt(0) ?? 0;
+		return code < 0x20 || /[\\/:*?"<>|]/u.test(character) ? '_' : character;
+	}).join('').trim().slice(0, 128);
+	return result.length > 0 ? result : 'download';
+}
+
+function base64(bytes: Uint8Array): string {
+	let output = '';
+	for (let offset = 0; offset < bytes.length; offset += 0x8000)
+		output += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + 0x8000, bytes.length)));
+	return window.btoa(output);
+}
+
+function parseUpdateStatus(value: unknown): AppUpdateStatus {
+	if (typeof value !== 'object' || value === null || Array.isArray(value))
+		throw new TypeError('native updater returned an invalid status');
+	const status = value as Record<string, unknown>;
+	if (
+		(status.checkedAt !== null && typeof status.checkedAt !== 'string') ||
+		typeof status.currentVersion !== 'string' ||
+		(status.errorMessage !== null && typeof status.errorMessage !== 'string') ||
+		typeof status.hasUpdate !== 'boolean' ||
+		(status.latestVersion !== null &&
+			typeof status.latestVersion !== 'string') ||
+		(status.releaseUrl !== null && typeof status.releaseUrl !== 'string')
+	)
+		throw new TypeError('native updater returned an invalid status');
+	const notes = status.releaseNotes;
+	if (
+		(status.state !== undefined && typeof status.state !== 'string') ||
+		(status.canInstallInPlace !== undefined &&
+			typeof status.canInstallInPlace !== 'boolean') ||
+		(notes !== undefined &&
+			notes !== null &&
+			(!Array.isArray(notes) ||
+				!notes.every(
+					(note) =>
+						typeof note === 'object' &&
+						note !== null &&
+						typeof note.version === 'string' &&
+						typeof note.markdown === 'string' &&
+						(note.url === null || typeof note.url === 'string'),
+				)))
+	)
+		throw new TypeError('native updater returned an invalid status');
+	return status as AppUpdateStatus;
+}
+
+export async function checkForAppUpdate(): Promise<AppUpdateStatus | null> {
+	const response = await request({ type: 'updater.check' });
+	return response.handled ? parseUpdateStatus(response.result) : null;
+}
+
+/** Quit through the host's normal quit path and relaunch into the downloaded update. */
+export async function installAppUpdate(): Promise<boolean> {
+	const response = await request({ type: 'updater.install' });
+	return response.handled;
+}
+
+export async function closeHostPresentation(): Promise<void> {
+	if ((await request({ type: 'route.close' })).handled) return;
+	window.close();
+}
+
+export async function updateNativeMenuAccelerators(
+	accelerators: readonly TerminayHostMenuAccelerator[],
+): Promise<void> {
+	await request({ type: 'menu.accelerators.update', accelerators });
+}
+
+/** Desktop mirrors this window's Notifications count on the application icon.
+ * Browser hosts have no bridge and report nothing; a host that does not know
+ * the action simply leaves its icon unbadged. */
+export async function setApplicationBadgeCount(count: number): Promise<void> {
+	if (bridge() === undefined) return;
+	try {
+		await request({
+			type: 'badge.count.set',
+			count: Math.min(Math.max(Math.trunc(count), 0), 9_999),
+		});
+	} catch {
+		// The icon badge is an echo of the header; the header stays authoritative.
+	}
+}
+
+export async function updateDeviceTerminalSettings(
+	settings: import('@terminay/protocol').JsonValue,
+): Promise<import('@terminay/protocol').JsonValue | null> {
+	const response = await request({ type: 'device.settings.update', settings });
+	return response.handled
+		? (response.result as import('@terminay/protocol').JsonValue)
+		: null;
+}
+
+export async function setDesktopPerformanceLogging(
+	enabled: boolean,
+): Promise<boolean | null> {
+	const response = await request({
+		type: 'diagnostics.performance-logging.set',
+		enabled,
+	});
+	if (!response.handled) return null;
+	const result = response.result;
+	if (
+		typeof result === 'object' &&
+		result !== null &&
+		!Array.isArray(result) &&
+		typeof (result as { enabled?: unknown }).enabled === 'boolean'
+	) {
+		return (result as { enabled: boolean }).enabled;
+	}
+	return enabled;
+}
+
+/** A bounded, main-computed projection of Desktop startup timing, lightweight
+ * process samples, and per-terminal usage. Returns null in a browser host and
+ * for a window bound to a remote profile. */
+export async function readDesktopPerformanceSnapshot(): Promise<
+	import('@terminay/protocol').JsonValue | null
+> {
+	const response = await request({
+		type: 'diagnostics.performance-snapshot.read',
+	});
+	if (!response.handled) return null;
+	const result = response.result;
+	return typeof result === 'object' && result !== null && !Array.isArray(result)
+		? (result as import('@terminay/protocol').JsonValue)
+		: null;
+}
+
+export type WorkspaceDragDecision =
+	| Readonly<{ action: 'reorder' }>
+	| Readonly<{ action: 'merge'; targetViewId: string }>
+	| Readonly<{ action: 'popout'; x: number; y: number }>;
+
+export async function beginWorkspaceDrag(input: {
+	viewId: string;
+	projectId: string;
+	preview: { title: string; emoji: string; color: string; width: number };
+}): Promise<void> {
+	await request({ type: 'workspace.drag.start', ...input });
+}
+
+export async function endWorkspaceDrag(): Promise<WorkspaceDragDecision> {
+	const response = await request({ type: 'workspace.drag.end' });
+	if (!response.handled) return { action: 'reorder' };
+	const value = response.result;
+	if (typeof value !== 'object' || value === null || Array.isArray(value))
+		throw new TypeError('native workspace drag result is invalid');
+	const result = value as Record<string, unknown>;
+	if (result.action === 'reorder' && Object.keys(result).length === 1)
+		return { action: 'reorder' };
+	if (
+		result.action === 'merge' &&
+		Object.keys(result).length === 2 &&
+		typeof result.targetViewId === 'string'
+	)
+		return { action: 'merge', targetViewId: result.targetViewId };
+	if (
+		result.action === 'popout' &&
+		Object.keys(result).length === 3 &&
+		typeof result.x === 'number' &&
+		Number.isFinite(result.x) &&
+		typeof result.y === 'number' &&
+		Number.isFinite(result.y)
+	)
+		return { action: 'popout', x: result.x, y: result.y };
+	throw new TypeError('native workspace drag result is invalid');
+}
+
+export async function presentWorkspaceView(
+	viewId: string,
+	position: { x: number; y: number },
+): Promise<void> {
+	const query = new URLSearchParams({
+		view: viewId,
+		x: String(position.x),
+		y: String(position.y),
+	});
+	const response = await request({
+		type: 'route.present',
+		route: `/?${query.toString()}`,
+		disposition: 'native-window',
+		logicalViewId: `workspace:${viewId}`,
+	});
+	if (!response.handled)
+		throw new Error('Native workspace windows are unavailable.');
+}

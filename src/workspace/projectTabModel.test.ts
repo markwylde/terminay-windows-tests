@@ -1,0 +1,383 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import {
+	defaultTerminalSettings,
+	normalizeTerminalSettings,
+} from '../terminalSettings.ts';
+import {
+	getProjectTabColor,
+	isProjectFoldersTreeOpenOnDevice,
+	isProjectSidebarOpenOnDevice,
+	collapsedFoldersAfterToggle,
+	projectCollapsedFoldersOnDevice,
+	projectFoldersColumnTabOnDevice,
+	projectSidebarPatch,
+	projectSidebarVisibilityKey,
+	projectTabColorHue,
+	projectTabHueDistance,
+	sidebarActiveGroupOnDevice,
+	withProjectCollapsedFolders,
+	withProjectFoldersColumnTab,
+	withProjectFoldersTreeVisibility,
+	withProjectSidebarActiveGroup,
+	withProjectSidebarVisibility,
+} from './projectTabModel.ts';
+
+test('sidebar visibility is device-local per server and project', () => {
+	const desktop = withProjectSidebarVisibility(
+		defaultTerminalSettings.sidebar,
+		'server-a',
+		'project-a',
+		true,
+	);
+
+	assert.equal(isProjectSidebarOpenOnDevice(desktop, 'server-a', 'project-a'), true);
+	assert.equal(isProjectSidebarOpenOnDevice(desktop, 'server-a', 'project-b'), false);
+	assert.equal(isProjectSidebarOpenOnDevice(desktop, 'server-b', 'project-a'), false);
+	assert.equal(projectSidebarVisibilityKey('server-a', 'project-a'), 'server-a:project-a');
+	assert.equal(
+		sidebarActiveGroupOnDevice(desktop, 'server-a', 'project-a'),
+		'explorer',
+	);
+	const withDocs = withProjectSidebarActiveGroup(
+		desktop,
+		'server-a',
+		'project-a',
+		'documentation',
+	);
+	assert.equal(
+		sidebarActiveGroupOnDevice(withDocs, 'server-a', 'project-a'),
+		'documentation',
+	);
+	assert.equal(
+		sidebarActiveGroupOnDevice(withDocs, 'server-a', 'project-b'),
+		'explorer',
+	);
+	assert.deepEqual(
+		projectSidebarPatch({
+			isFileExplorerOpen: true,
+			sidebarActiveGroup: 'documentation',
+		}),
+		null,
+		'Sidebar visibility and selected group must not produce a canonical workspace patch.',
+	);
+});
+
+test('the Folders tree is open by default and device-local per server and project', () => {
+	const fresh = defaultTerminalSettings.sidebar;
+	assert.equal(isProjectFoldersTreeOpenOnDevice(fresh, 'server-a', 'project-a'), true);
+
+	const hidden = withProjectFoldersTreeVisibility(fresh, 'server-a', 'project-a', false);
+	assert.equal(isProjectFoldersTreeOpenOnDevice(hidden, 'server-a', 'project-a'), false);
+	assert.equal(isProjectFoldersTreeOpenOnDevice(hidden, 'server-a', 'project-b'), true);
+	assert.equal(isProjectFoldersTreeOpenOnDevice(hidden, 'server-b', 'project-a'), true);
+	// The two columns are toggled independently.
+	assert.equal(isProjectSidebarOpenOnDevice(hidden, 'server-a', 'project-a'), false);
+	const sidebarOpen = withProjectSidebarVisibility(hidden, 'server-a', 'project-a', true);
+	assert.equal(isProjectFoldersTreeOpenOnDevice(sidebarOpen, 'server-a', 'project-a'), false);
+});
+
+test('the left column tab is device-local per server and project', () => {
+	const sidebar = defaultTerminalSettings.sidebar;
+	assert.equal(
+		projectFoldersColumnTabOnDevice(sidebar, 'server-a', 'project-a'),
+		'tabs',
+	);
+	const chosen = withProjectFoldersColumnTab(
+		sidebar,
+		'server-a',
+		'project-a',
+		'agents',
+	);
+	assert.equal(
+		projectFoldersColumnTabOnDevice(chosen, 'server-a', 'project-a'),
+		'agents',
+	);
+	assert.equal(
+		projectFoldersColumnTabOnDevice(chosen, 'server-a', 'project-b'),
+		'tabs',
+	);
+	assert.equal(
+		projectFoldersColumnTabOnDevice(chosen, 'server-b', 'project-a'),
+		'tabs',
+	);
+});
+
+test('an unknown stored left column tab reads as tabs', () => {
+	const normalized = normalizeTerminalSettings({
+		sidebar: {
+			projectFoldersColumnTab: {
+				'server-a:agents': 'agents',
+				'server-a:folders': 'folders',
+				'server-a:bad': 3,
+			},
+			// What an earlier build stored for the column is not read.
+			projectFoldersColumnLayout: {
+				'server-a:agents': { order: ['agents', 'folders'] },
+			},
+		},
+	}).sidebar;
+	assert.deepEqual(normalized.projectFoldersColumnTab, {
+		'server-a:agents': 'agents',
+	});
+	assert.equal('projectFoldersColumnLayout' in normalized, false);
+	assert.equal(
+		projectFoldersColumnTabOnDevice(normalized, 'server-a', 'folders'),
+		'tabs',
+	);
+	assert.deepEqual(
+		normalizeTerminalSettings({}).sidebar.projectFoldersColumnTab,
+		{},
+	);
+});
+
+test('a stored sidebar group the sidebar does not offer reads as Explorer', () => {
+	const sidebar = normalizeTerminalSettings({
+		sidebar: {
+			projectActiveGroup: {
+				'server-a:project-a': 'agents',
+				'server-a:project-b': 'documentation',
+			},
+		},
+	}).sidebar;
+	assert.equal(
+		sidebarActiveGroupOnDevice(sidebar, 'server-a', 'project-a'),
+		'explorer',
+	);
+	assert.equal(
+		sidebarActiveGroupOnDevice(sidebar, 'server-a', 'project-b'),
+		'documentation',
+	);
+});
+
+test('stored Folders tree preferences are normalised and unknown shapes dropped', () => {
+	const normalized = normalizeTerminalSettings({
+		sidebar: {
+			projectFoldersVisibility: { 'server-a:project-a': false, 'server-a:bad': 'no' },
+			projectFoldersWidth: { 'server-a:project-a': 300 },
+			defaultWidth: 320,
+		},
+	}).sidebar;
+	assert.deepEqual(normalized.projectFoldersVisibility, { 'server-a:project-a': false });
+	// Column widths are the device's, not the server's settings: a stored
+	// per-project width or default width is dropped.
+	assert.equal('projectFoldersWidth' in normalized, false);
+	assert.equal('defaultWidth' in normalized, false);
+	assert.deepEqual(normalizeTerminalSettings({}).sidebar.projectFoldersVisibility, {});
+});
+
+
+/** Hue of an assigned color, failing the test rather than returning null so a
+ * regression that stops producing palette colors is loud. */
+function assignedHue(color: string): number {
+	const hue = projectTabColorHue(color);
+	assert.notEqual(hue, null, `Expected ${color} to be a hue-bearing color.`);
+	return hue ?? 0;
+}
+
+test('color hue parsing reads primaries and rejects non-colors', () => {
+	assert.equal(projectTabColorHue('#ff0000'), 0);
+	assert.equal(projectTabColorHue('#00ff00'), 120);
+	assert.equal(projectTabColorHue('#0000ff'), 240);
+	assert.equal(projectTabColorHue('  #FFFF00  '), 60);
+	for (const value of ['', 'red', '#zzzzzz', '#fff', '#808080']) {
+		assert.equal(
+			projectTabColorHue(value),
+			null,
+			`Expected ${value} to carry no hue.`,
+		);
+	}
+});
+
+test('assigned colors sit on the palette hues', () => {
+	const hue = assignedHue(getProjectTabColor('project-a', [], () => 0));
+	assert.equal(
+		Math.abs(hue - Math.round(hue / 18) * 18) < 1,
+		true,
+		`Expected ${hue} to be a palette hue.`,
+	);
+});
+
+test('hue distance takes the shortest arc', () => {
+	assert.equal(projectTabHueDistance(350, 10), 20);
+	assert.equal(projectTabHueDistance(10, 350), 20);
+	assert.equal(projectTabHueDistance(0, 180), 180);
+	assert.equal(projectTabHueDistance(0, 190), 170);
+	assert.equal(projectTabHueDistance(42, 42), 0);
+});
+
+test('a second project lands far from the first', () => {
+	const first = getProjectTabColor('desktop-local:project-1', [], () => 0);
+	const second = getProjectTabColor('desktop-local:project-2', [
+		first,
+	]);
+	assert.equal(
+		projectTabHueDistance(assignedHue(first), assignedHue(second)) >= 150,
+		true,
+		`Expected a far-apart hue, got ${first} then ${second}.`,
+	);
+});
+
+test('successive projects spread across the wheel', () => {
+	const assigned: string[] = [];
+	for (let index = 1; index <= 6; index += 1) {
+		assigned.push(
+			getProjectTabColor(`desktop-local:project-${index}`, [
+				...assigned,
+			]),
+		);
+	}
+	const hues = assigned.map(assignedHue);
+	let closest = 180;
+	for (let left = 0; left < hues.length; left += 1) {
+		for (let right = left + 1; right < hues.length; right += 1) {
+			closest = Math.min(
+				closest,
+				projectTabHueDistance(hues[left] ?? 0, hues[right] ?? 0),
+			);
+		}
+	}
+	// 36 is the widest separation twenty 18-degree palette hues allow for six
+	// projects, and twice the 18 a first-unused-entry scan would leave. The one
+	// degree of slack absorbs the rounding of a hue through an 8-bit hex color.
+	assert.equal(
+		closest >= 35,
+		true,
+		`Expected six projects at least 36 degrees apart, got ${closest}.`,
+	);
+});
+
+test('an exhausted palette still assigns a palette color', () => {
+	const assigned: string[] = [];
+	for (let index = 1; index <= 20; index += 1) {
+		assigned.push(
+			getProjectTabColor(`desktop-local:project-${index}`, [
+				...assigned,
+			]),
+		);
+	}
+	assert.equal(new Set(assigned).size, 20, 'Expected all twenty palette hues.');
+	const extra = getProjectTabColor(
+		'desktop-local:project-21',
+		assigned,
+	);
+	assert.equal(
+		assigned.includes(extra),
+		true,
+		`Expected a palette color, got ${extra}.`,
+	);
+});
+
+test('assignment against colors in use is reproducible', () => {
+	const used = ['#e6994d'];
+	assert.equal(
+		getProjectTabColor('project-a', used),
+		getProjectTabColor('project-a', used),
+	);
+	// Two opposite colors in use leave two equally distant candidates, which is
+	// the only situation where identity decides. A single color in use has one
+	// unique furthest hue, so identity never comes into it.
+	const tied = ['#db5757', '#57dbdb'];
+	const picked = new Set(
+		Array.from({ length: 50 }, (_, index) =>
+			getProjectTabColor(`project-${index}`, tied),
+		),
+	);
+	assert.equal(
+		picked.size,
+		2,
+		`Expected identity to reach both tied candidates, got ${[...picked].join(', ')}.`,
+	);
+});
+
+test('the first color in a workspace is drawn at random', () => {
+	// A pinned source indexes the palette directly, so the whole wheel is
+	// reachable and the caller can still fix the sequence.
+	assert.equal(
+		assignedHue(getProjectTabColor('project-a', [], () => 0)),
+		0,
+	);
+	assert.notEqual(
+		getProjectTabColor('project-a', [], () => 0),
+		getProjectTabColor('project-a', [], () => 0.5),
+	);
+	// A source returning just under 1 must stay inside the palette.
+	assert.notEqual(projectTabColorHue(getProjectTabColor('a', [], () => 0.999)), null);
+});
+
+test('randomness applies only to the first color', () => {
+	const used = ['#db5757'];
+	assert.equal(
+		getProjectTabColor('project-a', used, () => 0),
+		getProjectTabColor('project-a', used, () => 0.75),
+		'Expected the random source to be ignored once a color is in use.',
+	);
+});
+
+test('Math.random as the source varies the first color', () => {
+	const seen = new Set<string>();
+	for (let attempt = 0; attempt < 200; attempt += 1)
+		seen.add(getProjectTabColor('project-a', [], Math.random));
+	assert.equal(
+		seen.size > 1,
+		true,
+		`Expected varied first colors, always got ${[...seen].join(', ')}.`,
+	);
+});
+
+test('without a random source the first color is stable', () => {
+	// Reconciliation re-derives a color for any server project stored without
+	// one, on every snapshot update. If that drew randomly the tab would change
+	// colour whenever anything in the workspace changed.
+	const derived = Array.from({ length: 20 }, () =>
+		getProjectTabColor('desktop-local:project-1'),
+	);
+	assert.equal(
+		new Set(derived).size,
+		1,
+		`Expected one stable derived color, got ${[...new Set(derived)].join(', ')}.`,
+	);
+	assert.notEqual(
+		getProjectTabColor('desktop-local:project-1'),
+		getProjectTabColor('server-7:project-9'),
+	);
+});
+
+test('a user-chosen color off the palette still repels the next project', () => {
+	const chosen = '#ff3366';
+	const next = getProjectTabColor('desktop-local:project-2', [
+		chosen,
+	]);
+	assert.equal(
+		projectTabHueDistance(assignedHue(chosen), assignedHue(next)) >= 150,
+		true,
+		`Expected the next color to avoid ${chosen}, got ${next}.`,
+	);
+});
+
+test('collapsed folders are device-local per server and project, and an empty set keeps no entry', () => {
+	const sidebar = defaultTerminalSettings.sidebar;
+	assert.deepEqual(projectCollapsedFoldersOnDevice(sidebar, 'server-a', 'project-a'), []);
+	assert.deepEqual(collapsedFoldersAfterToggle([], 'one'), ['one']);
+	assert.deepEqual(collapsedFoldersAfterToggle(['one', 'two'], 'one'), ['two']);
+
+	const collapsed = withProjectCollapsedFolders(sidebar, 'server-a', 'project-a', ['one', 'two']);
+	assert.deepEqual(projectCollapsedFoldersOnDevice(collapsed, 'server-a', 'project-a'), ['one', 'two']);
+	assert.deepEqual(projectCollapsedFoldersOnDevice(collapsed, 'server-a', 'project-b'), []);
+	assert.deepEqual(projectCollapsedFoldersOnDevice(collapsed, 'server-b', 'project-a'), []);
+	assert.deepEqual(
+		withProjectCollapsedFolders(collapsed, 'server-a', 'project-a', []).projectFoldersCollapsed,
+		{},
+	);
+
+	const normalized = normalizeTerminalSettings({
+		sidebar: {
+			projectFoldersCollapsed: {
+				'server-a:kept': ['one', 'one', 7, '', 'two'],
+				'server-a:empty': [],
+				'server-a:bad': 'one',
+			},
+		},
+	}).sidebar.projectFoldersCollapsed;
+	assert.deepEqual(normalized, { 'server-a:kept': ['one', 'two'] });
+});

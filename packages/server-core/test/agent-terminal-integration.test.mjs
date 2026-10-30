@@ -1,0 +1,101 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { AgentStatusService, TerminalActivityService, TerminalService, composeActivityLifecycle } from "../dist/index.js";
+
+test("terminal lifecycle registers the exact spawned session with the generic agent projection", async () => {
+  const activity = new TerminalActivityService({ serverId: "server-1" });
+  const agents = new AgentStatusService({ activity }); await agents.start();
+  const process = { pid: 9876, write() {}, resize() {}, kill() {}, onData() { return () => {}; }, onExit() { return () => {}; } };
+  const terminal = new TerminalService({ serverId: "server-1", ptyFactory: { spawn: () => process }, sessionLifecycle: composeActivityLifecycle(activity, agents, undefined) });
+  await terminal.createSession({ projectId: "project-1", sessionId: "terminal-1", shellPath: "/bin/sh", cols: 80, rows: 24 });
+  assert.equal(agents.isSessionActive({ serverId: "server-1", projectId: "project-1", sessionId: "terminal-1" }), true);
+  await terminal.shutdown(); await agents.stop();
+});
+
+test("foreground PTY lifecycle reaches the exact canonical activity session", async () => {
+  const activity = new TerminalActivityService({ serverId: "server-1" });
+  let foregroundListener;
+  const process = {
+    write() {}, resize() {}, kill() {},
+    onData() { return () => {}; },
+    onExit() { return () => {}; },
+    onForegroundProcess(listener) { foregroundListener = listener; return () => { foregroundListener = undefined; }; },
+  };
+  const terminal = new TerminalService({
+    serverId: "server-1",
+    ptyFactory: { spawn: () => process },
+    sessionLifecycle: composeActivityLifecycle(activity, undefined, undefined),
+  });
+  await terminal.createSession({
+    projectId: "project-1",
+    sessionId: "terminal-1",
+    shellPath: "/bin/sh",
+    cols: 80,
+    rows: 24,
+  });
+
+  foregroundListener({ processName: "sleep", shellForeground: false });
+
+  assert.deepEqual(activity.get({ serverId: "server-1", projectId: "project-1", sessionId: "terminal-1" }), {
+    acknowledged: true,
+    attention: false,
+    authority: "structured",
+    claimed: false,
+    foregroundBusy: true,
+    foregroundObservation: "available",
+    projectId: "project-1",
+    sessionId: "terminal-1",
+    source: "structured:foreground",
+    status: "working",
+    updatedAt: activity.get({ serverId: "server-1", projectId: "project-1", sessionId: "terminal-1" }).updatedAt,
+  });
+  await terminal.shutdown();
+  assert.equal(foregroundListener, undefined);
+});
+
+test("PTY start and foreground edges reach the agent service with the shell pid", async () => {
+  const identity = { serverId: "server-1", projectId: "project-1", sessionId: "terminal-1" };
+  const activity = new TerminalActivityService({ serverId: identity.serverId });
+  const agents = new AgentStatusService({ activity }); await agents.start();
+  const edges = [];
+  agents.observeTerminals((edge) => edges.push({ kind: edge.kind, shellPid: edge.terminal.shellPid, shellForeground: edge.shellForeground }));
+  let foregroundListener;
+  const process = {
+    pid: 7777,
+    write() {}, resize() {}, kill() {},
+    onData() { return () => {}; },
+    onExit() { return () => {}; },
+    onForegroundProcess(listener) { foregroundListener = listener; return () => { foregroundListener = undefined; }; },
+  };
+  const terminal = new TerminalService({
+    serverId: identity.serverId,
+    ptyFactory: { spawn: () => process },
+    sessionLifecycle: composeActivityLifecycle(activity, agents, undefined),
+  });
+  await terminal.createSession({ ...identity, shellPath: "/bin/sh", cols: 80, rows: 24 });
+  foregroundListener({ processName: "claude", shellForeground: false });
+  foregroundListener({ processName: "zsh", shellForeground: true });
+  assert.deepEqual(edges, [
+    { kind: "started", shellPid: 7777, shellForeground: undefined },
+    { kind: "foreground", shellPid: 7777, shellForeground: false },
+    { kind: "foreground", shellPid: 7777, shellForeground: true },
+  ]);
+  await terminal.shutdown(); await agents.stop();
+});
+
+test("a terminal moved to another project is announced again under its new identity", async () => {
+  const activity = new TerminalActivityService({ serverId: "server-1" });
+  const agents = new AgentStatusService({ activity }); await agents.start();
+  const process = { pid: 9876, write() {}, resize() {}, kill() {}, onData() { return () => {}; }, onExit() { return () => {}; } };
+  const terminal = new TerminalService({ serverId: "server-1", ptyFactory: { spawn: () => process }, sessionLifecycle: composeActivityLifecycle(activity, agents, undefined) });
+  await terminal.createSession({ projectId: "project-1", sessionId: "terminal-1", shellPath: "/bin/sh", cols: 80, rows: 24 });
+  const edges = [];
+  agents.observeTerminals((edge) => edges.push(edge));
+
+  agents.rehomeTerminal("terminal-1", "project-2");
+
+  assert.equal(agents.isSessionActive({ serverId: "server-1", projectId: "project-2", sessionId: "terminal-1" }), true);
+  assert.equal(agents.isSessionActive({ serverId: "server-1", projectId: "project-1", sessionId: "terminal-1" }), false);
+  assert.deepEqual(edges.map((edge) => [edge.kind, edge.terminal.identity.projectId, edge.terminal.shellPid]), [["started", "project-2", 9876]]);
+  await terminal.shutdown(); await agents.stop();
+});

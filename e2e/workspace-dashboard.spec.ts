@@ -1,0 +1,637 @@
+import type { Page } from '@playwright/test';
+import { expect, test } from './fixtures';
+import { sendAppCommand } from './support/app';
+import { typeInVisibleTerminal } from './support/terminal-input';
+import {
+	activeTerminalSessionId,
+	settledTerminalSessionId,
+	terminalPanelForSession,
+} from './support/terminal-session';
+import {
+	contextMenuItem,
+	fileExplorerItem,
+	openFileExplorer,
+	openProjectEditWindow,
+	setProjectRoot,
+	submitEditWindow,
+} from './support/ui';
+import { createStartedProject } from './support/project-start';
+import {
+	commandArrived,
+	commandGate,
+	endSettlePeriod,
+	HELD_SERVER_CLOCK,
+	INPUT_QUIET_MS,
+	serverClock,
+} from './support/server-clock';
+
+const homeControl = (page: Page) =>
+	page.getByRole('button', { name: 'Home', exact: true });
+const tabsSection = (page: Page) =>
+	page.locator('[data-terminay-home-section-tab="tabs"]');
+// Home stays mounted behind a project once it has been shown, so the dashboard
+// "is there" only while Home is the selected view.
+const dashboard = (page: Page) =>
+	page.locator(
+		'[data-terminay-home-active="true"] [data-terminay-dashboard]',
+	);
+const projectRow = (page: Page, projectId: string) =>
+	page.locator(`[data-terminay-dashboard-project="${projectId}"]`);
+const panelRows = (page: Page) => page.locator('[data-terminay-dashboard-panel]');
+
+const viewMode = (page: Page, mode: 'list' | 'board' | 'projects') =>
+	page.locator(`[data-terminay-dashboard-mode="${mode}"]`);
+const dashboardFilter = (page: Page) =>
+	page.locator('[data-terminay-dashboard-filter]');
+
+/**
+ * The view mode is remembered per device, so a suite that switches it would
+ * otherwise leak that choice into the next test. Every entry starts on List.
+ */
+async function showDashboard(page: Page): Promise<void> {
+	await homeControl(page).click();
+	// The dashboard is Home's Tabs section; the section is remembered, so later
+	// returns to Home land on it again.
+	await tabsSection(page).click();
+	await expect(dashboard(page)).toBeVisible();
+	await viewMode(page, 'list').click();
+	await expect(dashboard(page)).toHaveAttribute(
+		'data-terminay-dashboard-view',
+		'list',
+	);
+}
+
+async function activeProjectId(page: Page): Promise<string> {
+	const id = await page.locator('.project-tab--active').getAttribute('data-project-id');
+	if (!id) throw new Error('Expected an active project tab');
+	return id;
+}
+
+test.describe('workspace dashboard', () => {
+	test('the Home control sits between the sidebar toggle and the first project tab', async ({
+		mainWindow,
+	}) => {
+		const order = await mainWindow.evaluate(() => {
+			const bar = document.querySelector('.project-tabbar');
+			if (!bar) return [];
+			return [...bar.children].map((child) => child.className);
+		});
+
+		const toggleIndex = order.findIndex((name) =>
+			name.includes('project-tab-sidebar-toggle-box'),
+		);
+		const homeIndex = order.findIndex((name) =>
+			name.includes('project-tab-home-box'),
+		);
+		const tabsIndex = order.findIndex((name) =>
+			name.includes('project-tabbar-projects'),
+		);
+
+		expect(toggleIndex).toBeGreaterThanOrEqual(0);
+		expect(homeIndex).toBe(toggleIndex + 1);
+		expect(tabsIndex).toBeGreaterThan(homeIndex);
+	});
+
+	test('selecting Home shows every project and tab while terminals keep running', async ({
+		createWorkspace,
+		mainWindow,
+	}) => {
+		const workspace = await createWorkspace({
+			name: 'dashboard-inventory',
+			seed: { files: { 'notes.txt': 'dashboard inventory\n' } },
+		});
+		await setProjectRoot(mainWindow, workspace.rootDir);
+
+		const firstProjectId = await activeProjectId(mainWindow);
+		// Read this while the terminal is the visible panel: opening a file panel
+		// detaches the terminal's renderer, leaving nothing in the DOM to read.
+		const firstSessionId = await settledTerminalSessionId(
+			mainWindow.locator('.project-workspace--active .terminal-panel').first(),
+		);
+
+		// A file panel alongside the project's terminal: the dashboard lists both.
+		await openFileExplorer(mainWindow);
+		await fileExplorerItem(mainWindow, 'notes.txt').dblclick();
+		await expect(mainWindow.locator('.file-mode-switcher')).toBeVisible();
+		await createStartedProject(mainWindow);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(2);
+		await expect(mainWindow.locator('[data-pending-project-id]')).toHaveCount(0);
+		const secondProjectId = await activeProjectId(mainWindow);
+
+		await showDashboard(mainWindow);
+
+		// Home is not a project: no project tab reads as active while it is shown.
+		await expect(mainWindow.locator('.app-shell')).toHaveAttribute(
+			'data-terminay-selected-view',
+			'home',
+		);
+		await expect(mainWindow.locator('.project-tab--active')).toHaveCount(0);
+
+		await expect(projectRow(mainWindow, firstProjectId)).toBeVisible();
+		await expect(projectRow(mainWindow, secondProjectId)).toBeVisible();
+		// Two terminals and one file panel, none of them notable.
+		await expect(panelRows(mainWindow)).toHaveCount(3);
+		await expect(
+			mainWindow.locator('[data-terminay-dashboard-status="idle"]'),
+		).toHaveCount(3);
+
+		// Every project workspace is off screen.
+		await expect(mainWindow.locator('.project-workspace--active')).toHaveCount(
+			0,
+		);
+
+		// Nothing was closed: activating the first project's terminal row finds the
+		// same live session it had before Home, not a replacement.
+		await panelRows(mainWindow).first().click();
+		await expect(dashboard(mainWindow)).toHaveCount(0);
+		await expect(mainWindow.locator('.project-tab--active')).toHaveAttribute(
+			'data-project-id',
+			firstProjectId,
+		);
+		const restoredSessionId = await settledTerminalSessionId(
+			mainWindow.locator('.project-workspace--active .terminal-panel').first(),
+		);
+		expect(restoredSessionId).toBe(firstSessionId);
+	});
+
+	test('rows stay one line and truncate rather than wrapping', async ({
+		electronApp,
+		mainWindow,
+	}) => {
+		const editWindow = await openProjectEditWindow(mainWindow);
+		await editWindow
+			.getByPlaceholder('Project name')
+			.fill(
+				'a project whose name is far too long to fit on one dashboard line without help',
+			);
+		await submitEditWindow(editWindow);
+
+		await showDashboard(mainWindow);
+		const rows = mainWindow.locator('.workspace-dashboard__row');
+		const before = await rows.count();
+		const heights = await rows.evaluateAll((elements) =>
+			elements.map((element) => Math.round(element.getBoundingClientRect().height)),
+		);
+
+		await electronApp.evaluate(async ({ BrowserWindow }) => {
+			const [window] = BrowserWindow.getAllWindows();
+			const [, height] = window?.getSize() ?? [1200, 800];
+			window?.setSize(520, height ?? 800);
+		});
+		await expect
+			.poll(async () =>
+				mainWindow.evaluate(() => Math.round(window.innerWidth)),
+			)
+			.toBeLessThan(600);
+
+		await expect(rows).toHaveCount(before);
+		const narrowed = await rows.evaluateAll((elements) =>
+			elements.map((element) => Math.round(element.getBoundingClientRect().height)),
+		);
+		expect(narrowed).toEqual(heights);
+
+		// The title cell truncates rather than growing the row.
+		const title = mainWindow.locator('.workspace-dashboard__title').first();
+		await expect
+			.poll(() =>
+				title.evaluate((element) => element.scrollWidth > element.clientWidth),
+			)
+			.toBe(true);
+	});
+
+	test('activating a row lands on that project and panel', async ({
+		mainWindow,
+	}) => {
+		const firstProjectId = await activeProjectId(mainWindow);
+		await createStartedProject(mainWindow);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(2);
+		await expect(mainWindow.locator('[data-pending-project-id]')).toHaveCount(0);
+
+		await showDashboard(mainWindow);
+		await projectRow(mainWindow, firstProjectId).click();
+
+		await expect(dashboard(mainWindow)).toHaveCount(0);
+		await expect(mainWindow.locator('.project-tab--active')).toHaveAttribute(
+			'data-project-id',
+			firstProjectId,
+		);
+
+		await showDashboard(mainWindow);
+		const panelRow = panelRows(mainWindow).last();
+		const panelId = await panelRow.getAttribute('data-terminay-dashboard-panel');
+		await panelRow.click();
+
+		await expect(dashboard(mainWindow)).toHaveCount(0);
+		await expect(
+			mainWindow.locator('.project-workspace--active .terminal-panel'),
+		).toHaveCount(1);
+		expect(panelId).not.toBeNull();
+	});
+
+	test('a rename republishes the inventory the dashboard reads', async ({
+		mainWindow,
+	}) => {
+		const projectId = await activeProjectId(mainWindow);
+		await showDashboard(mainWindow);
+		await expect(projectRow(mainWindow, projectId)).toContainText('Project');
+
+		// Renaming happens on the project tab, which is still there behind Home.
+		await projectRow(mainWindow, projectId).click();
+		const editWindow = await openProjectEditWindow(mainWindow);
+		await editWindow.getByPlaceholder('Project name').fill('renamed-on-purpose');
+		await submitEditWindow(editWindow);
+
+		await showDashboard(mainWindow);
+		await expect(projectRow(mainWindow, projectId)).toContainText(
+			'renamed-on-purpose',
+		);
+	});
+
+	test('closing a project updates the dashboard in place', async ({
+		mainWindow,
+	}) => {
+		const firstProjectId = await activeProjectId(mainWindow);
+		await createStartedProject(mainWindow);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(2);
+		await expect(mainWindow.locator('[data-pending-project-id]')).toHaveCount(0);
+		const secondProjectId = await activeProjectId(mainWindow);
+
+		await showDashboard(mainWindow);
+		await expect(projectRow(mainWindow, secondProjectId)).toBeVisible();
+
+		await mainWindow
+			.locator(`.project-tab[data-project-id="${secondProjectId}"]`)
+			.locator('.project-tab-close')
+			.click();
+
+		// The row goes, and the dashboard stays selected.
+		await expect(projectRow(mainWindow, secondProjectId)).toHaveCount(0);
+		await expect(projectRow(mainWindow, firstProjectId)).toBeVisible();
+		await expect(mainWindow.locator('.app-shell')).toHaveAttribute(
+			'data-terminay-selected-view',
+			'home',
+		);
+	});
+
+	test('the Show Dashboard command works and Home survives a reload', async ({
+		mainWindow,
+	}) => {
+		await sendAppCommand(mainWindow, 'show-dashboard');
+		await expect(mainWindow.locator('.app-shell')).toHaveAttribute(
+			'data-terminay-selected-view',
+			'home',
+		);
+		await tabsSection(mainWindow).click();
+		await expect(dashboard(mainWindow)).toBeVisible();
+
+		await mainWindow.reload({ waitUntil: 'domcontentloaded' });
+
+		await expect(dashboard(mainWindow)).toBeVisible();
+		await expect(mainWindow.locator('.app-shell')).toHaveAttribute(
+			'data-terminay-selected-view',
+			'home',
+		);
+	});
+
+	test('dragging a project tab never displaces the Home control', async ({
+		electronApp,
+		mainWindow,
+	}) => {
+		await createStartedProject(mainWindow);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(2);
+		await expect(mainWindow.locator('[data-pending-project-id]')).toHaveCount(0);
+
+		const homeBox = await homeControl(mainWindow).boundingBox();
+		const orderBefore = await mainWindow
+			.locator('.project-tab')
+			.evaluateAll((tabs) => tabs.map((tab) => tab.getAttribute('data-project-id')));
+		if (!homeBox) throw new Error('Expected the Home control to have a layout box');
+
+		const dragged = mainWindow.locator('.project-tab').last();
+		const box = await dragged.boundingBox();
+		if (!box) throw new Error('Expected the project tab to have a layout box');
+
+		// Drag the last tab left, across the Home control and past it.
+		await mainWindow.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+		await mainWindow.mouse.down();
+		await mainWindow.mouse.move(homeBox.x - 8, box.y + box.height / 2, {
+			steps: 14,
+		});
+		await mainWindow.mouse.up();
+
+		const homeBoxAfter = await homeControl(mainWindow).boundingBox();
+		expect(homeBoxAfter?.x).toBeCloseTo(homeBox.x, 0);
+		await expect(homeControl(mainWindow)).toBeVisible();
+
+		const orderAfter = await mainWindow
+			.locator('.project-tab')
+			.evaluateAll((tabs) => tabs.map((tab) => tab.getAttribute('data-project-id')));
+		expect(orderAfter).toHaveLength(orderBefore.length);
+		expect(new Set(orderAfter)).toEqual(new Set(orderBefore));
+
+		// Squeezing the bar until the project tabs overflow must not push the
+		// Home control out with them: it is chrome, not a tab. It stays above
+		// the compact breakpoint, where the row hands Home to the switcher.
+		await electronApp.evaluate(async ({ BrowserWindow }) => {
+			const [window] = BrowserWindow.getAllWindows();
+			const [, height] = window?.getSize() ?? [1200, 800];
+			window?.setSize(700, height ?? 800);
+		});
+		await expect
+			.poll(async () =>
+				mainWindow.evaluate(() => Math.round(window.innerWidth)),
+			)
+			.toBeLessThan(720);
+
+		// The bar is laid out again as the window narrows, and on a busy runner
+		// that can still be under way once the width has settled: a box read
+		// then is missing. Hold the assertion until the layout is.
+		await expect(async () => {
+			await expect(homeControl(mainWindow)).toBeVisible();
+			const squeezed = await homeControl(mainWindow).boundingBox();
+			const barBox = await mainWindow.locator('.project-tabbar').boundingBox();
+			if (!squeezed || !barBox)
+				throw new Error('Expected the Home control and tab bar to have layout');
+			expect(squeezed.width).toBeGreaterThan(0);
+			expect(squeezed.x).toBeGreaterThanOrEqual(barBox.x - 1);
+			expect(squeezed.x + squeezed.width).toBeLessThanOrEqual(
+				barBox.x + barBox.width + 1,
+			);
+		}).toPass({ timeout: 10_000 });
+	});
+
+	test('the dashboard switches between its three views and remembers the choice', async ({
+		mainWindow,
+	}) => {
+		const projectId = await activeProjectId(mainWindow);
+		await showDashboard(mainWindow);
+
+		// Every view is an arrangement of the same projects, so the project is
+		// reachable in each of them.
+		await viewMode(mainWindow, 'projects').click();
+		await expect(dashboard(mainWindow)).toHaveAttribute(
+			'data-terminay-dashboard-view',
+			'projects',
+		);
+		await expect(
+			mainWindow.locator(
+				`[data-terminay-dashboard-project-card="${projectId}"]`,
+			),
+		).toBeVisible();
+
+		await viewMode(mainWindow, 'board').click();
+		await expect(dashboard(mainWindow)).toHaveAttribute(
+			'data-terminay-dashboard-view',
+			'board',
+		);
+		// A Board column with nothing in it is still shown: an empty column is a
+		// true statement about the workspace.
+		await expect(
+			mainWindow.locator('[data-terminay-dashboard-column]'),
+		).toHaveCount(5);
+		expect(
+			await mainWindow
+				.locator('[data-terminay-dashboard-column]')
+				.evaluateAll((columns) =>
+					columns.map((column) =>
+						column.getAttribute('data-terminay-dashboard-column'),
+					),
+				),
+		).toEqual(['idle', 'working', 'attention', 'done', 'untracked']);
+		await expect(
+			mainWindow.locator('[data-terminay-dashboard-column="idle"] .workspace-dashboard__card'),
+		).not.toHaveCount(0);
+
+		// Leaving Home and coming back keeps the remembered view.
+		await mainWindow.locator('.project-tab').first().click();
+		await expect(dashboard(mainWindow)).toHaveCount(0);
+		await homeControl(mainWindow).click();
+		await expect(dashboard(mainWindow)).toHaveAttribute(
+			'data-terminay-dashboard-view',
+			'board',
+		);
+
+		await viewMode(mainWindow, 'list').click();
+	});
+
+	test('the Board groups by project, keeps every card, and remembers it', async ({
+		mainWindow,
+	}) => {
+		const projectId = await activeProjectId(mainWindow);
+		const groupByProject = mainWindow.locator(
+			'[data-terminay-dashboard-group-by-project]',
+		);
+		const cards = mainWindow.locator('.workspace-dashboard__card');
+		await showDashboard(mainWindow);
+
+		// Grouping refines the Board, so nothing else offers it.
+		await expect(groupByProject).toHaveCount(0);
+		await viewMode(mainWindow, 'board').click();
+		await expect(groupByProject).not.toBeChecked();
+		const ungroupedCards = await cards.count();
+
+		await groupByProject.check();
+		const lane = mainWindow.locator(
+			`[data-terminay-dashboard-lane="${projectId}"]`,
+		);
+		await expect(lane).toBeVisible();
+		await expect(lane.locator('[data-terminay-dashboard-column]')).toHaveCount(
+			5,
+		);
+		expect(
+			await lane
+				.locator('[data-terminay-dashboard-column]')
+				.evaluateAll((columns) =>
+					columns.map((column) =>
+						column.getAttribute('data-terminay-dashboard-column'),
+					),
+				),
+		).toEqual(['idle', 'working', 'attention', 'done', 'untracked']);
+		await expect(cards).toHaveCount(ungroupedCards);
+
+		// Leaving Home and coming back keeps the grouping.
+		await mainWindow.locator('.project-tab').first().click();
+		await expect(dashboard(mainWindow)).toHaveCount(0);
+		await homeControl(mainWindow).click();
+		await expect(groupByProject).toBeChecked();
+		await expect(lane).toBeVisible();
+
+		// A lane heading activates its project, as a project heading does.
+		await lane.locator(`[data-terminay-dashboard-project="${projectId}"]`).click();
+		await expect(dashboard(mainWindow)).toHaveCount(0);
+		await expect(mainWindow.locator('.project-tab--active')).toHaveAttribute(
+			'data-project-id',
+			projectId,
+		);
+
+		await showDashboard(mainWindow);
+		await viewMode(mainWindow, 'board').click();
+		await groupByProject.uncheck();
+		await viewMode(mainWindow, 'list').click();
+	});
+
+	test('activating a card lands on its panel, exactly as a row does', async ({
+		mainWindow,
+	}) => {
+		const projectId = await activeProjectId(mainWindow);
+		await showDashboard(mainWindow);
+		await viewMode(mainWindow, 'projects').click();
+
+		const card = mainWindow
+			.locator(
+				`[data-terminay-dashboard-project-card="${projectId}"] .workspace-dashboard__card`,
+			)
+			.first();
+		await expect(card).toBeVisible();
+		await card.click();
+
+		await expect(dashboard(mainWindow)).toHaveCount(0);
+		await expect(mainWindow.locator('.project-tab--active')).toHaveAttribute(
+			'data-project-id',
+			projectId,
+		);
+		await expect(
+			mainWindow.locator('.project-workspace--active .terminal-panel'),
+		).toHaveCount(1);
+
+		await showDashboard(mainWindow);
+	});
+
+	test('a filter that matches nothing says so rather than looking like an empty workspace', async ({
+		mainWindow,
+	}) => {
+		const projectId = await activeProjectId(mainWindow);
+		await showDashboard(mainWindow);
+		await expect(projectRow(mainWindow, projectId)).toBeVisible();
+
+		await dashboardFilter(mainWindow).fill('nothing-matches-this-at-all');
+		await expect(projectRow(mainWindow, projectId)).toHaveCount(0);
+		await expect(
+			mainWindow.locator('.workspace-dashboard__empty'),
+		).toContainText('clear the filter');
+
+		await mainWindow
+			.locator('[data-terminay-dashboard-clear-filter]')
+			.click();
+		await expect(projectRow(mainWindow, projectId)).toBeVisible();
+	});
+
+	test('the summary counts the workspace', async ({ mainWindow }) => {
+		await showDashboard(mainWindow);
+		await expect(
+			mainWindow.locator('[data-terminay-dashboard-summary="idle"]'),
+		).toContainText('idle');
+		await expect(
+			mainWindow.locator('.workspace-dashboard__summary-projects'),
+		).toContainText('project');
+	});
+
+	test('an untracked tab reads idle everywhere and sits in a collapsed Untracked column', {
+		tag: HELD_SERVER_CLOCK,
+	}, async ({ electronApp, mainWindow, userDataDir }) => {
+		// Activity is judged on the server's clock, which the test holds.
+		const clock = serverClock(electronApp);
+		const bell = await commandGate(userDataDir);
+		const firstSessionId = await activeTerminalSessionId(mainWindow);
+		await sendAppCommand(mainWindow, 'new-terminal');
+		const tabs = mainWindow.locator(
+			'.project-workspace--active .terminal-tab-content',
+		);
+		await expect(tabs).toHaveCount(2);
+		const quietTab = tabs.filter({ hasText: 'Terminal 2' });
+		const firstTab = tabs.filter({ hasText: 'Terminal 1' });
+
+		await quietTab.click();
+		const quietSessionId = await activeTerminalSessionId(mainWindow);
+		// A command that rings the bell and finishes once it is in the background:
+		// attention and finished activity, neither of which may show. It is typed
+		// now and goes on once the test opens its gate: after activity is turned
+		// off for the tab, long after the typing, with the user on the other tab;
+		// and then a whole settle period goes by.
+		const command = `${bell.wait}; printf '\\a'; printf 'quiet-%s\\n' rang`;
+		await typeInVisibleTerminal(mainWindow, `${command}\r`, quietSessionId);
+		await commandArrived(electronApp, quietSessionId, command);
+
+		await quietTab.click({ button: 'right' });
+		await contextMenuItem(mainWindow, 'Open Settings').click();
+		const trackActivity = mainWindow.getByLabel('Track activity');
+		await expect(trackActivity).toBeChecked();
+		await trackActivity.uncheck();
+		await submitEditWindow(mainWindow);
+		// Closing the editor gives the terminal it edited its focus back; the
+		// user moves on from there.
+		await expect(
+			terminalPanelForSession(mainWindow, quietSessionId).locator(
+				'.xterm-helper-textarea',
+			),
+		).toBeFocused();
+		await firstTab.click();
+		await expect(
+			terminalPanelForSession(mainWindow, firstSessionId).locator(
+				'.xterm-helper-textarea',
+			),
+		).toBeFocused();
+		await clock.advance(INPUT_QUIET_MS);
+		await bell.open();
+		await expect.poll(() => clock.output(quietSessionId)).toContain('quiet-rang');
+		await clock.advance(INPUT_QUIET_MS);
+		await endSettlePeriod(electronApp);
+		expect(await clock.notifications()).toMatchObject({ published: 0 });
+
+		await expect(quietTab).toHaveAttribute('data-terminal-activity', 'viewed');
+		await expect(mainWindow.locator('.notifications-count')).toHaveCount(0);
+
+		// List: the tab is there, idle.
+		await showDashboard(mainWindow);
+		const quietRow = mainWindow.locator(
+			`[data-terminay-dashboard-panel]:has-text("Terminal 2")`,
+		);
+		await expect(quietRow).toHaveAttribute(
+			'data-terminay-dashboard-status',
+			'idle',
+		);
+		await expect(
+			mainWindow.locator('[data-terminay-dashboard-summary="untracked"]'),
+		).toContainText('1');
+
+		// Board: only in Untracked, which starts collapsed and says it holds one.
+		await viewMode(mainWindow, 'board').click();
+		const untracked = mainWindow.locator(
+			'[data-terminay-dashboard-column="untracked"]',
+		);
+		const toggle = untracked.locator(
+			'[data-terminay-dashboard-untracked-toggle]',
+		);
+		await expect(untracked).toHaveAttribute(
+			'data-terminay-dashboard-column-collapsed',
+			'true',
+		);
+		await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+		await expect(toggle).toHaveAttribute('aria-label', /Untracked, 1 tab/);
+		await expect(
+			mainWindow.locator('.workspace-dashboard__card:has-text("Terminal 2")'),
+		).toHaveCount(0);
+
+		await toggle.click();
+		await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+		await expect(
+			untracked.locator('.workspace-dashboard__card:has-text("Terminal 2")'),
+		).toBeVisible();
+		await expect(
+			mainWindow.locator(
+				'[data-terminay-dashboard-column]:not([data-terminay-dashboard-column="untracked"]) .workspace-dashboard__card:has-text("Terminal 2")',
+			),
+		).toHaveCount(0);
+
+		// Opening it is remembered on this device.
+		await mainWindow.reload({ waitUntil: 'domcontentloaded' });
+		await expect(dashboard(mainWindow)).toBeVisible();
+		await expect(untracked).toHaveAttribute(
+			'data-terminay-dashboard-column-collapsed',
+			'false',
+		);
+
+		await toggle.click();
+		await viewMode(mainWindow, 'list').click();
+	});
+});

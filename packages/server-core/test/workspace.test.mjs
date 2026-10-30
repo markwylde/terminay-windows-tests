@@ -1,0 +1,321 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { assertJsonValue } from "@terminay/protocol";
+import { WORKSPACE_SCHEMA_VERSION, WorkspaceStore, canonicalizeWorkspaceState, createInitialWorkspace, defaultWorkspaceSidebarState, migrateWorkspaceState, validateWorkspace } from "../dist/index.js";
+
+test("workspace store creates, moves, and atomically commits canonical objects", () => {
+  const store = new WorkspaceStore(createInitialWorkspace("server-a"));
+  const view = store.state.viewOrder[0];
+  const created = store.apply({ commandId: "create-project", expectedRevision: 0, command: { type: "project.create", projectId: "project-a", viewId: view, root: "/tmp/a", name: "A" } });
+  assert.equal(created.ok, true);
+  const second = store.apply({ commandId: "create-view", expectedRevision: 1, command: { type: "view.create", viewId: "view-b", name: "B" } });
+  assert.equal(second.ok, true);
+  const moved = store.apply({ commandId: "move-project", expectedRevision: 2, command: { type: "project.move", projectId: "project-a", targetViewId: "view-b" } });
+  assert.equal(moved.ok, true);
+  assert.equal(store.state.projects["project-a"].viewId, "view-b");
+  assert.equal(store.state.views[view].projectIds.includes("project-a"), false);
+  assert.equal(store.state.views["view-b"].projectIds.includes("project-a"), true);
+  assert.equal(Object.hasOwn(store.state.views[view], "activeProjectId"), false);
+  assertJsonValue(store.state);
+  assert.deepEqual(store.delta(0).events.map((event) => event.revision), [1, 2, 3]);
+  const bounded = new WorkspaceStore(createInitialWorkspace("server-b"), { maxHistory: 1 });
+  bounded.apply({ commandId: "v", command: { type: "view.create", viewId: "view-c", name: "C" } });
+  bounded.apply({ commandId: "w", command: { type: "view.create", viewId: "view-d", name: "D" } });
+  assert.deepEqual(bounded.delta(0).events, []);
+  assert.equal(bounded.delta(0).state.revision, 2);
+  validateWorkspace(store.state);
+});
+
+test("workspace store rejects stale and cross-scope mutations, and replays duplicate ids", () => {
+  const store = new WorkspaceStore(createInitialWorkspace("server-a"));
+  const view = store.state.viewOrder[0];
+  const first = { commandId: "same", expectedRevision: 0, command: { type: "project.create", projectId: "project-a", viewId: view, root: "/tmp/a", name: "A" } };
+  const committed = store.apply(first);
+  assert.equal(store.apply(first).ok, true);
+  assert.deepEqual(store.apply(first), committed);
+  const stale = store.apply({ commandId: "stale", expectedRevision: 0, command: { type: "view.rename", viewId: view, name: "stale" } });
+  assert.equal(stale.ok, false);
+  const invalid = store.apply({ commandId: "bad-panel", expectedRevision: 1, command: { type: "panel.reorder", projectId: "project-a", panelIds: ["other-project-panel"] } });
+  assert.equal(invalid.ok, false);
+});
+
+test("project sidebar state is independently durable, bounded, and migrates with its project", () => {
+  const store = new WorkspaceStore(createInitialWorkspace("server-a"));
+  const viewId = store.state.viewOrder[0];
+  assert.equal(store.apply({ commandId: "project-a", command: { type: "project.create", projectId: "project-a", viewId, root: "/tmp/a", name: "A" } }).ok, true);
+  assert.equal(store.apply({ commandId: "project-b", command: { type: "project.create", projectId: "project-b", viewId, root: "/tmp/b", name: "B" } }).ok, true);
+  const updated = store.apply({ commandId: "sidebar-a", command: { type: "project.sidebar.update", projectId: "project-a", sidebar: {
+    isFileExplorerOpen: true,
+    isExplorerPaneCollapsed: true,
+    sidebarPanelOrder: ["git", "explorer", "agents", "documentation"],
+    expandedDocumentationFolderIds: ["specs/features"],
+  } } });
+  assert.equal(updated.ok, true);
+  assert.equal(store.state.projects["project-a"].sidebar.isFileExplorerOpen, true);
+  assert.equal(store.state.projects["project-a"].sidebar.isExplorerPaneCollapsed, true);
+  assert.deepEqual(store.state.projects["project-a"].sidebar.sidebarPanelOrder, ["git", "explorer", "agents", "documentation"]);
+  assert.deepEqual(store.state.projects["project-b"].sidebar, defaultWorkspaceSidebarState());
+  const beforeInvalid = store.state.revision;
+  assert.equal(store.apply({ commandId: "invalid-sidebar", command: { type: "project.sidebar.update", projectId: "project-a", sidebar: { sidebarPanelOrder: ["explorer"] } } }).ok, false);
+  assert.equal(store.state.revision, beforeInvalid);
+
+  const previousVersion = { ...store.state, schemaVersion: 4 };
+  assert.throws(() => migrateWorkspaceState(previousVersion, "server-a"), /unsupported workspace schema/);
+});
+
+test("sidebar width is the device's: a stored width is dropped and a width patch is refused", () => {
+  const store = new WorkspaceStore(createInitialWorkspace("server-a"));
+  const viewId = store.state.viewOrder[0];
+  assert.equal(store.apply({ commandId: "project-a", command: { type: "project.create", projectId: "project-a", viewId, root: "/tmp/a", name: "A" } }).ok, true);
+  const project = store.state.projects["project-a"];
+  const stored = {
+    ...store.state,
+    projects: { ...store.state.projects, "project-a": { ...project, sidebar: { ...project.sidebar, fileExplorerWidth: 340 } } },
+  };
+  const loaded = migrateWorkspaceState(stored, "server-a");
+  assert.equal(Object.hasOwn(loaded.projects["project-a"].sidebar, "fileExplorerWidth"), false);
+  assert.deepEqual(loaded.projects["project-a"].sidebar, defaultWorkspaceSidebarState());
+
+  const before = store.state.revision;
+  assert.equal(store.apply({ commandId: "width", command: { type: "project.sidebar.update", projectId: "project-a", sidebar: { fileExplorerWidth: 300 } } }).ok, false);
+  assert.equal(store.state.revision, before);
+});
+
+test("restart recovery marks running sessions interrupted without changing identity", () => {
+  const store = new WorkspaceStore(createInitialWorkspace("server-a"));
+  const snapshot = store.state;
+  const projectId = "project-a"; const viewId = snapshot.viewOrder[0];
+  const project = store.apply({ commandId: "project", command: { type: "project.create", projectId, viewId, root: "/tmp/a", name: "A" } });
+  assert.equal(project.ok, true);
+  const state = store.state;
+  // The committed state is frozen, so a persisted repository load is modelled
+  // by a fresh valid state built from it.
+  const loaded = new WorkspaceStore({ ...state, terminalSessions: { "session-a": { id: "session-a", serverId: "server-a", projectId, status: "running", createdAt: 1, outputPosition: 4 } } });
+  const interrupted = loaded.markInterruptedSessions(10);
+  assert.equal(interrupted.terminalSessions["session-a"].status, "interrupted");
+  assert.equal(interrupted.terminalSessions["session-a"].id, "session-a");
+  assert.equal(interrupted.revision, 2);
+});
+
+test("terminal session identity survives panel creation and project moves", () => {
+  const store = new WorkspaceStore(createInitialWorkspace("server-a"));
+  const viewId = store.state.viewOrder[0];
+  assert.equal(store.apply({ commandId: "project", command: { type: "project.create", projectId: "project-a", viewId, root: "/tmp/a", name: "A" } }).ok, true);
+  const launch = { profileId: "profile-zsh", profileRevision: 4, profileName: "Zsh", targetSummary: "zsh", workspaceRevision: 1, settingsRevision: 4, icon: "terminal", color: "#112233" };
+  assert.equal(store.apply({ commandId: "session", command: { type: "terminal.create", sessionId: "session-a", projectId: "project-a", createdAt: 1, launch } }).ok, true);
+  const panel = { id: "panel-a", projectId: "project-a", type: "terminal", sessionId: "session-a", createdAt: 1 };
+  assert.equal(store.apply({ commandId: "panel", command: { type: "panel.create", panel } }).ok, true);
+  assert.equal(store.apply({ commandId: "view", command: { type: "view.create", viewId: "view-b", name: "B" } }).ok, true);
+  assert.equal(store.apply({ commandId: "move", command: { type: "project.move", projectId: "project-a", targetViewId: "view-b" } }).ok, true);
+  assert.equal(store.state.panels["panel-a"].projectId, "project-a");
+  assert.equal(store.state.panels["panel-a"].sessionId, "session-a");
+  assert.equal(store.state.terminalSessions["session-a"].id, "session-a");
+  assert.deepEqual(store.state.terminalSessions["session-a"].launch, launch);
+});
+
+test("PTY exit marks the canonical workspace session exited", () => {
+  const store = new WorkspaceStore(createInitialWorkspace("server-a"));
+  const viewId = store.state.viewOrder[0];
+  assert.equal(store.apply({ commandId: "project", command: { type: "project.create", projectId: "project-a", viewId, root: "/tmp/a", name: "A" } }).ok, true);
+  assert.equal(store.apply({ commandId: "terminal", command: { type: "terminal.createPanel", sessionId: "session-a", projectId: "project-a", panelId: "panel-a", title: "Terminal 1", cwd: "/tmp/a", createdAt: 1 } }).ok, true);
+  const exited = store.apply({ commandId: "exit", command: { type: "terminal.markExited", sessionId: "session-a", exitCode: 0 } });
+  assert.equal(exited.ok, true);
+  assert.equal(store.state.terminalSessions["session-a"].status, "exited");
+  assert.equal(store.state.terminalSessions["session-a"].exitCode, 0);
+  assert.equal(store.state.panels["panel-a"].sessionId, "session-a");
+  const again = store.apply({ commandId: "exit-again", command: { type: "terminal.markExited", sessionId: "session-a", exitCode: 1 } });
+  assert.equal(again.ok, true);
+  assert.equal(store.state.terminalSessions["session-a"].exitCode, 0);
+  const missing = store.apply({ commandId: "exit-missing", command: { type: "terminal.markExited", sessionId: "session-missing" } });
+  assert.equal(missing.ok, true);
+});
+
+test("project close cascades panels and terminal session records", () => {
+  const store = new WorkspaceStore(createInitialWorkspace("server-a"));
+  const viewId = store.state.viewOrder[0];
+  assert.equal(store.apply({ commandId: "project-a", command: { type: "project.create", projectId: "project-a", viewId, root: "/tmp/a", name: "A" } }).ok, true);
+  assert.equal(store.apply({ commandId: "project-b", command: { type: "project.create", projectId: "project-b", viewId, root: "/tmp/b", name: "B" } }).ok, true);
+  assert.equal(store.apply({ commandId: "terminal", command: { type: "terminal.createPanel", sessionId: "session-a", projectId: "project-a", panelId: "panel-terminal", title: "Terminal 1", cwd: "/tmp/a", createdAt: 1 } }).ok, true);
+  assert.equal(store.apply({ commandId: "file-panel", command: { type: "panel.create", panel: { id: "panel-file", projectId: "project-a", type: "file", path: "README.md", createdAt: 2 } } }).ok, true);
+
+  const closed = store.apply({ commandId: "close-project-a", command: { type: "project.close", projectId: "project-a" } });
+
+  assert.equal(closed.ok, true);
+  assert.equal(store.state.projects["project-a"], undefined);
+  assert.equal(store.state.panels["panel-terminal"], undefined);
+  assert.equal(store.state.panels["panel-file"], undefined);
+  assert.equal(store.state.terminalSessions["session-a"], undefined);
+  assert.deepEqual(store.state.views[viewId].projectIds, ["project-b"]);
+  assert.equal(store.state.views[viewId].activeProjectId, "project-b");
+  validateWorkspace(store.state);
+});
+
+test("terminal panel close removes the terminal session record", () => {
+  const store = new WorkspaceStore(createInitialWorkspace("server-a"));
+  const viewId = store.state.viewOrder[0];
+  assert.equal(store.apply({ commandId: "project", command: { type: "project.create", projectId: "project-a", viewId, root: "/tmp/a", name: "A" } }).ok, true);
+  assert.equal(store.apply({ commandId: "terminal-1", command: { type: "terminal.createPanel", sessionId: "session-1", projectId: "project-a", panelId: "panel-1", title: "Terminal 1", cwd: "/tmp/a", createdAt: 1 } }).ok, true);
+  assert.equal(store.apply({ commandId: "terminal-2", command: { type: "terminal.createPanel", sessionId: "session-2", projectId: "project-a", panelId: "panel-2", title: "Terminal 2", cwd: "/tmp/a", createdAt: 2 } }).ok, true);
+  assert.equal(store.apply({ commandId: "terminal-3", command: { type: "terminal.createPanel", sessionId: "session-3", projectId: "project-a", panelId: "panel-3", title: "Terminal 3", cwd: "/tmp/a", createdAt: 3 } }).ok, true);
+
+  const closed = store.apply({ commandId: "close-panel-2", command: { type: "panel.close", panelId: "panel-2" } });
+
+  assert.equal(closed.ok, true);
+  assert.equal(store.state.panels["panel-2"], undefined);
+  assert.equal(store.state.terminalSessions["session-2"], undefined);
+  assert.deepEqual(store.state.projects["project-a"].panelIds, ["panel-1", "panel-3"]);
+  assert.deepEqual(Object.keys(store.state.terminalSessions).sort(), ["session-1", "session-3"]);
+  validateWorkspace(store.state);
+});
+
+test("empty project and view selections remain valid JSON after final removals", () => {
+  const store = new WorkspaceStore(createInitialWorkspace("server-a"));
+  const viewId = store.state.viewOrder[0];
+  assert.equal(store.apply({ commandId: "project", command: { type: "project.create", projectId: "project-a", viewId, root: "/tmp/a", name: "A" } }).ok, true);
+  assert.equal(store.apply({ commandId: "terminal", command: { type: "terminal.createPanel", sessionId: "session-a", projectId: "project-a", panelId: "panel-a", title: "Terminal 1", cwd: "/tmp/a", createdAt: 1 } }).ok, true);
+
+  assert.equal(store.apply({ commandId: "close-panel", command: { type: "panel.close", panelId: "panel-a" } }).ok, true);
+  assert.deepEqual(store.state.projects["project-a"].panelIds, []);
+  assert.equal(Object.hasOwn(store.state.projects["project-a"], "activePanelId"), false);
+  assertJsonValue(store.state);
+
+  assert.equal(store.apply({ commandId: "close-project", command: { type: "project.close", projectId: "project-a" } }).ok, true);
+  assert.deepEqual(store.state.views[viewId].projectIds, []);
+  assert.equal(Object.hasOwn(store.state.views[viewId], "activeProjectId"), false);
+  assertJsonValue(store.state);
+});
+
+test("moving the final panel omits the empty source project's active selection", () => {
+  const store = new WorkspaceStore(createInitialWorkspace("server-a"));
+  const viewId = store.state.viewOrder[0];
+  for (const projectId of ["project-a", "project-b"]) {
+    assert.equal(store.apply({ commandId: projectId, command: { type: "project.create", projectId, viewId, root: `/tmp/${projectId}`, name: projectId } }).ok, true);
+  }
+  assert.equal(store.apply({ commandId: "terminal", command: { type: "terminal.createPanel", sessionId: "session-a", projectId: "project-a", panelId: "panel-a", title: "Terminal 1", cwd: "/tmp/project-a", createdAt: 1 } }).ok, true);
+
+  assert.equal(store.apply({ commandId: "move-panel", command: { type: "panel.move", panelId: "panel-a", targetProjectId: "project-b" } }).ok, true);
+  assert.deepEqual(store.state.projects["project-a"].panelIds, []);
+  assert.equal(Object.hasOwn(store.state.projects["project-a"], "activePanelId"), false);
+  assertJsonValue(store.state);
+});
+
+test("two client command streams get one ordered commit and one explicit stale conflict", () => {
+  const store = new WorkspaceStore(createInitialWorkspace("server-a"));
+  const defaultView = store.state.viewOrder[0];
+  const clientOne = store.apply({ commandId: "client-one", expectedRevision: 0, command: { type: "view.create", viewId: "view-b", name: "B" } });
+  assert.equal(clientOne.ok, true);
+  const clientTwo = store.apply({ commandId: "client-two", expectedRevision: 1, command: { type: "project.create", projectId: "project-a", viewId: defaultView, root: "/tmp/a", name: "A" } });
+  assert.equal(clientTwo.ok, true);
+  const stale = store.apply({ commandId: "client-one-stale", expectedRevision: 1, command: { type: "view.rename", viewId: defaultView, name: "Old revision" } });
+  assert.equal(stale.ok, false);
+  assert.equal(store.state.revision, 2);
+});
+
+test("v0 workspace snapshots migrate idempotently without terminal content", () => {
+  const migrated = migrateWorkspaceState({ schemaVersion: 0, serverId: "server-a", projects: { "project-a": { root: "/tmp/a", name: "A", output: "must-not-copy" } } }, "fallback");
+  assert.equal(migrated.schemaVersion, WORKSPACE_SCHEMA_VERSION);
+  assert.equal(migrated.projects["project-a"].root, "/tmp/a");
+  assert.equal(Object.keys(migrated.terminalSessions).length, 0);
+  assert.deepEqual(migrateWorkspaceState(migrated, "fallback"), migrated);
+  validateWorkspace(migrated);
+});
+
+test("a snapshot older than the last migratable version is refused rather than migrated", () => {
+  const store = new WorkspaceStore(createInitialWorkspace("server-a"));
+  const viewId = store.state.viewOrder[0];
+  store.apply({ commandId: "project", command: { type: "project.create", projectId: "project-a", viewId, root: "/tmp/a", name: "A" } });
+  store.apply({ commandId: "terminal", command: { type: "terminal.createPanel", projectId: "project-a", sessionId: "session-a", panelId: "panel-a", createdAt: 1 } });
+  for (const schemaVersion of [1, 2, 3, 4])
+    assert.throws(() => migrateWorkspaceState({ ...store.state, schemaVersion }, "fallback"), /unsupported workspace schema/);
+});
+
+test("a record carrying a removed environment field is rejected as unknown", () => {
+  const store = new WorkspaceStore(createInitialWorkspace("server-a"));
+  const viewId = store.state.viewOrder[0];
+  store.apply({ commandId: "project", command: { type: "project.create", projectId: "project-a", viewId, root: "/tmp/a", name: "A" } });
+  store.apply({ commandId: "terminal", command: { type: "terminal.createPanel", projectId: "project-a", sessionId: "session-a", panelId: "panel-a", createdAt: 1 } });
+  const state = store.state;
+  assert.throws(() => validateWorkspace({ ...state, projects: { ...state.projects, "project-a": { ...state.projects["project-a"], projectEnvironmentId: "terminay:this-server" } } }), /unknown field: projectEnvironmentId/);
+  assert.throws(() => validateWorkspace({ ...state, projects: { ...state.projects, "project-a": { ...state.projects["project-a"], environmentRevision: 1 } } }), /unknown field: environmentRevision/);
+  assert.throws(() => validateWorkspace({ ...state, terminalSessions: { ...state.terminalSessions, "session-a": { ...state.terminalSessions["session-a"], projectEnvironmentId: "ssh:forged" } } }), /unknown field: projectEnvironmentId/);
+});
+
+test("canonical persistence strips transient renderer fields and terminal content", () => {
+  const initial = createInitialWorkspace("server-a");
+  const viewId = initial.viewOrder[0];
+  const state = {
+    ...initial,
+    views: { ...initial.views, [viewId]: { ...initial.views[viewId], modal: "rename", hover: "panel-a", search: "secret query" } },
+    projects: {},
+    panels: {},
+    terminalSessions: {},
+    dragGeometry: { x: 1, y: 2 },
+    terminalOutput: "must-not-persist",
+  };
+  const canonical = canonicalizeWorkspaceState(state);
+  assert.equal("dragGeometry" in canonical, false);
+  assert.equal("terminalOutput" in canonical, false);
+  assert.equal("modal" in canonical.views[viewId], false);
+  assert.equal("hover" in canonical.views[viewId], false);
+  assert.equal("search" in canonical.views[viewId], false);
+  validateWorkspace(canonical);
+});
+
+test("project creation assigns unique default names and reuses freed numbers", () => {
+  const store = new WorkspaceStore(createInitialWorkspace("server-a"));
+  const view = store.state.viewOrder[0];
+  const create = (projectId) =>
+    store.apply({ commandId: `create-${projectId}`, command: { type: "project.create", projectId, viewId: view, root: "/tmp" } });
+
+  for (const id of ["p1", "p2", "p3"]) assert.equal(create(id).ok, true);
+  assert.deepEqual(["p1", "p2", "p3"].map((id) => store.state.projects[id].name), ["Project 1", "Project 2", "Project 3"]);
+
+  assert.equal(store.apply({ commandId: "close-p2", command: { type: "project.close", projectId: "p2" } }).ok, true);
+  assert.equal(create("p4").ok, true);
+  assert.equal(store.state.projects["p4"].name, "Project 2", "Expected the freed number to be reused.");
+
+  const names = Object.values(store.state.projects).map((project) => project.name);
+  assert.equal(new Set(names).size, names.length, `Expected unique names, got ${names.join(", ")}.`);
+});
+
+test("ten successive creations produce ten distinct default names", () => {
+  const store = new WorkspaceStore(createInitialWorkspace("server-a"));
+  const view = store.state.viewOrder[0];
+  for (let index = 0; index < 10; index += 1)
+    assert.equal(store.apply({ commandId: `create-${index}`, command: { type: "project.create", projectId: `p${index}`, viewId: view, root: "/tmp" } }).ok, true);
+  const names = Object.values(store.state.projects).map((project) => project.name);
+  assert.equal(names.length, 10);
+  assert.equal(new Set(names).size, 10, `Expected ten distinct names, got ${names.join(", ")}.`);
+});
+
+test("the seeded default project holds the first number", () => {
+  const store = new WorkspaceStore(createInitialWorkspace("server-a"));
+  const view = store.state.viewOrder[0];
+  // Hydration seeds a project named plain "Project"; it occupies slot 1, so the
+  // first project a user creates is "Project 2".
+  assert.equal(store.apply({ commandId: "seed", command: { type: "project.create", projectId: "default", viewId: view, root: "/tmp", name: "Project" } }).ok, true);
+  assert.equal(store.apply({ commandId: "c1", command: { type: "project.create", projectId: "p1", viewId: view, root: "/tmp" } }).ok, true);
+  assert.equal(store.state.projects["p1"].name, "Project 2");
+  assert.equal(store.apply({ commandId: "c2", command: { type: "project.create", projectId: "p2", viewId: view, root: "/tmp" } }).ok, true);
+  assert.equal(store.state.projects["p2"].name, "Project 3");
+});
+
+test("supplied project names are stored as given and non-numeric names reserve nothing", () => {
+  const store = new WorkspaceStore(createInitialWorkspace("server-a"));
+  const view = store.state.viewOrder[0];
+  assert.equal(store.apply({ commandId: "c1", command: { type: "project.create", projectId: "p1", viewId: view, root: "/tmp", name: "Project Apollo" } }).ok, true);
+  assert.equal(store.state.projects["p1"].name, "Project Apollo");
+
+  // "Project Apollo" is not the bare seed name and carries no number, so it
+  // reserves nothing and the next default still starts at 1.
+  assert.equal(store.apply({ commandId: "c2", command: { type: "project.create", projectId: "p2", viewId: view, root: "/tmp" } }).ok, true);
+  assert.equal(store.state.projects["p2"].name, "Project 1");
+
+  // A blank name falls back to the derived default rather than being rejected.
+  assert.equal(store.apply({ commandId: "c3", command: { type: "project.create", projectId: "p3", viewId: view, root: "/tmp", name: "   " } }).ok, true);
+  assert.equal(store.state.projects["p3"].name, "Project 2");
+
+  // A user may rename onto a duplicate; uniqueness governs the default only.
+  assert.equal(store.apply({ commandId: "r1", command: { type: "project.rename", projectId: "p3", name: "Project 1" } }).ok, true);
+  assert.equal(store.state.projects["p3"].name, "Project 1");
+});

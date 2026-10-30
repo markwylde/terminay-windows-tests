@@ -1,0 +1,330 @@
+import { chmod, mkdir, unlink } from 'node:fs/promises';
+import {
+	createConnection,
+	createServer,
+	type Server,
+	type Socket,
+} from 'node:net';
+import { dirname, join } from 'node:path';
+import type { PendingEnrollmentApprovalSummary } from './serverExposure.js';
+
+/**
+ * Headless approval for standalone servers. The data root is the trust
+ * boundary (owner-only permissions), so a stream socket inside it is the
+ * operator's channel: `terminay-server approve <id>` connects, sends one
+ * JSON line, and reads one JSON line back. No token crosses, no network
+ * listener exists, and the payload never carries device keys or secrets.
+ */
+
+export const APPROVAL_SOCKET_FILENAME = 'approval.sock';
+const MAX_FRAME_BYTES = 4 * 1024;
+const REQUEST_TIMEOUT_MS = 10_000;
+const APPROVAL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+
+export type ApprovalSocketRequest =
+	| Readonly<{ op: 'list' }>
+	| Readonly<{ op: 'approve'; approvalId: string }>
+	| Readonly<{ op: 'deny'; approvalId: string }>
+	| Readonly<{ op: 'pairing'; rotate?: boolean }>
+	| Readonly<{ op: 'status' }>;
+
+/**
+ * What a running server says about itself to its operator: whether it is
+ * ready, which build it is, and how it expects to be reached. It is service
+ * metadata only — no path, key, device record, or pairing material — because
+ * a status report is exactly the sort of thing that ends up pasted into an
+ * issue.
+ */
+export interface ServerStatusSummary {
+	readonly ready: boolean;
+	readonly version: string;
+	readonly revision?: string;
+	readonly exposeModes: readonly string[];
+	readonly publicHost?: string;
+	readonly advertiseAddress?: string;
+}
+
+/** One live pairing handoff, as the running server currently advertises it.
+ * The secret lives in the URL fragment and nowhere else; no host key, device
+ * record, or application credential is carried here. */
+export interface PairingHandoffSummary {
+	readonly mode: string;
+	readonly pairingUrl: string;
+	readonly pairingExpiresAt: string;
+	readonly serverId: string;
+}
+
+export type ApprovalSocketResponse =
+	| Readonly<{ ok: true; pending: readonly PendingEnrollmentApprovalSummary[] }>
+	| Readonly<{
+			ok: true;
+			approvalId: string;
+			outcome: 'approved' | 'denied';
+			deviceName: string;
+	  }>
+	| Readonly<{
+			ok: true;
+			exposure: readonly string[] | 'off';
+			handoffs: readonly PairingHandoffSummary[];
+	  }>
+	| Readonly<{ ok: true; status: ServerStatusSummary }>
+	| Readonly<{ ok: false; error: string }>;
+
+export interface ApprovalSocketAuthority {
+	listPendingApprovals(): readonly PendingEnrollmentApprovalSummary[];
+	approveEnrollment(
+		approvalId: string,
+	):
+		| Readonly<{ deviceName: string }>
+		| Promise<Readonly<{ deviceName: string }>>;
+	denyEnrollment(
+		approvalId: string,
+	):
+		| Readonly<{ deviceName: string }>
+		| Promise<Readonly<{ deviceName: string }>>;
+	/** Live pairing handoffs, optionally after minting a replacement room.
+	 * Absent when the process composing the socket has no exposure at all. */
+	pairingHandoffs?(
+		rotate: boolean,
+	):
+		| Promise<readonly PairingHandoffSummary[]>
+		| readonly PairingHandoffSummary[];
+	/** Exposure modes the administrator enabled for this data root. */
+	exposureModes?(): readonly string[];
+	/** Readiness, build, and reachability of the server composing the socket. */
+	serverStatus?(): ServerStatusSummary;
+}
+
+export function approvalSocketPath(dataRoot: string): string {
+	return join(dataRoot, APPROVAL_SOCKET_FILENAME);
+}
+
+export function parseApprovalSocketRequest(
+	value: unknown,
+): ApprovalSocketRequest {
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+		throw new Error('approval request is invalid');
+	}
+	const input = value as Record<string, unknown>;
+	if (input.op === 'list') {
+		if (Object.keys(input).length !== 1)
+			throw new Error('approval request is invalid');
+		return Object.freeze({ op: 'list' });
+	}
+	if (input.op === 'status') {
+		if (Object.keys(input).length !== 1)
+			throw new Error('approval request is invalid');
+		return Object.freeze({ op: 'status' });
+	}
+	if (input.op === 'pairing') {
+		if (Object.keys(input).some((key) => key !== 'op' && key !== 'rotate')) {
+			throw new Error('approval request is invalid');
+		}
+		const rotate = input.rotate;
+		if (rotate !== undefined && typeof rotate !== 'boolean') {
+			throw new Error('approval request is invalid');
+		}
+		return rotate === undefined
+			? Object.freeze({ op: 'pairing' as const })
+			: Object.freeze({ op: 'pairing' as const, rotate });
+	}
+	if (input.op === 'approve' || input.op === 'deny') {
+		if (
+			Object.keys(input).length !== 2 ||
+			typeof input.approvalId !== 'string' ||
+			!APPROVAL_ID.test(input.approvalId)
+		) {
+			throw new Error('approval request is invalid');
+		}
+		return Object.freeze({ op: input.op, approvalId: input.approvalId });
+	}
+	throw new Error('approval request is invalid');
+}
+
+export async function handleApprovalSocketRequest(
+	request: ApprovalSocketRequest,
+	authority: ApprovalSocketAuthority,
+): Promise<ApprovalSocketResponse> {
+	try {
+		if (request.op === 'list')
+			return Object.freeze({
+				ok: true,
+				pending: authority.listPendingApprovals(),
+			});
+		if (request.op === 'status') {
+			if (authority.serverStatus === undefined)
+				throw new Error('this server does not report its status');
+			// Rebuilt field by field, so nothing an authority happens to carry
+			// beside these six can ride out with them.
+			const status = authority.serverStatus();
+			return Object.freeze({
+				ok: true,
+				status: Object.freeze({
+					ready: status.ready === true,
+					version: status.version,
+					...(status.revision === undefined
+						? {}
+						: { revision: status.revision }),
+					exposeModes: Object.freeze([...status.exposeModes]),
+					...(status.publicHost === undefined
+						? {}
+						: { publicHost: status.publicHost }),
+					...(status.advertiseAddress === undefined
+						? {}
+						: { advertiseAddress: status.advertiseAddress }),
+				}),
+			});
+		}
+		if (request.op === 'pairing') {
+			const modes = authority.exposureModes?.() ?? [];
+			// A server nobody exposed says so rather than handing back a URL that
+			// no relay would route.
+			if (modes.length === 0 || authority.pairingHandoffs === undefined) {
+				return Object.freeze({
+					ok: true,
+					exposure: 'off',
+					handoffs: Object.freeze([]),
+				});
+			}
+			const handoffs = await authority.pairingHandoffs(request.rotate === true);
+			return Object.freeze({
+				ok: true,
+				exposure: Object.freeze([...modes]),
+				handoffs: Object.freeze([...handoffs]),
+			});
+		}
+		const resolved = await (request.op === 'approve'
+			? authority.approveEnrollment(request.approvalId)
+			: authority.denyEnrollment(request.approvalId));
+		return Object.freeze({
+			ok: true,
+			approvalId: request.approvalId,
+			outcome: request.op === 'approve' ? 'approved' : 'denied',
+			deviceName: resolved.deviceName,
+		});
+	} catch (error) {
+		return Object.freeze({
+			ok: false,
+			error: error instanceof Error ? error.message : 'approval failed',
+		});
+	}
+}
+
+export async function startApprovalSocket(options: {
+	readonly socketPath: string;
+	readonly authority: ApprovalSocketAuthority;
+}): Promise<{ close(): Promise<void> }> {
+	await mkdir(dirname(options.socketPath), { recursive: true, mode: 0o700 });
+	await unlink(options.socketPath).catch(() => undefined);
+	const server: Server = createServer((socket) =>
+		serve(socket, options.authority),
+	);
+	await new Promise<void>((resolve, reject) => {
+		server.once('error', reject);
+		server.listen(options.socketPath, () => {
+			server.off('error', reject);
+			resolve();
+		});
+	});
+	await chmod(options.socketPath, 0o600).catch(() => undefined);
+	return {
+		close: async () => {
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+			await unlink(options.socketPath).catch(() => undefined);
+		},
+	};
+}
+
+function serve(socket: Socket, authority: ApprovalSocketAuthority): void {
+	let buffered = '';
+	let done = false;
+	const finish = (response: ApprovalSocketResponse) => {
+		if (done) return;
+		done = true;
+		socket.end(`${JSON.stringify(response)}\n`);
+	};
+	const timer = setTimeout(
+		() => finish({ ok: false, error: 'approval request timed out' }),
+		REQUEST_TIMEOUT_MS,
+	);
+	timer.unref?.();
+	socket.setEncoding('utf8');
+	socket.on('data', (chunk: string) => {
+		if (done) return;
+		buffered += chunk;
+		if (buffered.length > MAX_FRAME_BYTES) {
+			clearTimeout(timer);
+			finish({ ok: false, error: 'approval request is too large' });
+			return;
+		}
+		const newline = buffered.indexOf('\n');
+		if (newline < 0) return;
+		clearTimeout(timer);
+		let request: ApprovalSocketRequest;
+		try {
+			request = parseApprovalSocketRequest(
+				JSON.parse(buffered.slice(0, newline)),
+			);
+		} catch {
+			finish({ ok: false, error: 'approval request is invalid' });
+			return;
+		}
+		void handleApprovalSocketRequest(request, authority).then(finish, () =>
+			finish({ ok: false, error: 'approval failed' }),
+		);
+	});
+	socket.on('error', () => {
+		clearTimeout(timer);
+		done = true;
+	});
+}
+
+/** Client side used by the `approve`, `deny`, and `approvals` subcommands. */
+export function sendApprovalSocketRequest(
+	socketPath: string,
+	request: ApprovalSocketRequest,
+): Promise<ApprovalSocketResponse> {
+	return new Promise((resolve, reject) => {
+		let buffered = '';
+		let settled = false;
+		const socket = createConnection(socketPath);
+		const timer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			socket.destroy();
+			reject(
+				new Error('the running server did not answer the approval request'),
+			);
+		}, REQUEST_TIMEOUT_MS);
+		socket.setEncoding('utf8');
+		socket.on('connect', () => socket.write(`${JSON.stringify(request)}\n`));
+		socket.on('data', (chunk: string) => {
+			buffered += chunk;
+			if (buffered.length > MAX_FRAME_BYTES) {
+				socket.destroy();
+			}
+		});
+		socket.on('error', (error) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			reject(
+				new Error(
+					`no running server accepts approvals at this data root (${error.message})`,
+				),
+			);
+		});
+		socket.on('close', () => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			try {
+				resolve(JSON.parse(buffered.trim()) as ApprovalSocketResponse);
+			} catch {
+				reject(
+					new Error('the running server returned an invalid approval response'),
+				);
+			}
+		});
+	});
+}

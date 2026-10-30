@@ -1,0 +1,587 @@
+/*
+ * Home and its sidebar.
+ *
+ * The geometry — side-by-side columns, the width separator, and the narrow
+ * drawer — belongs to WorkspaceSplitLayout. This file styles only what Home
+ * puts in its slots: a section menu, and sections that fill the content area.
+ */
+
+.home-view {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+	min-height: 0;
+	background: var(--terminal-panel-surface, #0f1318);
+	color: #dce2f0;
+}
+
+.home-view__layout.workspace-split-layout.workspace-split-layout {
+	flex: 1 1 auto;
+	height: auto;
+	min-height: 0;
+}
+
+/* Home is kept while a project is in front, so nothing typed into its tabs
+ * is lost; it is only taken out of the way, as an inactive project is. */
+.home-view--hidden {
+	visibility: hidden;
+	pointer-events: none;
+	z-index: 0;
+}
+
+.home-view:not(.home-view--hidden) {
+	z-index: 1;
+}
+
+/* --- Tabs ------------------------------------------------------------------ */
+
+/* Home's tab strip is a project's tab strip: the same host, the same chrome
+ * rules, in Home's own colour. Home's control opens into it as a project tab
+ * opens into its project's strip. */
+.home-tabs {
+	position: relative;
+	flex: 1 1 auto;
+	min-width: 0;
+	min-height: 0;
+}
+
+.home-tab-panel {
+	position: absolute;
+	inset: 0;
+	min-width: 0;
+	min-height: 0;
+	overflow: hidden;
+}
+
+/* A Home tab's chip is drawn as a project panel's tab chip is. */
+.home-tab {
+	display: flex;
+	align-items: center;
+	position: relative;
+	height: 100%;
+	width: 100%;
+	padding: 0 4px 0 10px;
+	gap: 8px;
+	box-sizing: border-box;
+	color: color-mix(in srgb, var(--tab-text-selected) 62%, transparent);
+	border-radius: var(--panel-tab-radius);
+	transition:
+		background-color 150ms ease,
+		color 150ms ease;
+	min-width: 120px;
+	max-width: 240px;
+	user-select: none;
+	touch-action: manipulation;
+}
+
+.home-tab:hover {
+	background: rgba(255, 255, 255, 0.08);
+	color: var(--tab-text-selected);
+}
+
+.workspace .dv-tab.dv-active-tab .home-tab {
+	background: rgba(255, 255, 255, 0.14);
+	color: var(--tab-text-selected);
+}
+
+.home-tab__title {
+	flex: 1;
+	min-width: 0;
+	font-size: 13px;
+	font-weight: 500;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	font-family: "Open Sans", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+.workspace .dv-tab.dv-active-tab .home-tab__title {
+	font-weight: 600;
+}
+
+.home-tab__close {
+	all: unset;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex-shrink: 0;
+	box-sizing: border-box;
+	width: 20px;
+	height: 20px;
+	border-radius: var(--panel-tab-radius);
+	cursor: pointer;
+	opacity: 0.25;
+	transition: all 120ms ease;
+}
+
+.home-tab:hover .home-tab__close,
+.workspace .dv-tab.dv-active-tab .home-tab__close {
+	opacity: 0.8;
+}
+
+.home-tab__close:hover {
+	background-color: rgba(255, 255, 255, 0.1);
+	opacity: 1;
+}
+
+.home-tab__close:focus-visible {
+	outline: 2px solid rgba(120, 170, 255, 0.9);
+	outline-offset: 1px;
+	opacity: 1;
+}
+
+.home-tab__icon {
+	display: inline-flex;
+	flex: 0 0 auto;
+	opacity: 0.8;
+}
+
+/* A tab with unsaved edits says so where its title is read. */
+.home-tab__dirty {
+	flex: 0 0 auto;
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	background: #f0b45c;
+}
+
+.home-notice {
+	flex: 0 0 auto;
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 8px 14px;
+	font-size: 12.5px;
+	color: #f3d9a4;
+	background: rgba(240, 180, 92, 0.12);
+	border-bottom: 1px solid rgba(240, 180, 92, 0.25);
+}
+
+.home-notice > span {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.home-notice__dismiss {
+	all: unset;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 20px;
+	height: 20px;
+	border-radius: 5px;
+	cursor: pointer;
+}
+
+.home-notice__dismiss:hover {
+	background: rgba(255, 255, 255, 0.1);
+}
+
+.home-notice__dismiss:focus-visible {
+	outline: 2px solid rgba(120, 170, 255, 0.9);
+	outline-offset: 1px;
+}
+
+/* --- With no tab open ------------------------------------------------------ */
+
+.home-empty {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 10px;
+	padding: 24px;
+	box-sizing: border-box;
+	text-align: center;
+	background: var(--terminal-panel-surface, #0f1318);
+	color: #dce2f0;
+}
+
+.home-empty__title {
+	margin: 0;
+	font-size: 15px;
+	font-weight: 600;
+}
+
+.home-empty__text {
+	margin: 0;
+	font-size: 12.5px;
+	color: rgba(220, 226, 240, 0.55);
+}
+
+.home-empty__sections {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: center;
+	gap: 8px;
+	margin-top: 6px;
+}
+
+.home-empty__section,
+.home-empty__search {
+	all: unset;
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	box-sizing: border-box;
+	padding: 8px 14px;
+	border-radius: 8px;
+	font-size: 13px;
+	cursor: pointer;
+	background: rgba(255, 255, 255, 0.06);
+	box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+	transition: background-color 120ms ease;
+}
+
+.home-empty__search {
+	margin-top: 8px;
+	font-size: 12.5px;
+	color: rgba(220, 226, 240, 0.7);
+	background: transparent;
+}
+
+.home-empty__section:hover,
+.home-empty__search:hover {
+	background: rgba(255, 255, 255, 0.11);
+}
+
+.home-empty__section:focus-visible,
+.home-empty__search:focus-visible {
+	outline: 2px solid rgba(120, 170, 255, 0.9);
+	outline-offset: 1px;
+}
+
+.home-empty__key {
+	padding: 1px 6px;
+	border-radius: 4px;
+	font-family: inherit;
+	font-size: 11px;
+	background: rgba(255, 255, 255, 0.08);
+	color: rgba(220, 226, 240, 0.6);
+}
+
+/* --- Discarding unsaved edits ---------------------------------------------- */
+
+.home-confirm-overlay {
+	position: absolute;
+	inset: 0;
+	z-index: 20;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 20px;
+	box-sizing: border-box;
+	background: rgba(0, 0, 0, 0.45);
+}
+
+.home-confirm {
+	width: min(420px, 100%);
+	padding: 18px;
+	box-sizing: border-box;
+	border-radius: 10px;
+	border: 1px solid rgba(255, 255, 255, 0.09);
+	background: #161b22;
+	box-shadow: 0 18px 44px rgba(0, 0, 0, 0.5);
+	color: #dce2f0;
+}
+
+.home-confirm__text {
+	margin: 0 0 14px;
+	font-size: 13px;
+	line-height: 1.5;
+}
+
+.home-confirm__actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+}
+
+.home-view__panel {
+	position: relative;
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+	min-height: 0;
+	overflow: hidden;
+}
+
+.home-sidebar {
+	box-sizing: border-box;
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	width: 100%;
+	min-height: 0;
+	overflow: hidden;
+	background: var(--terminal-panel-surface, var(--tab-bg-active));
+	border-right: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+/* Drawn as the project sidebar's tab bar is, so it joins Home's tab strip. */
+.home-sidebar__band {
+	box-sizing: border-box;
+	flex: 0 0 auto;
+	height: var(--panel-tab-strip-height, 34px);
+	background: var(--project-chrome);
+	border-bottom: 1px solid rgba(0, 0, 0, 0.22);
+}
+
+.home-sidebar__sections {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	padding: 8px 6px;
+	min-height: 0;
+	overflow-y: auto;
+}
+
+.home-sidebar__section {
+	all: unset;
+	box-sizing: border-box;
+	display: flex;
+	align-items: center;
+	gap: 9px;
+	min-width: 0;
+	height: 30px;
+	padding: 0 10px;
+	border-radius: 5px;
+	font-size: 13px;
+	color: rgba(220, 226, 240, 0.72);
+	cursor: pointer;
+}
+
+.home-sidebar__section:hover {
+	color: #ffffff;
+	background: rgba(255, 255, 255, 0.06);
+}
+
+.home-sidebar__section--active {
+	color: #ffffff;
+	background: rgba(255, 255, 255, 0.1);
+}
+
+.home-sidebar__section:focus-visible {
+	outline: 1px solid rgba(87, 183, 255, 0.7);
+	outline-offset: -1px;
+}
+
+.home-sidebar__label {
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+
+/* --- Sections ------------------------------------------------------------ */
+
+.home-section {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+	min-height: 0;
+	overflow: auto;
+	background: var(--terminal-panel-surface, #0f1318);
+	color: #dce2f0;
+}
+
+.home-section__header {
+	flex: 0 0 auto;
+	padding: 14px 20px 12px;
+	border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.home-section__heading {
+	margin: 0;
+	font-size: 15px;
+	font-weight: 600;
+	letter-spacing: 0.01em;
+}
+
+.home-section__subheading {
+	margin: 3px 0 0;
+	font-size: 12px;
+	color: rgba(220, 226, 240, 0.55);
+}
+
+/* --- Overview widgets ---------------------------------------------------- */
+
+.home-overview__grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+	gap: 12px;
+	padding: 16px 20px 20px;
+}
+
+.home-widget {
+	all: unset;
+	box-sizing: border-box;
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	min-width: 0;
+	padding: 12px 14px;
+	border-radius: 8px;
+	background: rgba(255, 255, 255, 0.035);
+	border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.home-widget--action {
+	cursor: pointer;
+}
+
+.home-widget--action:hover {
+	background: rgba(255, 255, 255, 0.06);
+}
+
+.home-widget--action:focus-visible,
+.home-widget__link:focus-visible {
+	outline: 1px solid rgba(87, 183, 255, 0.7);
+	outline-offset: 1px;
+}
+
+.home-widget__title {
+	display: flex;
+	align-items: center;
+	gap: 7px;
+	font-size: 11.5px;
+	font-weight: 600;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	color: rgba(220, 226, 240, 0.55);
+}
+
+.home-widget__body {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 6px 16px;
+	min-width: 0;
+}
+
+.home-widget__count {
+	display: inline-flex;
+	align-items: baseline;
+	gap: 5px;
+	white-space: nowrap;
+}
+
+.home-widget__number {
+	font-size: 20px;
+	font-weight: 700;
+	font-variant-numeric: tabular-nums;
+	color: #ffffff;
+}
+
+.home-widget__unit,
+.home-widget__note {
+	font-size: 12px;
+	color: rgba(220, 226, 240, 0.6);
+}
+
+.home-widget__count--needsYou .home-widget__number {
+	color: #ffb4ae;
+}
+
+.home-widget__count--working .home-widget__number {
+	color: #f0d17c;
+}
+
+.home-widget__count--done .home-widget__number {
+	color: #8fe0ab;
+}
+
+.home-widget__unavailable {
+	font-size: 11.5px;
+	color: #f0d17c;
+}
+
+.home-widget__empty {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.home-widget__link {
+	all: unset;
+	box-sizing: border-box;
+	cursor: pointer;
+	border-radius: 4px;
+	color: #9ccfff;
+	font-size: 12.5px;
+}
+
+.home-widget__link.home-widget__count {
+	display: inline-flex;
+	align-items: baseline;
+	gap: 5px;
+}
+
+.home-widget__link:hover {
+	text-decoration: underline;
+}
+
+.home-widget__list {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	width: 100%;
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+
+.home-widget__row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	width: 100%;
+	min-width: 0;
+	color: #dce2f0;
+}
+
+.home-widget__row-text {
+	flex: 1 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+
+.home-widget__row-meta {
+	flex: 0 0 auto;
+	font-size: 11.5px;
+	font-variant-numeric: tabular-nums;
+	color: rgba(220, 226, 240, 0.55);
+}
+
+.home-widget__outcome {
+	flex: 0 0 auto;
+	padding: 1px 7px;
+	border-radius: 999px;
+	font-size: 11px;
+	background: rgba(255, 255, 255, 0.06);
+	color: rgba(220, 226, 240, 0.7);
+}
+
+.home-widget__outcome--success {
+	color: #8fe0ab;
+	background: rgba(69, 200, 116, 0.16);
+}
+
+.home-widget__outcome--failure,
+.home-widget__outcome--timed-out {
+	color: #ffb4ae;
+	background: rgba(238, 98, 88, 0.16);
+}
+
+.home-widget__outcome--running {
+	color: #f0d17c;
+	background: rgba(232, 185, 49, 0.16);
+}

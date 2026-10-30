@@ -1,0 +1,209 @@
+import type { Locator, Page } from '@playwright/test'
+import { expect } from '../fixtures'
+
+/**
+ * Press and hold `locator` until the long press has done what it does,
+ * `opened` being on screen, then let go. A long press acts while it is held,
+ * so the release comes after the hold has run out whatever the machine's
+ * speed.
+ */
+export async function longPress(locator: Locator, opened: Locator): Promise<void> {
+  const box = await locator.boundingBox()
+  if (!box) throw new Error('Expected a layout box for long-press')
+  const page = locator.page()
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
+  await page.mouse.down()
+  await expect(opened).toBeVisible()
+  await page.mouse.up()
+}
+
+async function closeEditWindowWithButton(editWindow: Page, label: 'Save' | 'Cancel'): Promise<void> {
+  const editor = editWindow.getByRole('dialog').filter({
+    has: editWindow.getByRole('heading', { name: /Edit (Project|Terminal) Tab/ }),
+  })
+  await editor.getByRole('button', { name: label }).click()
+  await expect(editor).toHaveCount(0)
+}
+
+export async function openProjectEditWindow(page: Page): Promise<Page> {
+  await page.locator('.project-tab--active').evaluate((element) => {
+    element.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }))
+  })
+  await expect(page.getByRole('heading', { name: 'Edit Project Tab' })).toBeVisible()
+  return page
+}
+
+export async function openTerminalEditWindow(page: Page): Promise<Page> {
+  await page.locator('.project-workspace--active .terminal-tab-content--active').evaluate((element) => {
+    element.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }))
+  })
+  await expect(page.getByRole('heading', { name: 'Edit Terminal Tab' })).toBeVisible()
+  return page
+}
+
+export async function setProjectRoot(page: Page, rootPath: string): Promise<void> {
+  const editWindow = await openProjectEditWindow(page)
+  await expect(editWindow.getByRole('heading', { name: 'Edit Project Tab' })).toBeVisible()
+  await editWindow.getByPlaceholder('Enter folder path').fill(rootPath)
+  await closeEditWindowWithButton(editWindow, 'Save')
+}
+
+export async function submitEditWindow(editWindow: Page): Promise<void> {
+  await closeEditWindowWithButton(editWindow, 'Save')
+}
+
+export async function cancelEditWindow(editWindow: Page): Promise<void> {
+  await closeEditWindowWithButton(editWindow, 'Cancel')
+}
+
+export async function openFileExplorer(page: Page): Promise<void> {
+  await expect(page.locator('.project-workspace--active')).toBeVisible()
+  const sidebar = page.locator(
+    '.project-workspace--active .file-explorer-sidebar',
+  )
+  if (!(await sidebar.isVisible())) {
+    const toggle = page.getByLabel('Toggle file explorer')
+    await expect(toggle).toBeVisible()
+    await toggle.click()
+  }
+
+  await expect(sidebar).toBeVisible()
+}
+
+/** The left column's Agents list, brought to the front by its tab. */
+export async function openAgentsPane(page: Page): Promise<Locator> {
+  const column = page.locator(
+    '.project-workspace--active [data-terminay-folders-column="true"]',
+  )
+  const tab = column.getByRole('tab', { name: 'Agents' })
+  await expect(tab).toBeVisible()
+  await tab.click()
+  await expect(tab).toHaveAttribute('aria-selected', 'true')
+  const panel = column.locator('[data-folders-column-panel="agents"]')
+  await expect(panel).toBeVisible()
+  return panel
+}
+
+export async function selectSidebarGroup(
+  page: Page,
+  group: 'explorer' | 'documentation' | 'agents',
+): Promise<void> {
+  // Agents are a tab of the left column, not a sidebar group.
+  if (group === 'agents') {
+    await openAgentsPane(page)
+    return
+  }
+  await openFileExplorer(page)
+  const label = group === 'explorer' ? 'Explorer' : 'Documentation'
+  const tab = page
+    .locator('.project-workspace--active')
+    .getByRole('tab', { name: label })
+  await expect(tab).toBeVisible()
+  await tab.click()
+  await expect(tab).toHaveAttribute('aria-selected', 'true')
+}
+
+export async function openDocumentationSidebar(page: Page): Promise<Locator> {
+  await selectSidebarGroup(page, 'documentation')
+  const pane = page
+    .locator('.project-workspace--active .sidebar-pane')
+    .filter({
+      has: page.locator('.sidebar-pane__title', { hasText: 'Documentation' }),
+    })
+  await expect(pane).toBeVisible()
+  if (
+    await pane.evaluate((element) =>
+      element.classList.contains('sidebar-pane--collapsed'),
+    )
+  ) {
+    await pane.locator('.sidebar-pane__header').click()
+  }
+  await expect(pane).not.toHaveClass(/sidebar-pane--collapsed/)
+  await expect(pane.locator('.documentation-tree')).toBeVisible({
+    timeout: 15_000,
+  })
+  await expect(pane.getByRole('tree')).toBeVisible({ timeout: 15_000 })
+  return pane
+}
+
+export function fileExplorerItem(page: Page, name: string) {
+  return page.locator('.file-explorer-tree-item').filter({ hasText: name }).first()
+}
+
+/** Markdown opens on the Document view; this moves the panel to Preview. */
+export async function leaveDocumentView(page: Page): Promise<void> {
+  await expect(page.locator('.documentation-editor:visible')).toBeVisible()
+  await selectFileView(page, 'Preview')
+  await expect(page.locator('.documentation-editor:visible')).toHaveCount(0)
+}
+
+/**
+ * Selects a File Viewer view by its label, whether it is drawn as a tab or
+ * kept in the switcher's "More views" menu for this file type.
+ */
+export async function selectFileView(page: Page, label: string): Promise<void> {
+  const switcher = page.locator('.file-mode-switcher:visible')
+  await expect(switcher).toBeVisible()
+  const tab = switcher.getByRole('tab', { name: label, exact: true })
+  if ((await tab.count()) === 0) {
+    await switcher.getByRole('button', { name: 'More views' }).click()
+    await switcher.getByRole('menuitem', { name: label, exact: true }).click()
+  } else {
+    await tab.click()
+  }
+  await expect(tab).toHaveAttribute('aria-selected', 'true')
+}
+
+export async function activateDockTab(page: Page, title: string): Promise<void> {
+  const tab = page
+    .locator('.terminal-tab-content')
+    .filter({ has: page.locator('.terminal-tab-title', { hasText: title }) })
+    .first()
+
+  await tab.click()
+  await expect(tab).toHaveClass(/terminal-tab-content--active/)
+}
+
+export function contextMenuItem(page: Page, name: string) {
+  return page.locator('.context-menu__item').filter({ hasText: name }).first()
+}
+
+export async function submitFileExplorerNameModal(page: Page, label: string, value: string): Promise<void> {
+  const dialog = page.getByRole('dialog')
+  await expect(dialog).toBeVisible()
+  await dialog.getByRole('textbox', { name: label }).fill(value)
+  await dialog.getByRole('button', { name: /^(Create File|Create Folder|Rename)$/ }).click()
+  await expect(dialog).toHaveCount(0)
+}
+
+export async function setMonacoValue(page: Page, value: string): Promise<void> {
+  await page.locator('.monaco-editor').click()
+  await page.evaluate((nextValue) => {
+    const monacoApi = (window as Window & {
+      monaco?: {
+        editor?: {
+          getModels: () => Array<{ setValue: (value: string) => void }>
+        }
+      }
+    }).monaco
+    const model = monacoApi?.editor?.getModels()?.at(-1)
+
+    if (!model) {
+      throw new Error('No Monaco model is available')
+    }
+
+    model.setValue(nextValue)
+  }, value)
+}
+
+export async function openRemoteMenu(page: Page): Promise<void> {
+  // Responsive shells may retain an inactive copy of the workspace. Operate
+  // only on the menu belonging to the currently visible shell.
+  const menu = page.locator('[role="menu"][aria-label="Connection menu"]:visible').first()
+  if (await menu.isVisible().catch(() => false)) {
+    return
+  }
+
+  await page.getByLabel('Open connection menu').click()
+  await expect(menu).toBeVisible()
+}

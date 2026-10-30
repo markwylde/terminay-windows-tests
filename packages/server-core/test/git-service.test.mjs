@@ -1,0 +1,596 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { access, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+
+test("GitService binds canonical project/repository/worktree identities and reports status", async () => {
+  const { GitService } = await import("../dist/gitService/index.js");
+  const root = await mkdtemp(join(tmpdir(), "terminay-server-git-"));
+  const project = join(root, "project");
+  const alias = join(root, "alias");
+  try {
+    await mkdir(project);
+    await git(["init", "-b", "main"], project);
+    await git(["config", "user.email", "test@example.invalid"], project);
+    await git(["config", "user.name", "Terminay Test"], project);
+    await writeFile(join(project, "tracked.txt"), "base\n");
+    await git(["add", "tracked.txt"], project);
+    await git(["commit", "-m", "initial"], project);
+    await symlink(project, alias);
+
+    const service = new GitService();
+    const first = await service.bindProject("project-a", project);
+    const second = await service.bindProject("project-b", alias);
+    assert.equal(first.repositoryId, second.repositoryId);
+    assert.equal(first.worktreeId, second.worktreeId);
+    assert.equal(first.repositoryRoot.endsWith('/project'), true);
+    await writeFile(join(project, "tracked.txt"), "changed\n");
+    await writeFile(join(project, "new.txt"), "new\n");
+
+    const status = await service.status({ projectId: "project-a", repositoryId: first.repositoryId, worktreeId: first.worktreeId });
+    assert.equal(status.state, "ready");
+    assert.equal(status.branch.name, "main");
+    assert.deepEqual(status.entries.map((entry) => [entry.path, entry.kind]).sort(), [["new.txt", "untracked"], ["tracked.txt", "modified"]]);
+    assert.equal(status.entries.some((entry) => entry.path.startsWith("/")), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("GitService returns normalized bounded diffs and rejects path escapes", async () => {
+  const { GitService, GitServiceError } = await import("../dist/gitService/index.js");
+  const root = await mkdtemp(join(tmpdir(), "terminay-server-git-diff-"));
+  try {
+    await git(["init", "-b", "main"], root);
+    await git(["config", "user.email", "test@example.invalid"], root);
+    await git(["config", "user.name", "Terminay Test"], root);
+    await writeFile(join(root, "file.txt"), "before\n");
+    await git(["add", "file.txt"], root);
+    await git(["commit", "-m", "initial"], root);
+    await writeFile(join(root, "file.txt"), "before\nafter\n");
+    const service = new GitService({ limits: { maxDiffBytes: 1024, maxOutputBytes: 1024 } });
+    const binding = await service.bindProject("project", root);
+    const diff = await service.diff({ projectId: "project", path: "file.txt", worktreeId: binding.worktreeId });
+    assert.equal(diff.state, "ready");
+    assert.equal(diff.files[0].path, "file.txt");
+    assert.equal(diff.hunks[0].lines.some((line) => line.type === "add" && line.value === "after"), true);
+    await assert.rejects(() => service.diff({ projectId: "project", path: "../outside" }), (error) => error instanceof GitServiceError && error.code === "path-escape");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("GitService keeps read-only worktree listing project-bound", async () => {
+  const { GitService, GitServiceError } = await import("../dist/gitService/index.js");
+  const root = await mkdtemp(join(tmpdir(), "terminay-server-git-worktrees-"));
+  const feature = join(root, "feature");
+  try {
+    await git(["init", "-b", "main"], root);
+    await git(["config", "user.email", "test@example.invalid"], root);
+    await git(["config", "user.name", "Terminay Test"], root);
+    await writeFile(join(root, "file.txt"), "base\n");
+    await git(["add", "file.txt"], root);
+    await git(["commit", "-m", "initial"], root);
+    await git(["worktree", "add", feature, "-b", "feature"], root);
+    const service = new GitService();
+    const binding = await service.bindProject("project", root);
+    const list = await service.worktrees({ projectId: "project", repositoryId: binding.repositoryId });
+    assert.equal(list.state, "ready");
+    assert.equal(list.worktrees.length, 2);
+    assert.equal(list.worktrees.filter((worktree) => worktree.isMain).length, 1);
+    assert.equal(list.worktrees.some((worktree) => worktree.branch === "feature"), true);
+    await assert.rejects(() => service.status({ projectId: "project", worktreeId: "worktree-not-real" }), (error) => error instanceof GitServiceError && error.code === "worktree-not-found");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("GitService reports effective worktree changes against the default branch", async () => {
+  const { GitService } = await import("../dist/gitService/index.js");
+  const root = await mkdtemp(join(tmpdir(), "terminay-server-git-worktree-delta-"));
+  const project = join(root, "project");
+  const feature = join(root, "feature");
+  try {
+    await mkdir(project);
+    await git(["init", "-b", "main"], project);
+    await git(["config", "user.email", "test@example.invalid"], project);
+    await git(["config", "user.name", "Terminay Test"], project);
+    await writeFile(join(project, "shared.txt"), "base\n");
+    await git(["add", "shared.txt"], project);
+    await git(["commit", "-m", "initial"], project);
+    await git(["worktree", "add", feature, "-b", "feature"], project);
+
+    await writeFile(join(feature, "feature.txt"), "unmerged\nchange\n");
+    await git(["add", "feature.txt"], feature);
+    await git(["commit", "-m", "feature change"], feature);
+
+    const service = new GitService();
+    const binding = await service.bindProject("project", project);
+    // Each listing follows a commit made outside the service, so it is measured
+    // rather than answered from a cache the watch has yet to invalidate.
+    const unmerged = await service.worktrees({ projectId: "project", repositoryId: binding.repositoryId, fresh: true });
+    const unmergedFeature = unmerged.worktrees.find((worktree) => !worktree.isMain);
+    assert.equal(unmergedFeature.aheadOfDefaultBranchCount, 1);
+    assert.equal(unmergedFeature.hasCommittedChanges, true);
+    assert.equal(unmergedFeature.lineAdditions, 2);
+    assert.equal(unmergedFeature.lineDeletions, 0);
+
+    await writeFile(join(project, "feature.txt"), "unmerged\nchange\n");
+    await git(["add", "feature.txt"], project);
+    await git(["commit", "-m", "squash feature"], project);
+
+    const squashMerged = await service.worktrees({ projectId: "project", repositoryId: binding.repositoryId, fresh: true });
+    const squashMergedFeature = squashMerged.worktrees.find((worktree) => !worktree.isMain);
+    assert.equal(squashMergedFeature.aheadOfDefaultBranchCount, 1);
+    assert.equal(squashMergedFeature.hasCommittedChanges, false);
+    assert.equal(squashMergedFeature.lineAdditions, 0);
+    assert.equal(squashMergedFeature.lineDeletions, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("GitService reports a worktree's unpushed work apart from what the default branch lacks", async () => {
+  const { GitService } = await import("../dist/gitService/index.js");
+  const root = await mkdtemp(join(tmpdir(), "terminay-server-git-worktree-unpushed-"));
+  const project = join(root, "project");
+  const remote = join(root, "remote.git");
+  const feature = join(root, "feature");
+  try {
+    await mkdir(project);
+    await git(["init", "-b", "main"], project);
+    await git(["config", "user.email", "test@example.invalid"], project);
+    await git(["config", "user.name", "Terminay Test"], project);
+    await writeFile(join(project, "shared.txt"), "base\n");
+    await git(["add", "shared.txt"], project);
+    await git(["commit", "-m", "initial"], project);
+    await git(["init", "--bare", "-b", "main", remote], root);
+    await git(["remote", "add", "origin", remote], project);
+    await git(["push", "-u", "origin", "main"], project);
+    await git(["worktree", "add", feature, "-b", "feature"], project);
+
+    const service = new GitService();
+    const binding = await service.bindProject("project", project);
+    // Every step changes the repository with Git outside the service, so each
+    // listing is measured rather than answered from a cache the watch has yet
+    // to invalidate.
+    const list = async () => {
+      const result = await service.worktrees({ projectId: "project", repositoryId: binding.repositoryId, fresh: true });
+      return {
+        main: result.worktrees.find((worktree) => worktree.isMain),
+        feature: result.worktrees.find((worktree) => !worktree.isMain),
+      };
+    };
+    const unpushed = (worktree) => ({
+      commits: worktree.hasUnpushedCommits,
+      additions: worktree.unpushedLineAdditions,
+      deletions: worktree.unpushedLineDeletions,
+    });
+
+    // A new worktree with no commits of its own has no upstream and nothing to push.
+    assert.deepEqual(unpushed((await list()).feature), { commits: false, additions: 0, deletions: 0 });
+
+    // A commit on a branch that was never pushed.
+    await writeFile(join(feature, "feature.txt"), "one\ntwo\n");
+    await git(["add", "feature.txt"], feature);
+    await git(["commit", "-m", "feature change"], feature);
+    assert.deepEqual(unpushed((await list()).feature), { commits: true, additions: 2, deletions: 0 });
+
+    // Pushed: still work the default branch lacks, and nothing unpushed.
+    await git(["push", "-u", "origin", "feature"], feature);
+    const pushed = (await list()).feature;
+    assert.deepEqual(unpushed(pushed), { commits: false, additions: 0, deletions: 0 });
+    assert.equal(pushed.hasCommittedChanges, true);
+    assert.equal(pushed.aheadOfDefaultBranchCount, 1);
+    assert.equal(pushed.lineAdditions, 2);
+
+    // One commit ahead of the upstream, and an uncommitted change to a tracked file.
+    await writeFile(join(feature, "more.txt"), "three\nfour\nfive\n");
+    await git(["add", "more.txt"], feature);
+    await git(["commit", "-m", "more"], feature);
+    await writeFile(join(feature, "shared.txt"), "base\nedited\n");
+    const ahead = (await list()).feature;
+    assert.deepEqual(unpushed(ahead), { commits: true, additions: 4, deletions: 0 });
+    assert.equal(ahead.aheadOfDefaultBranchCount, 2);
+    assert.equal(ahead.lineAdditions, 6);
+
+    // Uncommitted work alone is unpushed work with no unpushed commit.
+    await git(["push"], feature);
+    assert.deepEqual(unpushed((await list()).feature), { commits: false, additions: 1, deletions: 0 });
+    await git(["checkout", "--", "shared.txt"], feature);
+
+    // Squash-merged, then the remote branch is deleted: the commits are on no
+    // remote, and their effect is on the default branch.
+    await writeFile(join(project, "feature.txt"), "one\ntwo\n");
+    await writeFile(join(project, "more.txt"), "three\nfour\nfive\n");
+    await git(["add", "feature.txt", "more.txt"], project);
+    await git(["commit", "-m", "squash feature"], project);
+    await git(["push", "origin", "--delete", "feature"], feature);
+    const merged = await list();
+    assert.equal(merged.feature.hasCommittedChanges, false);
+    assert.deepEqual(unpushed(merged.feature), { commits: false, additions: 0, deletions: 0 });
+
+    // The default branch checkout is ahead of its own upstream by the squash.
+    assert.deepEqual(unpushed(merged.main), { commits: true, additions: 5, deletions: 0 });
+    await git(["push"], project);
+    assert.deepEqual(unpushed((await list()).main), { commits: false, additions: 0, deletions: 0 });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("GitService publishes bounded progress and status revisions to subscribers", async () => {
+  const { GitService } = await import("../dist/gitService/index.js");
+  const root = await mkdtemp(join(tmpdir(), "terminay-server-git-events-"));
+  try {
+    await git(["init", "-b", "main"], root);
+    await git(["config", "user.email", "test@example.invalid"], root);
+    await git(["config", "user.name", "Terminay Test"], root);
+    await writeFile(join(root, "file.txt"), "base\n");
+    await git(["add", "file.txt"], root);
+    await git(["commit", "-m", "initial"], root);
+    const service = new GitService({ maxEvents: 32 });
+    const events = [];
+    const secondClientEvents = [];
+    service.subscribe((event) => events.push(event));
+    service.subscribe((event) => secondClientEvents.push(event));
+    const binding = await service.bindProject("project", root);
+    const first = await service.status({ projectId: "project", repositoryId: binding.repositoryId, worktreeId: binding.worktreeId });
+    assert.equal(first.state, "ready");
+    assert.deepEqual(events.map((event) => [event.type, event.revision]), [
+      ["git.progress", 1],
+      ["git.progress", 2],
+      ["git.status.changed", 3],
+    ]);
+    assert.equal(events[0].phase, "started");
+    assert.equal(events[1].phase, "completed");
+    assert.equal(events[2].changedFiles, 0);
+    assert.equal("repositoryRoot" in events[2], false);
+    assert.equal("stderr" in events[2], false);
+    assert.deepEqual(secondClientEvents, events);
+
+    await service.status({ projectId: "project", repositoryId: binding.repositoryId, worktreeId: binding.worktreeId });
+    assert.equal(events.filter((event) => event.type === "git.status.changed").length, 1);
+
+    await writeFile(join(root, "new.txt"), "new\n");
+    await service.status({ projectId: "project", repositoryId: binding.repositoryId, worktreeId: binding.worktreeId });
+    const changed = events.filter((event) => event.type === "git.status.changed").at(-1);
+    assert.equal(changed.changedFiles, 1);
+    assert.equal(changed.projectId, "project");
+    assert.equal(changed.repositoryId, binding.repositoryId);
+    assert.equal(changed.worktreeId, binding.worktreeId);
+    assert.equal(service.revision, events.at(-1).revision);
+    assert.deepEqual(secondClientEvents.map((event) => event.revision), events.map((event) => event.revision));
+    assert.equal(service.replay(0).kind, "events");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("GitService removes confirmed dirty or unmerged non-main worktrees", async () => {
+  const { GitService, GitServiceError } = await import("../dist/gitService/index.js");
+  const root = await mkdtemp(join(tmpdir(), "terminay-server-git-remove-"));
+  const feature = join(root, "feature");
+  const dirty = join(root, "dirty");
+  try {
+    await git(["init", "-b", "main"], root);
+    await git(["config", "user.email", "test@example.invalid"], root);
+    await git(["config", "user.name", "Terminay Test"], root);
+    await writeFile(join(root, "file.txt"), "base\n");
+    await git(["add", "file.txt"], root);
+    await git(["commit", "-m", "initial"], root);
+    await git(["worktree", "add", feature, "-b", "feature"], root);
+    await git(["worktree", "add", dirty, "-b", "dirty"], root);
+    // Give the dirty worktree an actual unmerged index so the mutation guard
+    // is exercised for both ordinary dirt and conflict state.
+    await writeFile(join(root, "file.txt"), "main branch change\n");
+    await git(["add", "file.txt"], root);
+    await git(["commit", "-m", "main branch change"], root);
+    await writeFile(join(dirty, "file.txt"), "dirty branch change\n");
+    await git(["add", "file.txt"], dirty);
+    await git(["commit", "-m", "dirty branch change"], dirty);
+    await git(["merge", "main"], dirty).catch(() => undefined);
+    await writeFile(join(dirty, "untracked.txt"), "discard me\n");
+
+    const service = new GitService();
+    const binding = await service.bindProject("project", root);
+    const initial = await service.worktrees({ projectId: "project", repositoryId: binding.repositoryId });
+    const main = initial.worktrees.find((worktree) => worktree.isMain);
+    const featureBefore = initial.worktrees.find((worktree) => worktree.path.endsWith("/feature"));
+    assert.ok(main);
+    assert.ok(featureBefore);
+    await assert.rejects(
+      () => service.removeWorktree({ projectId: "project", repositoryId: binding.repositoryId, worktreeId: main.id }),
+      (error) => error instanceof GitServiceError && error.code === "worktree-main",
+    );
+
+    // A review bound to the previous full HEAD cannot be replayed after the
+    // selected worktree advances.
+    await writeFile(join(feature, "feature.txt"), "feature\n");
+    await git(["add", "feature.txt"], feature);
+    await git(["commit", "-m", "feature change"], feature);
+    await assert.rejects(
+      () => service.removeWorktree({ projectId: "project", repositoryId: binding.repositoryId, worktreeId: featureBefore.id, expectedHead: featureBefore.head }),
+      (error) => error instanceof GitServiceError && error.code === "stale-revision",
+    );
+
+    // Reviewed again after the commit made outside the service.
+    const withDirty = await service.worktrees({ projectId: "project", repositoryId: binding.repositoryId, fresh: true });
+    const dirtySummary = withDirty.worktrees.find((worktree) => worktree.path.endsWith("/dirty"));
+    const featureAfter = withDirty.worktrees.find((worktree) => worktree.path.endsWith("/feature"));
+    assert.ok(dirtySummary);
+    assert.ok(featureAfter);
+    const dirtyRemoved = await service.removeWorktree({
+      projectId: "project",
+      repositoryId: binding.repositoryId,
+      worktreeId: dirtySummary.id,
+      expectedHead: dirtySummary.head,
+    });
+    assert.equal(dirtyRemoved.applied, true);
+    assert.equal(dirtyRemoved.state, "removed");
+
+    const removed = await service.removeWorktree({
+      projectId: "project",
+      repositoryId: binding.repositoryId,
+      worktreeId: featureAfter.id,
+      expectedHead: featureAfter.head,
+    });
+    assert.equal(removed.applied, true);
+    assert.equal(removed.state, "removed");
+    const final = await service.worktrees({ projectId: "project", repositoryId: binding.repositoryId });
+    assert.equal(final.worktrees.some((worktree) => worktree.id === featureAfter.id), false);
+    assert.equal(final.worktrees.some((worktree) => worktree.id === dirtySummary.id), false);
+    await assert.rejects(() => access(dirty));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("GitService removes a stale worktree registration after its directory disappears", async () => {
+  const { GitService } = await import("../dist/gitService/index.js");
+  const root = await mkdtemp(join(tmpdir(), "terminay-server-git-remove-stale-"));
+  const project = join(root, "project");
+  const feature = join(root, "feature");
+  try {
+    await mkdir(project);
+    await git(["init", "-b", "main"], project);
+    await git(["config", "user.email", "test@example.invalid"], project);
+    await git(["config", "user.name", "Terminay Test"], project);
+    await writeFile(join(project, "file.txt"), "base\n");
+    await git(["add", "file.txt"], project);
+    await git(["commit", "-m", "initial"], project);
+    await git(["worktree", "add", feature, "-b", "feature"], project);
+
+    const service = new GitService();
+    const binding = await service.bindProject("project", project);
+    const before = await service.worktrees({ projectId: "project", repositoryId: binding.repositoryId });
+    const selected = before.worktrees.find((worktree) => worktree.path.endsWith("/feature"));
+    assert.ok(selected);
+
+    await rm(feature, { recursive: true, force: true });
+
+    // Measured, not answered from a cache the watch has yet to invalidate.
+    const stale = await service.worktrees({
+      projectId: "project",
+      repositoryId: binding.repositoryId,
+      worktreeId: selected.id,
+      fresh: true,
+    });
+    assert.equal(stale.state, "ready");
+    assert.equal(stale.worktrees.find((worktree) => worktree.id === selected.id)?.isPrunable, true);
+
+    const removed = await service.removeWorktree({
+      projectId: "project",
+      repositoryId: binding.repositoryId,
+      worktreeId: selected.id,
+      expectedHead: selected.head,
+    });
+    assert.equal(removed.applied, true);
+    assert.equal(removed.state, "removed");
+
+    const after = await service.worktrees({ projectId: "project", repositoryId: binding.repositoryId });
+    assert.equal(after.worktrees.some((worktree) => worktree.id === selected.id), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("GitService moves only a clean reviewed worktree to a safe sibling name", async () => {
+  const { GitService, GitServiceError } = await import("../dist/gitService/index.js");
+  const root = await mkdtemp(join(tmpdir(), "terminay-server-git-move-"));
+  const feature = join(root, "feature");
+  try {
+    await git(["init", "-b", "main"], root);
+    await git(["config", "user.email", "test@example.invalid"], root);
+    await git(["config", "user.name", "Terminay Test"], root);
+    await writeFile(join(root, "file.txt"), "base\n");
+    await git(["add", "file.txt"], root);
+    await git(["commit", "-m", "initial"], root);
+    await git(["worktree", "add", feature, "-b", "feature"], root);
+    const service = new GitService();
+    const binding = await service.bindProject("project", root);
+    const listing = await service.worktrees({ projectId: "project", repositoryId: binding.repositoryId });
+    const selected = listing.worktrees.find((worktree) => worktree.path.endsWith("/feature"));
+    assert.ok(selected);
+    await assert.rejects(() => service.moveWorktree({ projectId: "project", repositoryId: binding.repositoryId, worktreeId: selected.id, name: "../escape" }), (error) => error instanceof GitServiceError);
+    await mkdir(join(root, "occupied"));
+    await assert.rejects(() => service.moveWorktree({ projectId: "project", repositoryId: binding.repositoryId, worktreeId: selected.id, name: "occupied" }), (error) => error instanceof GitServiceError && /already exists/u.test(error.message));
+    await writeFile(join(feature, "dirty.txt"), "dirty\n");
+    await assert.rejects(() => service.moveWorktree({ projectId: "project", repositoryId: binding.repositoryId, worktreeId: selected.id, name: "renamed" }), (error) => error instanceof GitServiceError && error.code === "worktree-dirty");
+    await git(["clean", "-fd"], feature);
+    const moved = await service.moveWorktree({ projectId: "project", repositoryId: binding.repositoryId, worktreeId: selected.id, name: "renamed", expectedHead: selected.head });
+    assert.equal(moved.applied, true);
+    assert.equal(moved.state, "moved");
+    assert.equal(moved.path.endsWith("/renamed"), true);
+    assert.notEqual(moved.worktreeId, selected.id);
+    const after = await service.worktrees({ projectId: "project", repositoryId: binding.repositoryId });
+    assert.equal(after.worktrees.some((worktree) => worktree.id === selected.id), false);
+    assert.equal(after.worktrees.some((worktree) => worktree.id === moved.worktreeId), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("GitService removes a locked linked worktree including dirty files", async () => {
+  const { GitService, GitServiceError } = await import("../dist/gitService/index.js");
+  const root = await mkdtemp(join(tmpdir(), "terminay-server-git-remove-locked-"));
+  const locked = join(root, "locked");
+  try {
+    await git(["init", "-b", "main"], root);
+    await git(["config", "user.email", "test@example.invalid"], root);
+    await git(["config", "user.name", "Terminay Test"], root);
+    await writeFile(join(root, "file.txt"), "base\n");
+    await git(["add", "file.txt"], root);
+    await git(["commit", "-m", "initial"], root);
+    await git(["worktree", "add", locked, "-b", "locked"], root);
+    await writeFile(join(locked, "untracked.txt"), "discard me\n");
+    await git(["worktree", "lock", locked], root);
+
+    const service = new GitService();
+    const binding = await service.bindProject("project", root);
+    const listing = await service.worktrees({ projectId: "project", repositoryId: binding.repositoryId });
+    const selected = listing.worktrees.find((worktree) => worktree.path.endsWith("/locked"));
+    const main = listing.worktrees.find((worktree) => worktree.isMain);
+    assert.ok(selected);
+    assert.ok(main);
+    assert.equal(selected.locked, true);
+    await assert.rejects(
+      () => service.removeWorktree({ projectId: "project", repositoryId: binding.repositoryId, worktreeId: main.id }),
+      (error) => error instanceof GitServiceError && error.code === "worktree-main",
+    );
+    await assert.rejects(
+      () => service.pullWorktree({ projectId: "project", repositoryId: binding.repositoryId, worktreeId: selected.id, expectedHead: selected.head }),
+      (error) => error instanceof GitServiceError && error.code === "worktree-locked",
+    );
+    await assert.rejects(
+      () => service.moveWorktree({ projectId: "project", repositoryId: binding.repositoryId, worktreeId: selected.id, name: "renamed", expectedHead: selected.head }),
+      (error) => error instanceof GitServiceError && error.code === "mutation-failed",
+    );
+
+    const removed = await service.removeWorktree({
+      projectId: "project",
+      repositoryId: binding.repositoryId,
+      worktreeId: selected.id,
+      expectedHead: selected.head,
+    });
+    assert.equal(removed.applied, true);
+    assert.equal(removed.state, "removed");
+    const after = await service.worktrees({ projectId: "project", repositoryId: binding.repositoryId });
+    assert.equal(after.worktrees.some((worktree) => worktree.id === selected.id), false);
+    await assert.rejects(() => access(locked));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("GitService serializes concurrent worktree removals for one repository", async () => {
+  const { GitService } = await import("../dist/gitService/index.js");
+  const root = await mkdtemp(join(tmpdir(), "terminay-server-git-remove-concurrent-"));
+  const one = join(root, "one");
+  const two = join(root, "two");
+  try {
+    await git(["init", "-b", "main"], root);
+    await git(["config", "user.email", "test@example.invalid"], root);
+    await git(["config", "user.name", "Terminay Test"], root);
+    await writeFile(join(root, "file.txt"), "base\n");
+    await git(["add", "file.txt"], root);
+    await git(["commit", "-m", "initial"], root);
+    await git(["worktree", "add", one, "-b", "one"], root);
+    await git(["worktree", "add", two, "-b", "two"], root);
+    const service = new GitService();
+    const binding = await service.bindProject("project", root);
+    const listing = await service.worktrees({ projectId: "project", repositoryId: binding.repositoryId });
+    const first = listing.worktrees.find((worktree) => worktree.path.endsWith("/one"));
+    const second = listing.worktrees.find((worktree) => worktree.path.endsWith("/two"));
+    assert.ok(first);
+    assert.ok(second);
+    const [removedFirst, removedSecond] = await Promise.all([
+      service.removeWorktree({ projectId: "project", repositoryId: binding.repositoryId, worktreeId: first.id, expectedHead: first.head }),
+      service.removeWorktree({ projectId: "project", repositoryId: binding.repositoryId, worktreeId: second.id, expectedHead: second.head }),
+    ]);
+    assert.equal(removedFirst.applied, true);
+    assert.equal(removedSecond.applied, true);
+    const after = await service.worktrees({ projectId: "project", repositoryId: binding.repositoryId });
+    assert.equal(after.worktrees.some((worktree) => worktree.id === first.id), false);
+    assert.equal(after.worktrees.some((worktree) => worktree.id === second.id), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("GitService clean-only removal deletes only worktrees that are still clean", async () => {
+  const { GitService, GitServiceError } = await import("../dist/gitService/index.js");
+  const root = await mkdtemp(join(tmpdir(), "terminay-server-git-remove-clean-"));
+  const paths = Object.fromEntries(["clean", "squashed", "untracked", "unmerged", "advanced", "locked", "locked-dirty"].map((name) => [name, join(root, name)]));
+  try {
+    await git(["init", "-b", "main"], root);
+    await git(["config", "user.email", "test@example.invalid"], root);
+    await git(["config", "user.name", "Terminay Test"], root);
+    await writeFile(join(root, "file.txt"), "base\n");
+    await git(["add", "file.txt"], root);
+    await git(["commit", "-m", "initial"], root);
+    for (const [name, path] of Object.entries(paths)) await git(["worktree", "add", path, "-b", name], root);
+    // A squash-merged branch is ahead by ancestry yet its tree is on main.
+    await writeFile(join(paths.squashed, "squashed.txt"), "squashed\n");
+    await git(["add", "squashed.txt"], paths.squashed);
+    await git(["commit", "-m", "squashed work"], paths.squashed);
+    await git(["merge", "--squash", "squashed"], root);
+    await git(["commit", "-m", "squash merge"], root);
+    await writeFile(join(paths.unmerged, "unmerged.txt"), "unmerged\n");
+    await git(["add", "unmerged.txt"], paths.unmerged);
+    await git(["commit", "-m", "unmerged work"], paths.unmerged);
+    await git(["worktree", "lock", "--reason", "claude session locked (pid 1)", paths.locked], root);
+    await git(["worktree", "lock", "--reason", "agent at work", paths["locked-dirty"]], root);
+
+    const service = new GitService();
+    const binding = await service.bindProject("project", root);
+    const listing = await service.worktrees({ projectId: "project", repositoryId: binding.repositoryId });
+    const find = (name) => listing.worktrees.find((worktree) => worktree.path.endsWith(`/${name}`));
+    const request = (worktree, expectedHead = worktree.head) => ({ projectId: "project", repositoryId: binding.repositoryId, worktreeId: worktree.id, expectedHead });
+    const main = listing.worktrees.find((worktree) => worktree.isMain);
+    assert.ok(main);
+
+    await assert.rejects(() => service.removeCleanWorktree(request(main)), (error) => error instanceof GitServiceError && error.code === "worktree-main");
+    await assert.rejects(() => service.removeCleanWorktree({ ...request(find("clean")), expectedHead: undefined }), (error) => error instanceof GitServiceError && error.code === "invalid-operation");
+    await assert.rejects(() => service.removeCleanWorktree(request(find("unmerged"))), (error) => error instanceof GitServiceError && error.code === "worktree-dirty");
+
+    // Work that lands after the reviewed listing is never swept away.
+    await writeFile(join(paths.untracked, "late.txt"), "written after the listing\n");
+    await assert.rejects(() => service.removeCleanWorktree(request(find("untracked"))), (error) => error instanceof GitServiceError && error.code === "worktree-dirty");
+    await access(join(paths.untracked, "late.txt"));
+    await writeFile(join(paths.advanced, "advanced.txt"), "advanced\n");
+    await git(["add", "advanced.txt"], paths.advanced);
+    await git(["commit", "-m", "advanced after the listing"], paths.advanced);
+    await assert.rejects(() => service.removeCleanWorktree(request(find("advanced"))), (error) => error instanceof GitServiceError && error.code === "stale-revision");
+
+    // A lock never hides work: a locked worktree that is no longer clean is
+    // refused and keeps its lock and the reason recorded with it.
+    await writeFile(join(paths["locked-dirty"], "late.txt"), "written after the listing\n");
+    await assert.rejects(() => service.removeCleanWorktree(request(find("locked-dirty"))), (error) => error instanceof GitServiceError && error.code === "worktree-dirty");
+    await access(join(paths["locked-dirty"], "late.txt"));
+    assert.match((await execFileAsync("git", ["worktree", "list", "--porcelain"], { cwd: root })).stdout, /^locked agent at work$/m);
+
+    // A lock alone does not keep a clean worktree.
+    for (const name of ["clean", "squashed", "locked"]) {
+      const removed = await service.removeCleanWorktree(request(find(name)));
+      assert.equal(removed.applied, true);
+      assert.equal(removed.state, "removed");
+      await assert.rejects(() => access(paths[name]));
+      // The branch outlives its worktree.
+      await git(["rev-parse", "--verify", `refs/heads/${name}`], root);
+    }
+    const after = await service.worktrees({ projectId: "project", repositoryId: binding.repositoryId });
+    assert.deepEqual(after.worktrees.filter((worktree) => !worktree.isMain).map((worktree) => worktree.path.split("/").at(-1)).sort(), ["advanced", "locked-dirty", "unmerged", "untracked"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+async function git(args, cwd) {
+  await execFileAsync("git", args, { cwd, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } });
+}

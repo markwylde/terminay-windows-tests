@@ -1,0 +1,407 @@
+.shared-production-route {
+	box-sizing: border-box;
+	display: grid;
+	align-content: start;
+	gap: 16px;
+	width: 100%;
+	height: 100%;
+	min-width: 0;
+	padding: clamp(16px, 4vw, 40px);
+	overflow: auto;
+	color: var(--text-primary, #e6edf3);
+	background: var(--background-primary, #0d1117);
+}
+
+.shared-production-route header,
+.shared-production-route p {
+	margin: 0;
+}
+
+.shared-production-route [role="listbox"] {
+	display: grid;
+	gap: 12px;
+}
+
+.shared-production-route__card {
+	box-sizing: border-box;
+	display: grid;
+	gap: 6px;
+	min-width: 0;
+	min-height: 44px;
+	padding: 12px;
+	border: 1px solid var(--border-primary, #30363d);
+	border-radius: 8px;
+}
+
+.shared-connections {
+	--connection-accent: #3b82f6;
+	--connection-surface: #0f172a;
+	--connection-surface-hover: #1e293b;
+	--connection-muted: #94a3b8;
+	--connection-border: #1e293b;
+	--connection-text: #f8fafc;
+	--connection-code-bg: #0b1220;
+	--connection-code-text: #e2e8f0;
+	font-family:
+		-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial,
+		sans-serif;
+}
+
+.shared-production-route.shared-connections {
+	gap: 24px;
+}
+
+.shared-production-route.shared-connections header {
+	display: grid;
+	gap: 8px;
+}
+
+.shared-production-route.shared-connections header h1 {
+	margin: 0;
+	color: #fff;
+	font-size: 20px;
+	font-weight: 700;
+	letter-spacing: -0.02em;
+}
+
+.shared-production-route.shared-connections header > p:last-child {
+	color: var(--connection-muted);
+	line-height: 1.5;
+}
+
+.shared-connections__eyebrow {
+	color: var(--connection-muted);
+	font-size: 11px;
+	font-weight: 600;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+}
+
+.shared-connections [role="listbox"] {
+	gap: 10px;
+}
+
+.shared-connections--embedded {
+	height: auto;
+	gap: 16px;
+	padding: 0;
+	overflow: visible;
+	background: transparent;
+}
+
+.shared-connections__empty {
+	display: grid;
+	gap: 6px;
+	padding: 4px 0 8px;
+	color: var(--connection-muted);
+}
+
+.shared-connections__empty-title,
+.shared-connections__empty p {
+	margin: 0;
+}
+
+.shared-connections__empty-title {
+	color: #f8fafc;
+	font-size: 14px;
+	font-weight: 600;
+}
+
+.shared-connections__empty p {
+	font-size: 13px;
+	font-weight: 400;
+	line-height: 1.5;
+}
+
+.shared-connection-card {
+	grid-template-columns: minmax(0, 1fr) auto;
+	grid-template-areas:
+		"identity status"
+		"actions actions";
+	align-items: center;
+	gap: 12px 16px;
+	padding: 14px 16px;
+	border-color: var(--connection-border);
+	border-radius: 10px;
+	background: var(--connection-surface);
+	transition:
+		border-color 140ms ease,
+		background 140ms ease;
+}
+
+.shared-connection-card--current {
+	border-color: #334155;
+	background: #111827;
+}
+
+.shared-connection-card__identity {
+	display: grid;
+	grid-area: identity;
+	gap: 5px;
+	min-width: 0;
+}
+
+.shared-connection-card__title {
+	display: flex;
+	align-items: center;
+	gap: 9px;
+	min-width: 0;
+}
+
+.shared-connection-card__title strong {
+	overflow: hidden;
+	color: #f8fafc;
+	font-size: 14px;
+	font-weight: 600;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.shared-connection-card__current {
+	padding: 3px 7px;
+	border-radius: 999px;
+	background: #1e293b;
+	color: #94a3b8;
+	font-size: 9px;
+	font-weight: 700;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+}
+
+.shared-connection-card__origin {
+	overflow: hidden;
+	color: var(--connection-muted);
+	font-size: 12px;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.shared-connection-card__status {
+	display: inline-flex;
+	grid-area: status;
+	align-items: center;
+	gap: 7px;
+	color: var(--connection-muted);
+	font-size: 12px;
+	font-weight: 700;
+	text-transform: capitalize;
+	white-space: nowrap;
+}
+
+.shared-connection-card__status::before {
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	background: currentColor;
+	content: "";
+}
+
+.shared-connection-card__status--connected {
+	color: #4ade80;
+}
+
+.shared-connection-card__status--reconnecting {
+	color: #e8bb6a;
+}
+
+.shared-connection-card__actions {
+	display: flex;
+	grid-area: actions;
+	flex-wrap: wrap;
+	gap: 8px;
+}
+
+.shared-connection-card__actions button,
+.shared-connections__profile-actions button,
+.shared-connections__action-panel button {
+	min-height: 38px;
+	padding: 8px 14px;
+	border: 1px solid var(--connection-border);
+	border-radius: 8px;
+	background: transparent;
+	color: var(--connection-muted);
+	cursor: pointer;
+	font: inherit;
+	font-size: 12px;
+	font-weight: 600;
+	transition:
+		background 0.2s ease,
+		border-color 0.2s ease,
+		color 0.2s ease;
+}
+
+.shared-connection-card__actions button:hover,
+.shared-connections__profile-actions button:hover,
+.shared-connections__action-panel button:hover {
+	border-color: #334155;
+	background: rgba(255, 255, 255, 0.05);
+	color: #f1f5f9;
+}
+
+.shared-connection-card__actions .shared-connection-card__switch {
+	border-color: #334155;
+	color: #cbd5e1;
+}
+
+.shared-connection-card__actions .shared-connection-card__danger-action {
+	color: #fca5a5;
+}
+
+.shared-connection-card__actions .shared-connection-card__danger-action:hover {
+	border-color: rgba(239, 68, 68, 0.35);
+	background: rgba(239, 68, 68, 0.08);
+	color: #fecaca;
+}
+
+.shared-connections__profile-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	padding-top: 2px;
+}
+
+.shared-connections__profile-actions button:first-child,
+.shared-connections__action-panel-actions button[type="submit"] {
+	border-color: var(--connection-accent);
+	background: var(--connection-accent);
+	color: #fff;
+}
+
+.shared-connections__profile-actions button:first-child:hover,
+.shared-connections__action-panel-actions button[type="submit"]:hover {
+	border-color: #2563eb;
+	background: #2563eb;
+	color: #fff;
+	box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+}
+
+.shared-connections__action-panel {
+	display: grid;
+	gap: 16px;
+	padding: 0;
+	border: 0;
+	border-radius: 0;
+	background: transparent;
+}
+
+.shared-connections__action-panel-fields {
+	display: grid;
+	gap: 16px;
+}
+
+.shared-connections__action-panel > label,
+.shared-connections__action-panel-fields > label {
+	display: grid;
+	gap: 8px;
+	color: var(--connection-muted);
+	font-size: 12px;
+	font-weight: 600;
+}
+
+.shared-connections__action-panel-actions {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: flex-end;
+	gap: 12px;
+}
+
+.shared-connections__action-panel input,
+.shared-connections__action-panel textarea {
+	box-sizing: border-box;
+	width: 100%;
+	min-height: 44px;
+	padding: 12px 16px;
+	border: 1px solid var(--connection-border);
+	border-radius: 8px;
+	outline: none;
+	background: var(--connection-surface);
+	color: #f8fafc;
+	font: inherit;
+	font-size: 14px;
+	font-weight: 400;
+	transition:
+		border-color 0.2s ease,
+		background 0.2s ease,
+		box-shadow 0.2s ease;
+}
+
+.shared-connections__action-panel input:focus,
+.shared-connections__action-panel textarea:focus {
+	border-color: var(--connection-accent);
+	background: #1e293b;
+	box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+}
+
+.shared-connections__action-panel--fields {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.shared-connections__action-panel--fields label:last-of-type {
+	grid-column: 1 / -1;
+}
+
+.shared-connections button:focus-visible {
+	outline: 2px solid var(--connection-accent);
+	outline-offset: 2px;
+}
+
+.shared-connections button:disabled {
+	cursor: not-allowed;
+	opacity: 0.55;
+}
+
+@media (max-width: 560px) {
+	.shared-connection-card {
+		grid-template-columns: minmax(0, 1fr) auto;
+		padding: 14px;
+	}
+
+	.shared-connection-card__actions {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+
+	.shared-connection-card__switch {
+		grid-column: 1 / -1;
+	}
+
+	.shared-connections__profile-actions {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+	}
+
+	.shared-connections__profile-actions button:last-child:nth-child(odd) {
+		grid-column: 1 / -1;
+	}
+
+	.shared-connections__action-panel,
+	.shared-connections__action-panel--fields {
+		display: grid;
+		grid-template-columns: 1fr;
+	}
+
+	.shared-connections__action-panel--fields label:last-of-type {
+		grid-column: auto;
+	}
+}
+
+.shared-connections__match-code {
+	margin-top: 12px;
+	padding: 12px 16px;
+	border-radius: 8px;
+	background: rgba(127, 127, 127, 0.12);
+	text-align: center;
+}
+
+.shared-connections__match-code p {
+	margin: 0 0 6px;
+}
+
+.shared-connections__match-code-value {
+	font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+	font-size: 2rem;
+	font-weight: 600;
+	letter-spacing: 0.3em;
+	padding-left: 0.3em;
+}

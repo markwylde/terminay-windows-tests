@@ -1,0 +1,7663 @@
+import './headlessBootstrap';
+import { randomUUID } from 'node:crypto';
+import {
+	accessSync,
+	chmodSync,
+	existsSync,
+	type FSWatcher,
+	constants as fsConstants,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	statSync,
+	watch as watchFileSystemPath,
+	writeFileSync,
+} from 'node:fs';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import {
+	type ByteTransport,
+	createTerminayHostBytePacket,
+	parseTerminayHostBytePacket,
+	protocolError,
+	type TerminayHostActionRequest,
+	type TerminayHostConnectionProfile,
+	type TerminayHostContext,
+	type TerminayPairingProgressState,
+	type JsonValue,
+} from '@terminay/protocol';
+import {
+	app,
+	BrowserWindow,
+	clipboard,
+	contentTracing,
+	crashReporter,
+	dialog,
+	ipcMain,
+	Menu,
+	MessageChannelMain,
+	Notification,
+	nativeImage,
+	powerMonitor,
+	safeStorage,
+	screen,
+	shell,
+	webContents,
+} from 'electron';
+import {
+	AUXILIARY_WINDOW_PREFERRED_SIZE,
+	closesAuxiliaryWindow,
+	fitAuxiliaryWindowBounds,
+} from './auxiliaryWindowPlacement';
+import { LocalServerUiSession } from '../apps/terminay-desktop/src/main/localServerUiSession';
+import {
+	type DesktopBundleLaunch,
+	DesktopServerBundleHost,
+} from '../apps/terminay-desktop/src/main/serverBundleHost';
+import {
+	type AppControlAdapter,
+	type AutomationControlAdapter,
+	assertAutomationSpaceCapacity,
+	automationControlError,
+	type AppWindowControlAdapter,
+	ConnectedServerGateway,
+	CONTROL_PERMISSION_GROUPS,
+	CONTROL_TOOL_OPERATIONS,
+	createAppControlAdapter,
+	createAppWindowControlAdapter,
+	createMacroControlAdapter,
+	createSettingsControlAdapter,
+	createTerminalMetadataAdapter,
+	describeSettingsUpdate,
+	type MacroControlAdapter,
+	planSettingsUpdate,
+	type SettingsControlAdapter,
+	settingsState,
+	CONTROL_SOCKET_ENV,
+	CONTROL_TOKEN_ENV,
+	ControlCapabilityStore,
+	ControlEndpointError,
+	type ControlOperation,
+	ControlSocketPlacementError,
+	type ControlSocketPlacement,
+	type ControlPermissionGate,
+	type ControlRequestContext,
+	createControlEndpoint,
+	createMcpPermissionGate,
+	createNotificationControlAdapter,
+	describeNotificationRequest,
+	placeControlSocket,
+	resolveControlSocketPlacement,
+	createTerminalControlAdapter,
+	createWorkspaceViewAdapter,
+	type LocalControlEndpoint,
+	type McpApprovalDescription,
+	type NotificationControlAdapter,
+	ProjectHandleCodec,
+	reachOf,
+	resolveOpenTerminalProject,
+	type TerminalControlAdapter,
+	type WorkspaceViewControlAdapter,
+	WindowHandleCodec,
+	workspaceProjectFields,
+} from '../apps/terminay-server/src/index';
+import { createProtectedHostKeyStore } from '../apps/terminay-server/src/remote/hostedHostKey';
+import { parseHostedIceServers } from '../apps/terminay-server/src/remote/hostedPeerLifecycle';
+import { loadOrCreateSessionOrigin } from '../apps/terminay-server/src/remote/sessionOrigin';
+import type { McpServerCommand } from '../packages/extension-api/src/index';
+import { describeChatMcpCall } from '../packages/server-core/src/agentChat/activity';
+import { ParakeetRuntime } from '../packages/server-core/src/aiService/parakeetRuntime';
+import { APP_WINDOW_STORE_DIRECTORY_NAME } from '../packages/server-core/src/appWindows/store';
+import {
+	createFilePushEnrolmentPersistence,
+	PushEnrolmentStore,
+} from '../packages/server-core/src/push/enrolments';
+import { pushOriginForSessionOrigin } from '../packages/server-core/src/push/sender';
+import { launchDetachedSessionHolder } from '../packages/server-core/src/sessionHolder/factory';
+import { sessionHolderEnabled as isSessionHolderEnabled } from '../packages/server-core/src/sessionHolder/paths';
+import { backgroundTerminalLimitMs } from '../packages/server-core/src/settings/backgroundTerminals';
+import {
+	createAutomationFileBackends,
+	createJsonFileBackend,
+} from '../packages/server-core/src/automationService/fileBackend';
+import { AutomationRepository } from '../packages/server-core/src/automationService/repository';
+import { AutomationRunLog } from '../packages/server-core/src/automationService/runLog';
+import type { AutomationSubject } from '../packages/server-core/src/automationService/types';
+import {
+	agentHarnessSwitchesFromSettings,
+	agentIntegrationEnabledFromSettings,
+} from '../packages/server-core/src/extensions/sessionSources';
+import { MacroRepository } from '../packages/server-core/src/macroService/repository';
+import {
+	mcpPrincipalCommandRequest,
+	mcpPrincipalQueryRequest,
+} from '../packages/server-core/src/mcpPrincipal';
+import { SETTINGS_OPERATIONS } from '../packages/server-core/src/settings/protocol';
+import {
+	RecordingService,
+	ServerRecordingAdapter,
+} from '../packages/server-core/src/recordingService/index';
+import { ServerSettingsRepository } from '../packages/server-core/src/settings/repository';
+import { createServerVaultComposition } from '../packages/server-core/src/settings/vaultComposition';
+import {
+	createNodeShellDiscoveryHost,
+	ShellProfileCatalogueService,
+	ShellProfileDiscoveryService,
+} from '../packages/server-core/src/shellProfiles/index';
+import { RootFolderBrowser } from '../packages/server-core/src/rootFolderBrowser';
+import { commandSubmissionInput } from '../packages/server-core/src/terminalService/commandSubmission';
+import { nodeTerminalLaunchPathAuthority } from '../packages/server-core/src/terminalService/launchResolver';
+import type { TerminalEvent } from '../packages/server-core/src/terminalService/index';
+import {
+	AUTOMATION_SPACE_PROJECT_ID,
+	isAutomationSpace,
+} from '../packages/server-core/src/workspace';
+import { openCanonicalWorkspace } from '../packages/server-core/src/workspaceHydration';
+import {
+	findCommandForKeyboardEvent,
+	getCommandShortcut,
+	isReservedSystemAccelerator,
+} from '../src/keyboardShortcuts';
+import { defaultMacros, normalizeMacros } from '../src/macroSettings';
+import { distanceToRect, pointInRect } from '../src/projectTabDrag';
+import {
+	aboutWindowDocument,
+	aboutWindowExternalUrl,
+} from '../src/shared/aboutWindowDocument';
+import { type ServerMessagePort } from '../src/shared/serverPortTransport';
+import {
+	defaultTerminalSettings,
+	normalizeTerminalSettings,
+	selectDeviceTerminalSettings,
+} from '../src/terminalSettings';
+import type { MacroDefinition } from '../src/types/macros';
+import type { TerminalSettings } from '../src/types/settings';
+import type {
+	AiTabMetadataModel,
+	AppCommand,
+	RemoteAccessStatus,
+} from '../src/types/terminay';
+import {
+	AiTabMetadataService,
+	warmAiTabMetadataProviderEnv,
+} from './aiTabMetadata/service';
+import {
+	type AppUpdater,
+	createAppUpdater,
+	describeManualCheck,
+	UPDATE_CHECK_INTERVAL_MS,
+} from './appUpdater';
+import { showCanonicalLaunchRecovery } from './canonicalLaunchRecovery';
+import {
+	desktopEmbeddedStorePaths,
+	desktopLocalServerUiPartitionKey,
+	migrateLegacyEmbeddedRecordingServerId,
+	migrateLegacyEmbeddedWorkspaceServerId,
+	resolveDesktopInstanceIdentity,
+} from './desktopInstanceIdentity';
+import {
+	DesktopWindowCompositionStore,
+	desktopWindowCompositionKey,
+} from './desktopWindowComposition';
+import {
+	type DesktopConnectionLane,
+	type DesktopConnectionProfileRecord,
+	DesktopWindowConnections,
+} from './desktopWindowConnections';
+import { forgetRememberedConnection } from './forgetRememberedConnection';
+import {
+	openStartupWindowServer,
+	pairingTargetWindow,
+	switchWindowServer,
+} from './windowServerSwitch';
+import {
+	chooseWindowView,
+	type WindowViewKey,
+	workspaceWindowTitle,
+} from './windowWorkspaceView';
+import {
+	createProfileConnectQueue,
+	DesktopWindowIds,
+} from './remote/desktopWindowIdentity';
+import {
+	bindAppChildDiagnostics,
+	bindWebContentsDiagnostics,
+} from './diagnostics/electronEvents';
+import { gitObservationDiagnosticEvent } from './diagnostics/gitObservation';
+import { worktreeCaptureDiagnosticEvent } from './diagnostics/worktreeCapture';
+import { createSessionHolderDiagnostics } from './diagnostics/sessionHolderObservation';
+import { createDiagnosticsHelpMenuItems } from './diagnostics/menu';
+import { DesktopPerformanceLogging } from './diagnostics/performance';
+import { DesktopRuntimeMetrics } from './diagnostics/runtimeMetrics';
+import {
+	bindFatalProcessDiagnostics,
+	initializeDesktopDiagnostics,
+} from './diagnostics/service';
+import {
+	type StartupPhaseId,
+	type StartupSubPhaseId,
+	StartupTimeline,
+} from './diagnostics/startupTimeline';
+import { TerminalResourceSampler } from './diagnostics/terminalResources';
+import { normalizeExternalUrl } from './externalUrl';
+import { FileBufferService } from './fileViewer/fileBufferService';
+import { FileWatchService } from './fileViewer/fileWatchService';
+import { GitDiffService } from './fileViewer/gitDiffService';
+import { registerFileViewerIpcHandlers } from './fileViewer/ipc';
+import { createGracefulQuitHandler } from './gracefulQuit';
+import {
+	appQuitChoice,
+	createAppQuitConfirmationDialog,
+	planAppQuit,
+} from './appQuitPlan';
+import { createAppBadgeTracker } from './appBadge';
+import {
+	bindMainWindowCloseConfirmation,
+	createCloseConfirmationDialog,
+} from './mainWindowCloseConfirmation';
+import { TerminalRecordingService } from './recording/service';
+import {
+	connectDesktopHostedRemote,
+	type DesktopHostedSignalOptions,
+	isHostedDesktopOrigin,
+} from './remote/desktopHostedConnection';
+import { establishDesktopDevicePairing } from './remote/desktopPairing';
+import {
+	DesktopPairingAttempts,
+	runDesktopPairingAttempt,
+} from './remote/desktopPairingAttempt';
+import {
+	createDesktopReconnectTransport,
+	type DesktopReconnectTransport,
+} from './remote/desktopReconnect';
+import { createDesktopBootstrappedWebRtcConnection } from './remote/desktopWebRtcBootstrap';
+import { resolveDesktopWebRtcRuntimeRoot } from './remote/desktopWebRtcRuntimeRoot';
+import {
+	createEphemeralTestProtectedValueCodec,
+	DesktopDeviceCredentialStore,
+} from './remote/deviceCredentialStore';
+import { exposeOnStartup } from './remote/exposeOnStartup';
+import { hostedPairingDiagnosticEvent } from './remote/hostedPairingDiagnostics';
+import { DesktopServerOwnedExposure } from './remote/serverOwnedExposure';
+import { buildServerUiArchive } from './remote/serverUiArchive';
+import {
+	ServerTerminalAuthority,
+	writePortDiagnostic,
+} from './serverTerminalAuthority';
+import {
+	bindLocalServerUiDocumentEndpoint,
+	bindRemoteServerUiDocumentEndpoint,
+} from './serverUiDocumentEndpoint';
+import {
+	assertBoundServerUiEvent,
+	bindServerUiWindow,
+	getServerUiPartitionName,
+	releaseServerUiWindowBinding,
+} from './serverUiHost';
+import { secureSession } from './sessionSecurity';
+import {
+	desktopStartupLoadingDocument,
+	STARTUP_SWITCH_TO_LOCAL_FRAGMENT,
+	startupPhaseVisibilityCss,
+	startupSwitchToLocalCss,
+} from './startupLoadingDocument';
+import {
+	embeddedNotificationSettleMsOverride,
+	embeddedTerminalReplayBytesOverride,
+} from './testTerminalLimits';
+import {
+	embeddedManualServerClock,
+	type ManualServerClock,
+} from './testServerClock';
+import { installTestTerminalHandoff } from './testTerminalHandoff';
+import { NOTIFICATION_SETTLE_MS } from '../packages/server-core/src/notifications/types';
+import { assertTrustedIpcSender } from './trustedIpcSender';
+import { resolveDesktopUserDataPath } from './userDataNamespace';
+import {
+	ElectronSafeStorageVaultAdapter,
+	FileSafeStorageVaultRepository,
+} from './vault/safeStorageVault';
+import {
+	applyWindowMenu,
+	applyWindowMenus,
+	isMenuLessCopyInput,
+} from './windowMenuPolicy';
+import { canonicalAuxiliaryRequest } from './auxiliaryRouteAllowList';
+import { buildTerminayMenu } from './terminayMenu';
+import {
+	createEmbeddedWorkspaceStateBackend,
+	embeddedBuiltInExtensionArtifactRoot,
+	embeddedWorkspacePersistenceFault,
+	isEmbeddedWorkspacePersistenceError,
+} from './workspacePersistence';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+/**
+ * Leaves room for the project tab bar, sidebar group tabs, the active group's
+ * pane titles, and a usable workspace body. The flat sidebar solver treats
+ * anything smaller as an explicitly unsupported embedded/web presentation
+ * rather than clipping titles.
+ */
+const MAIN_PROJECT_WINDOW_MIN_HEIGHT = 260;
+const desktopTestCredentialCodec =
+	process.env.TERMINAY_TEST === '1'
+		? createEphemeralTestProtectedValueCodec(
+				process.env.TERMINAY_TEST_CREDENTIAL_KEY,
+			)
+		: undefined;
+
+process.env.APP_ROOT = path.join(__dirname, '..');
+app.setName('Terminay');
+
+const customUserDataPath = process.env.TERMINAY_USER_DATA_DIR?.trim();
+const resolvedUserDataPath = resolveDesktopUserDataPath({
+	appDataPath: app.getPath('appData'),
+	...(customUserDataPath ? { customPath: customUserDataPath } : {}),
+	isDevelopmentBuild:
+		process.env.TERMINAY_DEVELOPMENT_SOURCE_WORKSPACES === '1',
+	isPackaged: app.isPackaged,
+});
+if (resolvedUserDataPath) {
+	app.setPath('userData', resolvedUserDataPath);
+}
+if (!app.requestSingleInstanceLock()) {
+	app.exit(1);
+	process.exit(1);
+}
+
+/** The settings files are read on nearly every host interaction. Re-reading
+ * them from disk each time is invisible in this process's own CPU numbers but
+ * shows up as sustained load in any endpoint-security agent that authorizes
+ * every open. Cache the parsed value and let a directory watch invalidate it,
+ * so an external edit is still picked up without a read per call.
+ *
+ * These live here, above every module-scope construction below, because the
+ * first `readTerminalSettings()` runs while this module is still evaluating —
+ * `TerminalRecordingService` calls it from its constructor. Declared further
+ * down, the bundler hoists them as uninitialised bindings, the watch is armed
+ * against them anyway, and the first event the app's own startup writes trips
+ * over a value that is still `undefined`. */
+let cachedTerminalSettings: TerminalSettings | undefined;
+let terminalSettingsWatcher: FSWatcher | undefined;
+
+const embeddedDesktopInstance = resolveDesktopInstanceIdentity(
+	app.getPath('userData'),
+);
+const embeddedServerId = embeddedDesktopInstance.id;
+const embeddedStorePaths = desktopEmbeddedStorePaths(embeddedDesktopInstance);
+const embeddedLocalProfileId =
+	LocalServerUiSession.profileIdFor(embeddedServerId);
+
+// Desktop runs the bundle packaged with it for every connection, so the
+// per-server verified bundle cache written by older versions is dead material.
+// Remove it rather than leave verified remote code on disk.
+try {
+	rmSync(embeddedStorePaths.retiredUiBundleCache, {
+		force: true,
+		recursive: true,
+	});
+} catch {
+	// A cache directory that cannot be removed must never prevent startup.
+}
+
+try {
+	if (process.env.TERMINAY_TEST === '1' && resolvedUserDataPath) {
+		app.setAppLogsPath(path.join(resolvedUserDataPath, 'logs'));
+	} else {
+		app.setAppLogsPath();
+	}
+} catch {
+	process.stderr.write(
+		'[Terminay diagnostics] application log path setup failed\n',
+	);
+}
+app.commandLine.appendSwitch(
+	'enable-features',
+	'DocumentPolicyIncludeJSCallStacksInCrashReports',
+);
+const desktopDiagnostics = await initializeDesktopDiagnostics({
+	app,
+	crashReporter,
+});
+const unbindFatalProcessDiagnostics =
+	bindFatalProcessDiagnostics(desktopDiagnostics);
+const unbindAppChildDiagnostics = bindAppChildDiagnostics({
+	app,
+	diagnostics: desktopDiagnostics,
+});
+const desktopPerformanceLogging = new DesktopPerformanceLogging({
+	app,
+	contentTracing,
+	diagnostics: desktopDiagnostics,
+	listWebContents: () => webContents.getAllWebContents(),
+	// The Help menu no longer shows this state, so only renderers are told.
+	onEnabledChange: () => {
+		broadcastPerformanceLogging();
+	},
+	userDataDirectory: app.getPath('userData'),
+});
+
+/** Always-on, in-memory only. Never reaches the diagnostics writer. */
+const desktopStartupTimeline = new StartupTimeline();
+/** The window painting the pre-server loading document, while it is doing so. */
+let startupPhaseWindow: BrowserWindow | null = null;
+/** Repaints are dropped once the verified bundle navigation has begun, so the
+ * phase line can never race the handoff that replaces the whole document. */
+let startupPhasePaintingStopped = false;
+/** Keys of inserted phase rules, newest last, so superseded ones are removed. */
+let startupPhaseCssKeys: string[] = [];
+/** Reveals run one at a time. */
+let startupPhaseReveals: Promise<void> = Promise.resolve();
+
+/** Windows currently presenting the Performance Log route, and the release
+ * handle each one holds on the lightweight collector. Sampling runs only while
+ * this map is non-empty. */
+const performanceLogWindows = new Map<number, () => void>();
+
+const desktopRuntimeMetrics = new DesktopRuntimeMetrics({
+	app,
+	onSample: () => {
+		void broadcastPerformanceSnapshot();
+	},
+});
+const desktopTerminalResources = new TerminalResourceSampler();
+
+/** Open a startup phase and reveal its line on the loading document.
+ * Revealing is a style insertion, never a navigation, so it cannot destroy the
+ * renderer's execution context or interrupt the dot animation. It is also not
+ * awaited: a phase is never delayed by the line that names it. */
+function beginStartupPhase(id: StartupPhaseId | StartupSubPhaseId): void {
+	desktopStartupTimeline.begin(id);
+	revealStartupPhaseLine(id);
+}
+
+function endStartupPhase(id: StartupPhaseId | StartupSubPhaseId): void {
+	desktopStartupTimeline.end(id);
+}
+
+function revealStartupPhaseLine(id: StartupPhaseId | StartupSubPhaseId): void {
+	const window = startupPhaseWindow;
+	if (window === null || startupPhasePaintingStopped || window.isDestroyed())
+		return;
+	// Serialize so two phases cannot interleave their insert/remove pairs.
+	// Correctness does not depend on this: the rule form makes the newest rule
+	// win regardless. Serializing only keeps the stylesheet from growing.
+	startupPhaseReveals = startupPhaseReveals
+		.then(async () => {
+			if (startupPhasePaintingStopped || window.isDestroyed()) return;
+			const key = await window.webContents.insertCSS(
+				startupPhaseVisibilityCss(id),
+			);
+			const stale = startupPhaseCssKeys;
+			startupPhaseCssKeys = [key];
+			for (const previous of stale) {
+				if (window.isDestroyed()) return;
+				await window.webContents
+					.removeInsertedCSS(previous)
+					.catch(() => undefined);
+			}
+		})
+		.catch(() => {
+			// A failed reveal leaves the previously shown line in place.
+		});
+}
+
+/** Called once the verified bundle navigation owns the window. */
+function stopStartupPhasePainting(): void {
+	startupPhasePaintingStopped = true;
+	startupPhaseWindow = null;
+	startupPhaseCssKeys = [];
+}
+
+export const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'];
+export const MAIN_DIST = path.join(process.env.APP_ROOT, 'dist-electron');
+export const RENDERER_DIST = path.join(process.env.APP_ROOT, 'dist');
+export const SERVER_UI_DIST = path.join(process.env.APP_ROOT, 'dist-web');
+
+let localServerUiSession: LocalServerUiSession;
+let remoteServerUiBundleHost: DesktopServerBundleHost;
+let embeddedStartupWindowForRecovery: BrowserWindow | null = null;
+
+/** A window can be closed while Local startup is deliberately paused on the
+ * host-owned recovery document. The UI session does not exist yet in that
+ * state, so teardown must be a no-op instead of throwing from Electron's
+ * `closed` callback. */
+function releaseLocalServerUiSessionSafely(webContentsId: number): void {
+	try {
+		localServerUiSession?.release(webContentsId);
+	} catch (error) {
+		void desktopDiagnostics
+			.record(
+				{
+					component: 'renderer',
+					event: 'renderer.bootstrap.failed',
+					message: error,
+					severity: 'warning',
+					source: 'canonical-window-teardown',
+				},
+				{ channel: 'lifecycle' },
+			)
+			.catch(() => undefined);
+	}
+}
+
+/** Recovery diagnostics are intentionally best effort: their writer may be
+ * the failed dependency, and must never make a caught startup failure fatal. */
+function recordCanonicalRecoveryDiagnostic(message: unknown): Promise<void> {
+	return desktopDiagnostics
+		.record(
+			{
+				component: 'renderer',
+				event: 'renderer.bootstrap.failed',
+				message,
+				severity: 'error',
+				source: 'canonical-launch-recovery',
+			},
+			{ channel: 'lifecycle' },
+		)
+		.catch(() => undefined);
+}
+
+function recordDesktopHostedPeerDiagnostic(
+	type: 'candidate-pair' | 'connection-failed' | 'connection-status',
+	fields: Readonly<Record<string, string | number>>,
+): void {
+	void desktopDiagnostics
+		.record(
+			{
+				component: 'renderer',
+				event: `remote.hosted-peer.${type}`,
+				fields,
+				severity: type === 'connection-failed' ? 'warning' : 'info',
+				source: 'desktop-hosted-peer',
+			},
+			{ channel: 'lifecycle' },
+		)
+		.catch(() => undefined);
+}
+const localServerUiPartitionKey = desktopLocalServerUiPartitionKey(
+	embeddedServerId,
+	embeddedLocalProfileId,
+);
+
+process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL
+	? path.join(process.env.APP_ROOT, 'public')
+	: RENDERER_DIST;
+
+async function openInBrowser(url: unknown): Promise<void> {
+	await shell.openExternal(normalizeExternalUrl(url));
+}
+
+function shellEscapePath(pathValue: string): string {
+	return `'${pathValue.replace(/'/g, `'\\''`)}'`;
+}
+
+function expandClipboardFormatCandidates(format: string): string[] {
+	const candidates = new Set<string>([format]);
+	if (format.includes('.') && !format.includes('/'))
+		candidates.add(format.replace('.', '/'));
+	if (format.includes('/') && !format.includes('.'))
+		candidates.add(format.replace('/', '.'));
+	return [...candidates];
+}
+
+function readClipboardFormatText(format: string): string | null {
+	for (const candidate of expandClipboardFormatCandidates(format)) {
+		try {
+			const text = clipboard.read(candidate);
+			if (text.length > 0) return text;
+		} catch {
+			// Try the next native format representation.
+		}
+		try {
+			const data = clipboard.readBuffer(candidate);
+			if (data.length > 0) return data.toString('utf8');
+		} catch {
+			// Try the next native format representation.
+		}
+	}
+	return null;
+}
+
+function readClipboardFilePaths(): string[] {
+	const availableFormats = new Set(
+		clipboard.availableFormats().map((format) => format.toLowerCase()),
+	);
+	for (const format of [
+		'public.file-url',
+		'public/file-url',
+		'text/uri-list',
+		'nsfilenamespboardtype',
+	]) {
+		if (!availableFormats.has(format)) continue;
+		const value = readClipboardFormatText(format);
+		if (!value) continue;
+		const paths = value
+			.split(/\r?\n/)
+			.map((entry) => entry.trim())
+			.filter((entry) => entry.length > 0)
+			.map((entry) => {
+				if (!entry.startsWith('file://')) return entry;
+				try {
+					return fileURLToPath(entry);
+				} catch {
+					return entry;
+				}
+			})
+			.filter((entry) => !entry.includes('\0'));
+		if (paths.length > 0) return paths;
+	}
+	return [];
+}
+
+function readClipboardImagePath(): string | null {
+	const imageBytes = clipboard.readImage().toPNG();
+	if (imageBytes.length === 0) return null;
+	const tempDir = path.join(app.getPath('temp'), 'terminay-clipboard');
+	mkdirSync(tempDir, { recursive: true });
+	const filePath = path.join(tempDir, `clipboard-${randomUUID()}.png`);
+	writeFileSync(filePath, imageBytes);
+	return filePath;
+}
+
+function readTerminalClipboard(): string {
+	const filePaths = readClipboardFilePaths();
+	if (filePaths.length > 0) return filePaths.map(shellEscapePath).join(' ');
+	const text = clipboard.readText();
+	if (text.length > 0) return text;
+	const imagePath = readClipboardImagePath();
+	return imagePath === null ? '' : shellEscapePath(imagePath);
+}
+
+function isAppNavigation(url: string): boolean {
+	try {
+		const parsedUrl = new URL(url);
+
+		if (VITE_DEV_SERVER_URL) {
+			return parsedUrl.origin === new URL(VITE_DEV_SERVER_URL).origin;
+		}
+
+		if (parsedUrl.protocol !== 'file:') {
+			return false;
+		}
+
+		const filePath = fileURLToPath(parsedUrl);
+		const relativePath = path.relative(RENDERER_DIST, filePath);
+
+		return (
+			relativePath.length > 0 &&
+			!relativePath.startsWith('..') &&
+			!path.isAbsolute(relativePath)
+		);
+	} catch {
+		return false;
+	}
+}
+
+/** Privileged IPC is accepted only from the top-level, known Terminay app
+ * renderer. Payload validation alone is insufficient because a subframe or
+ * foreign document could otherwise invoke the same preload-exposed channel. */
+function assertTrustedAppSender(
+	event: Electron.IpcMainEvent | Electron.IpcMainInvokeEvent,
+): void {
+	assertTrustedIpcSender(event, {
+		isAllowedNavigation: isAppNavigation,
+		isKnownWindow: (sender) => {
+			const window = BrowserWindow.fromWebContents(
+				sender as Electron.WebContents,
+			);
+			return (
+				window !== null && !window.isDestroyed() && isTrustedAppWindow(window)
+			);
+		},
+	});
+}
+
+function isTrustedAppWindow(window: BrowserWindow): boolean {
+	return appWindows.has(window);
+}
+
+function isTrustedDictationWindow(window: BrowserWindow): boolean {
+	return appWindows.has(window);
+}
+
+function allowPrimaryWindowPermission(
+	requestingWebContents: unknown,
+	permission: unknown,
+	details: unknown,
+): boolean {
+	if (
+		permission !== 'media' ||
+		requestingWebContents === null ||
+		typeof requestingWebContents !== 'object'
+	) {
+		return false;
+	}
+
+	const window = BrowserWindow.fromWebContents(
+		requestingWebContents as Electron.WebContents,
+	);
+	if (window === null || !isTrustedDictationWindow(window)) {
+		return false;
+	}
+
+	const mediaDetails = details as {
+		mediaType?: unknown;
+		mediaTypes?: unknown;
+	};
+	if (mediaDetails.mediaType !== undefined) {
+		return mediaDetails.mediaType === 'audio';
+	}
+
+	return (
+		Array.isArray(mediaDetails.mediaTypes) &&
+		mediaDetails.mediaTypes.length > 0 &&
+		mediaDetails.mediaTypes.every((mediaType) => mediaType === 'audio')
+	);
+}
+
+/** Apply the process-wide, renderer-agnostic hardening shared by every native
+ * shell. The exact navigation allowlist belongs to the current server-UI
+ * document binding in `bindServerUiWindow`: a Desktop window can legitimately
+ * switch from the embedded bundle to a verified remote bundle, whose file root
+ * is not this application's static `dist` directory. Keeping the old
+ * application-root allowlist here silently prevented that committed switch and
+ * left the Connections dialog mounted. */
+function securePrimaryWindow(window: BrowserWindow): void {
+	const contents = window.webContents;
+	contents.setWindowOpenHandler(() => ({ action: 'deny' }));
+	contents.on('will-attach-webview', (event) => event.preventDefault());
+	secureSession(contents.session, allowPrimaryWindowPermission);
+}
+
+function getBrandAssetPath(filename: string): string | null {
+	const candidates = [
+		path.join(process.env.VITE_PUBLIC, filename),
+		path.join(process.cwd(), 'public', filename),
+		path.join(app.getAppPath(), 'public', filename),
+		path.join(process.env.APP_ROOT, 'public', filename),
+	];
+
+	for (const candidate of candidates) {
+		if (existsSync(candidate)) {
+			return candidate;
+		}
+	}
+
+	return null;
+}
+
+function getWindowIconPath(): string | undefined {
+	if (process.platform === 'win32') {
+		return (
+			getBrandAssetPath('icon.ico') ??
+			getBrandAssetPath('terminay.png') ??
+			undefined
+		);
+	}
+
+	if (process.platform === 'darwin') {
+		return (
+			getBrandAssetPath('icon.icns') ??
+			getBrandAssetPath('terminay.png') ??
+			undefined
+		);
+	}
+
+	return (
+		getBrandAssetPath('terminay.png') ??
+		getBrandAssetPath('terminay.svg') ??
+		undefined
+	);
+}
+
+let terminalZoomLevel = 0;
+
+function sendTerminalZoom(webContents: Electron.WebContents): void {
+	if (webContents.isDestroyed()) return;
+	webContents.send('server-ui-host:event', {
+		type: 'terminal.zoom',
+		zoomLevel: terminalZoomLevel,
+	});
+}
+
+function broadcastZoomChange(): void {
+	for (const window of BrowserWindow.getAllWindows()) {
+		sendTerminalZoom(window.webContents);
+	}
+}
+
+function zoomIn(): void {
+	if (terminalZoomLevel < 10) {
+		terminalZoomLevel++;
+		broadcastZoomChange();
+	}
+}
+
+function zoomOut(): void {
+	if (terminalZoomLevel > -5) {
+		terminalZoomLevel--;
+		broadcastZoomChange();
+	}
+}
+
+function resetZoom(): void {
+	terminalZoomLevel = 0;
+	broadcastZoomChange();
+}
+
+// Shell-profile discovery is constructed before the embedded authority. Keep
+// that lifecycle state explicit so its reference callback cannot mistake an
+// uninitialised binding for a published workspace authority.
+let serverTerminalAuthority: ServerTerminalAuthority | null = null;
+// MCP authority is separate from agent-journal observation. The store retains
+// only token digests and resolves every request to immutable terminal/project
+// scope before it reaches terminal operations.
+const mcpCapabilities = new ControlCapabilityStore();
+// Capabilities live as long as their terminals. A daily prune drops any whose
+// terminal ended without its exit being seen.
+const MCP_CAPABILITY_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+let mcpCapabilityPruneTimer: ReturnType<typeof setInterval> | undefined;
+let mcpControlEndpoint: LocalControlEndpoint | null = null;
+let removeMcpSettingsObserver: (() => void) | undefined;
+let removeMcpApprovalRevocation: (() => void) | undefined;
+let removeMcpCapabilityPersistence: (() => void) | undefined;
+let desktopRemoteExposure: DesktopServerOwnedExposure;
+let appliedAgentIntegrationSetting: boolean | null = null;
+let applyAgentIntegrationPromise = Promise.resolve();
+
+function applyAgentIntegrationSetting(
+	settings: TerminalSettings,
+): Promise<void> {
+	const enabled = settings.agentIntegration.enabled;
+	applyAgentIntegrationPromise = applyAgentIntegrationPromise
+		.catch(() => undefined)
+		.then(async () => {
+			if (appliedAgentIntegrationSetting === enabled) {
+				return;
+			}
+
+			const serverAgents = serverTerminalAuthority?.agents;
+			if (serverAgents !== undefined) {
+				await serverTerminalAuthority?.composition.start();
+				serverAgents.setIntegrationEnabled(enabled);
+			}
+			appliedAgentIntegrationSetting = enabled;
+		})
+		.catch((error) => {
+			appliedAgentIntegrationSetting = null;
+			console.error(
+				'[agent-status] failed to apply integration setting',
+				error,
+			);
+		});
+	return applyAgentIntegrationPromise;
+}
+
+// BrowserWindow identity outlives a renderer document and its transferred
+// MessagePort. Keep the selected authority separately so a reload reconnects
+// the same profile instead of allowing the Local load hook to take over.
+const remoteProfileBindingsByWebContents = new Map<number, string>();
+// Each native window is its own client window to a remote server.
+const desktopWindowIds = new DesktopWindowIds();
+const desktopProfileConnects = createProfileConnectQueue();
+const auxiliaryWindowsByPresentation = new Map<string, BrowserWindow>();
+/** Settings-family windows, as opposed to torn-off workspace windows. */
+const auxiliaryWindows = new WeakSet<BrowserWindow>();
+const launchRecoveryWebContents = new Set<number>();
+const deferredCanonicalLaunches = new Map<number, () => Promise<void>>();
+
+type RememberedRemoteConnection = {
+	id: string;
+	kind: 'device' | 'standalone';
+	label: string;
+	origin: string;
+	/** Server identity learned from the authenticated pairing transcript. */
+	serverId?: string;
+};
+
+const rememberedRemoteConnections = new Map<
+	string,
+	RememberedRemoteConnection
+>();
+let rememberedRemoteConnectionsLoaded = false;
+
+function rememberedRemoteConnectionsPath(): string {
+	return path.join(app.getPath('userData'), 'connection-profiles.json');
+}
+
+function loadRememberedRemoteConnections(): void {
+	if (rememberedRemoteConnectionsLoaded) return;
+	rememberedRemoteConnectionsLoaded = true;
+	try {
+		const raw = JSON.parse(
+			readFileSync(rememberedRemoteConnectionsPath(), 'utf8'),
+		) as unknown;
+		if (!Array.isArray(raw)) return;
+		for (const candidate of raw) {
+			if (
+				typeof candidate !== 'object' ||
+				candidate === null ||
+				Array.isArray(candidate)
+			)
+				continue;
+			const value = candidate as Record<string, unknown>;
+			if (
+				typeof value.id !== 'string' ||
+				typeof value.label !== 'string' ||
+				typeof value.origin !== 'string' ||
+				(value.kind !== 'device' && value.kind !== 'standalone')
+			)
+				continue;
+			const origin = new URL(value.origin);
+			if (
+				(origin.protocol !== 'https:' &&
+					!(
+						origin.protocol === 'http:' &&
+						['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)
+					)) ||
+				origin.username ||
+				origin.password ||
+				origin.pathname !== '/' ||
+				origin.search ||
+				origin.hash
+			)
+				continue;
+			rememberedRemoteConnections.set(value.id, {
+				id: value.id,
+				kind: value.kind,
+				label: value.label,
+				origin: origin.origin,
+				...(typeof value.serverId === 'string' &&
+				/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(value.serverId)
+					? { serverId: value.serverId }
+					: {}),
+			});
+		}
+	} catch {
+		// A missing or malformed metadata file is an empty profile list. It
+		// contains no credentials and must never prevent Local from starting.
+	}
+}
+
+/** The connection menu contains only non-secret profile metadata. Write it as
+ * one replacement so a reconnect never observes half a newly paired profile. */
+function rememberRemoteConnection(profile: RememberedRemoteConnection): void {
+	loadRememberedRemoteConnections();
+	rememberedRemoteConnections.set(profile.id, profile);
+	persistRememberedRemoteConnections();
+	publishRememberedRemoteConnections();
+}
+
+function persistRememberedRemoteConnections(): void {
+	const destination = rememberedRemoteConnectionsPath();
+	mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+	const temporary = `${destination}.${randomUUID()}.tmp`;
+	writeFileSync(
+		temporary,
+		JSON.stringify([...rememberedRemoteConnections.values()]),
+		{ encoding: 'utf8', mode: 0o600, flag: 'wx' },
+	);
+	renameSync(temporary, destination);
+}
+
+function createDesktopDeviceCredentialStore(): DesktopDeviceCredentialStore {
+	return new DesktopDeviceCredentialStore({
+		codec: desktopTestCredentialCodec ?? {
+			backend: selectedSafeStorageBackend,
+			decrypt: (encrypted) => safeStorage.decryptString(encrypted),
+			encrypt: (plainText) => safeStorage.encryptString(plainText),
+			isAvailable: () => safeStorage.isEncryptionAvailable(),
+		},
+		directory: path.join(app.getPath('userData'), 'remote-device-credentials'),
+	});
+}
+
+/** The renderer supplies a bounded opaque payload only. The native host owns
+ * destination selection and writes through a same-directory temporary file so
+ * cancellation/failure cannot leave a partial requested destination. */
+async function savePreviewDownload(
+	window: BrowserWindow,
+	action: Extract<
+		TerminayHostActionRequest['action'],
+		{ type: 'preview.download' }
+	>,
+): Promise<{ canceled: boolean }> {
+	const result = await dialog.showSaveDialog(window, {
+		defaultPath: action.filename,
+		title: 'Save preview download',
+	});
+	if (result.canceled || result.filePath === undefined)
+		return { canceled: true };
+	const bytes = Buffer.from(action.bytesBase64, 'base64');
+	if (bytes.byteLength === 0 || bytes.byteLength > 16 * 1024 * 1024)
+		throw new Error('Preview download payload is invalid.');
+	const temporary = path.join(
+		path.dirname(result.filePath),
+		`.${path.basename(result.filePath)}.${randomUUID()}.download`,
+	);
+	try {
+		await writeFile(temporary, bytes, { flag: 'wx', mode: 0o600 });
+		await rename(temporary, result.filePath);
+		return { canceled: false };
+	} finally {
+		await rm(temporary, { force: true }).catch(() => undefined);
+	}
+}
+
+function selectedSafeStorageBackend(): string | undefined {
+	const backend = (
+		safeStorage as typeof safeStorage & {
+			getSelectedStorageBackend?: () => string | undefined;
+		}
+	).getSelectedStorageBackend;
+	return typeof backend === 'function' ? backend.call(safeStorage) : undefined;
+}
+
+// A project torn off into its own window (or merged into another) travels as an
+// opaque payload built by the renderer. Main only needs the terminal session
+// ids so it can re-home ownership of the live PTYs to the receiving window.
+// Project-host (index.html) windows, as opposed to the auxiliary settings /
+// macros / recordings / edit windows. Multi-window project tabs are peers.
+const appWindows = new Set<BrowserWindow>();
+const workspaceViewByWebContents = new Map<number, string>();
+// A server-UI document has exactly one opaque byte endpoint.  Rebinding a
+// Desktop window from Local to a paired server must retire the Local endpoint
+// before the new preload announces readiness; otherwise both endpoint owners
+// can race to deliver a port and the new document can reconnect to Local.
+const documentEndpointUnbindByWebContents = new Map<number, () => void>();
+
+// One window holds one primary connection plus an attached set. The registry
+// is per native window and is torn down with it, so no attached transport can
+// outlive the document that asked for it.
+const windowConnectionsByWebContents = new Map<
+	number,
+	DesktopWindowConnections
+>();
+
+/** How main shows a server in one window. Each window registers its own. */
+type WindowServerController = Readonly<{
+	window: BrowserWindow;
+	isAuxiliary: boolean;
+	/** True for a window that is not a torn-off workspace view. */
+	isMainWorkspace: boolean;
+	currentProfileId: () => string;
+	/** What the window is presenting, once it has mounted a workspace. */
+	currentViewKey: () => WindowViewKey | undefined;
+	mountRemote: (
+		profile: RememberedRemoteConnection,
+		remote: Readonly<{ launch: DesktopBundleLaunch; transport: ByteTransport }>,
+	) => Promise<void>;
+	mountLocal: () => Promise<void>;
+}>;
+
+const windowServerControllers = new Map<number, WindowServerController>();
+
+function windowServerMemoryPath(): string {
+	return path.join(app.getPath('userData'), 'window-server.v1.json');
+}
+
+/** Which server the workspace window last showed. Device-local presentation
+ * state: a profile id and nothing else. */
+function rememberWindowServer(profileId: string): void {
+	try {
+		const destination = windowServerMemoryPath();
+		mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+		const temporary = `${destination}.${randomUUID()}.tmp`;
+		writeFileSync(temporary, JSON.stringify({ profileId }), {
+			encoding: 'utf8',
+			mode: 0o600,
+			flag: 'wx',
+		});
+		renameSync(temporary, destination);
+	} catch {
+		// Where the window reopens is a convenience; failing to record it must
+		// not fail the switch that just happened.
+	}
+}
+
+function readRememberedWindowServer(): string | undefined {
+	try {
+		const raw = JSON.parse(readFileSync(windowServerMemoryPath(), 'utf8')) as
+			| Record<string, unknown>
+			| undefined;
+		return typeof raw?.profileId === 'string' ? raw.profileId : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Show a remembered server, or Local, in one window. The window keeps its
+ * current server until the next one's transport is open.
+ */
+async function switchWindowToServer(
+	requestingWebContentsId: number,
+	profileId: string,
+	options?: Readonly<{ keepAuxiliary?: BrowserWindow }>,
+): Promise<void> {
+	const requesting = windowServerControllers.get(requestingWebContentsId);
+	// A choice made in an auxiliary window is about its workspace window.
+	const parent = requesting?.isAuxiliary
+		? requesting.window.getParentWindow()
+		: null;
+	const controller =
+		requesting?.isAuxiliary && parent !== null && !parent.isDestroyed()
+			? windowServerControllers.get(parent.webContents.id)
+			: requesting;
+	if (
+		controller === undefined ||
+		controller.isAuxiliary ||
+		controller.window.isDestroyed()
+	)
+		throw new Error('There is no workspace window to show that server in.');
+	const targetId = controller.window.webContents.id;
+	loadRememberedRemoteConnections();
+	const outcome = await switchWindowServer({
+		profileId,
+		currentProfileId: controller.currentProfileId(),
+		localProfileId: embeddedLocalProfileId,
+		isRemembered: (id) => rememberedRemoteConnections.has(id),
+		connectRemote: (id) => {
+			const profile = rememberedRemoteConnections.get(id);
+			if (profile === undefined)
+				throw new Error('That server is no longer saved on this computer.');
+			return prepareCanonicalDesktopRemoteConnection(
+				profile,
+				desktopWindowIds.for(targetId),
+			);
+		},
+		mountRemote: (id, remote) => {
+			const profile = rememberedRemoteConnections.get(id);
+			if (profile === undefined)
+				throw new Error('That server is no longer saved on this computer.');
+			return controller.mountRemote(profile, remote);
+		},
+		discardRemote: (remote) =>
+			remote.transport.close({ code: 'normal' }).then(() => undefined),
+		mountLocal: controller.mountLocal,
+		// Settings, Macros and the like present the server of the window they
+		// were opened from, so they go when that window shows another.
+		beforeMount: () => {
+			for (const child of controller.window.getChildWindows())
+				if (child !== options?.keepAuxiliary && !child.isDestroyed())
+					child.close();
+		},
+	});
+	if (outcome === 'switched' && controller.isMainWorkspace)
+		rememberWindowServer(profileId);
+}
+
+/** How long the server the window is returning to may take before the
+ * loading state offers Local instead. */
+const STARTUP_OFFER_LOCAL_AFTER_MS = 2_000;
+
+/**
+ * Open the startup window on the server it last showed. The loading state
+ * stays up until that server answers, so the window never shows Local on its
+ * way to another server.
+ */
+async function openStartupWindow(window: BrowserWindow): Promise<void> {
+	const targetId = window.webContents.id;
+	const controller = windowServerControllers.get(targetId);
+	loadRememberedRemoteConnections();
+	let requestLocal: () => void = () => undefined;
+	const localRequested = new Promise<void>((resolve) => {
+		requestLocal = resolve;
+	});
+	// The loading document runs no script: its one link is a fragment, and
+	// following it is the request.
+	const onInPageNavigation = (_event: unknown, url: string) => {
+		if (url.endsWith(STARTUP_SWITCH_TO_LOCAL_FRAGMENT)) requestLocal();
+	};
+	window.webContents.on('did-navigate-in-page', onInPageNavigation);
+	try {
+		const outcome = await openStartupWindowServer({
+			rememberedProfileId: readRememberedWindowServer(),
+			localProfileId: embeddedLocalProfileId,
+			isRemembered: (id) =>
+				controller !== undefined && rememberedRemoteConnections.has(id),
+			connectRemote: (id) => {
+				const profile = rememberedRemoteConnections.get(id);
+				if (profile === undefined)
+					throw new Error('That server is no longer saved on this computer.');
+				beginStartupPhase('last-server-connect');
+				return prepareCanonicalDesktopRemoteConnection(
+					profile,
+					desktopWindowIds.for(targetId),
+				).catch((error: unknown) => {
+					console.error('[main] The last server did not answer', error);
+					throw error;
+				});
+			},
+			mountRemote: async (id, remote) => {
+				const profile = rememberedRemoteConnections.get(id);
+				if (profile === undefined || controller === undefined)
+					throw new Error('That server is no longer saved on this computer.');
+				await controller.mountRemote(profile, remote).catch((error: unknown) => {
+					console.error('[main] The last server failed to open', error);
+					throw error;
+				});
+				deferredCanonicalLaunches.delete(targetId);
+			},
+			discardRemote: (remote) =>
+				remote.transport.close({ code: 'normal' }).then(() => undefined),
+			mountLocal: () => launchDeferredCanonicalWindow(window),
+			localRequested,
+			offerLocalAfterMs: STARTUP_OFFER_LOCAL_AFTER_MS,
+			offerLocal: () => {
+				if (startupPhasePaintingStopped || window.isDestroyed()) return;
+				void window.webContents
+					.insertCSS(startupSwitchToLocalCss())
+					.catch(() => undefined);
+			},
+			// The verified bundle navigation now owns the window; stop repainting
+			// the loading document so a phase line can never race the handoff.
+			beforeMount: () => {
+				endStartupPhase('last-server-connect');
+				stopStartupPhasePainting();
+			},
+		});
+		// Choosing Local is a choice of server like any other, so the window
+		// reopens there. A server that merely did not answer stays remembered.
+		if (outcome === 'local-requested')
+			rememberWindowServer(embeddedLocalProfileId);
+	} finally {
+		if (!window.isDestroyed())
+			window.webContents.off('did-navigate-in-page', onInPageNavigation);
+	}
+}
+
+/** Open a new window showing a remembered server, or Local. */
+async function openServerInNewWindow(profileId: string): Promise<void> {
+	let opened: BrowserWindow | null;
+	if (profileId === embeddedLocalProfileId) {
+		opened = createWindow();
+	} else {
+		loadRememberedRemoteConnections();
+		const profile = rememberedRemoteConnections.get(profileId);
+		if (profile === undefined)
+			throw new Error('That server is no longer saved on this computer.');
+		// The window does not exist yet; it adopts this id once it does.
+		const windowId = desktopWindowIds.mint();
+		const lanes = await openDesktopRemoteLanes(profile, windowId);
+		try {
+			opened = createWindow({
+				serverUiLaunch: await prepareCanonicalRemoteLaunch(profile, lanes),
+				serverUiTransport: lanes.transport,
+			});
+		} catch (error) {
+			await lanes.transport.close({ code: 'normal' }).catch(() => undefined);
+			throw error;
+		}
+		if (opened !== null) {
+			desktopWindowIds.adopt(opened.webContents.id, windowId);
+			remoteProfileBindingsByWebContents.set(opened.webContents.id, profile.id);
+		}
+	}
+	if (opened === null) throw new Error('Desktop is closing.');
+	const window = opened;
+	window.once('ready-to-show', () => {
+		if (window.isDestroyed()) return;
+		window.show();
+		window.focus();
+	});
+}
+
+/** Every window lists the same remembered set, so each is told when it changes. */
+function publishRememberedRemoteConnections(): void {
+	for (const connections of windowConnectionsByWebContents.values())
+		connections.refresh();
+}
+
+/** Rename changes display metadata only. Local is not a remembered profile. */
+function renameRememberedRemoteConnection(
+	profileId: string,
+	label: string,
+): void {
+	loadRememberedRemoteConnections();
+	const profile = rememberedRemoteConnections.get(profileId);
+	if (profile === undefined)
+		throw new Error('That connection profile is no longer available.');
+	rememberedRemoteConnections.set(profileId, { ...profile, label });
+	persistRememberedRemoteConnections();
+	publishRememberedRemoteConnections();
+}
+
+/**
+ * Forget removes this device's credential and metadata for a remembered
+ * server. It changes nothing on that server: the device stays authorized there
+ * until it is revoked.
+ */
+async function forgetRememberedRemoteConnection(
+	profileId: string,
+): Promise<void> {
+	loadRememberedRemoteConnections();
+	const forgotten = await forgetRememberedConnection({
+		profileId,
+		localProfileId: embeddedLocalProfileId,
+		profiles: rememberedRemoteConnections,
+		windows: [...windowConnectionsByWebContents.values()],
+		removeCredential: (origin) =>
+			createDesktopDeviceCredentialStore().remove(origin),
+		removeProfile: (id) => {
+			rememberedRemoteConnections.delete(id);
+			persistRememberedRemoteConnections();
+		},
+	});
+	if (forgotten) publishRememberedRemoteConnections();
+}
+
+/** Device-local window composition, persisted beside geometry. */
+const desktopWindowCompositions = new DesktopWindowCompositionStore(
+	path.join(app.getPath('userData'), 'window-composition.v1.json'),
+);
+
+/**
+ * Two open windows can share a presentation identity — two Local windows show
+ * the same profile and the same default view — and their compositions must not
+ * overwrite each other. Each window takes the lowest free slot beside that
+ * identity and gives it back when it closes, so reopening the same windows
+ * finds the same records rather than a BrowserWindow id that no restart keeps.
+ */
+const desktopCompositionSlotsInUse = new Map<string, Set<number>>();
+const desktopCompositionSlotByWebContents = new Map<
+	number,
+	Readonly<{ identity: string; slot: number }>
+>();
+
+function claimDesktopCompositionSlot(
+	webContentsId: number,
+	identity: string,
+): number {
+	releaseDesktopCompositionSlot(webContentsId);
+	let used = desktopCompositionSlotsInUse.get(identity);
+	if (used === undefined) {
+		used = new Set<number>();
+		desktopCompositionSlotsInUse.set(identity, used);
+	}
+	let slot = 0;
+	while (used.has(slot)) slot += 1;
+	used.add(slot);
+	desktopCompositionSlotByWebContents.set(webContentsId, { identity, slot });
+	return slot;
+}
+
+function releaseDesktopCompositionSlot(webContentsId: number): void {
+	const held = desktopCompositionSlotByWebContents.get(webContentsId);
+	if (held === undefined) return;
+	desktopCompositionSlotByWebContents.delete(webContentsId);
+	const used = desktopCompositionSlotsInUse.get(held.identity);
+	if (used === undefined) return;
+	used.delete(held.slot);
+	if (used.size === 0) desktopCompositionSlotsInUse.delete(held.identity);
+}
+
+/** The non-secret profile records the `connections` capability may name. */
+function desktopConnectionProfileRecords(): readonly DesktopConnectionProfileRecord[] {
+	loadRememberedRemoteConnections();
+	return Object.freeze([
+		Object.freeze({
+			id: embeddedLocalProfileId,
+			isLocal: true,
+			label: 'Local',
+			serverId: embeddedServerId,
+		}),
+		...[...rememberedRemoteConnections.values()]
+			.sort((left, right) => left.label.localeCompare(right.label))
+			.map((remote) =>
+				Object.freeze({
+					id: remote.id,
+					isLocal: false,
+					label: remote.label,
+					...(remote.serverId === undefined
+						? {}
+						: { serverId: remote.serverId }),
+				}),
+			),
+	]);
+}
+
+/**
+ * Open one attached connection for a window and hand its document a dedicated
+ * byte endpoint.
+ *
+ * Local uses the same private MessagePort the embedded authority already
+ * speaks; a remote profile reuses the existing per-profile transport
+ * establishment, so its device credential is consumed here in main and never
+ * reaches the renderer. The renderer receives an opaque `MessagePort` and the
+ * sanitized server identity that binds every packet on it.
+ */
+async function openDesktopConnectionLane(
+	target: BrowserWindow,
+	ownerId: number,
+	profile: DesktopConnectionProfileRecord,
+	connectionId: string,
+	onLost: () => void,
+): Promise<DesktopConnectionLane> {
+	const deliver = (serverId: string, port: Electron.MessagePortMain) => {
+		if (target.isDestroyed()) throw new Error('Desktop window is closed.');
+		target.webContents.postMessage(
+			'server-ui-host:connection-endpoint',
+			{ connectionId, serverId },
+			[port],
+		);
+	};
+	if (profile.isLocal) {
+		if (serverTerminalAuthority === null)
+			throw new Error('The Local server is unavailable.');
+		const channel = new MessageChannelMain();
+		// One window holds several Local lanes at once — its primary document
+		// endpoint and every attached connection — and the authority evicts an
+		// owner slot when it is claimed again. Each connection owns its own slot,
+		// so replacing one endpoint never closes another connection's port.
+		serverTerminalAuthority.acceptRendererPort(
+			channel.port1 as unknown as ServerMessagePort,
+			{ ownerId: `${ownerId}:${connectionId}` },
+		);
+		try {
+			deliver(embeddedServerId, channel.port2);
+		} catch (error) {
+			channel.port1.close();
+			channel.port2.close();
+			throw error;
+		}
+		return Object.freeze({
+			serverId: embeddedServerId,
+			close: () => channel.port1.close(),
+		});
+	}
+	loadRememberedRemoteConnections();
+	const remote = rememberedRemoteConnections.get(profile.id);
+	if (remote === undefined)
+		throw new Error('That connection profile is no longer available.');
+	const lanes = await openDesktopRemoteLanes(
+		remote,
+		desktopWindowIds.for(ownerId),
+	);
+	try {
+		const serverId =
+			lanes.serverId ??
+			remote.serverId ??
+			(await readRemoteServerIdentity(remote.origin));
+		const channel = new MessageChannelMain();
+		let closed = false;
+		const close = async () => {
+			if (closed) return;
+			closed = true;
+			channel.port1.close();
+			await lanes.transport.close({ code: 'normal' }).catch(() => undefined);
+		};
+		channel.port1.on('message', ({ data }) => {
+			if (closed) return;
+			try {
+				const packet = parseTerminayHostBytePacket(data, serverId);
+				void lanes.transport.send(packet.frame).catch(() => {
+					void close().finally(onLost);
+				});
+			} catch {
+				void close().finally(onLost);
+			}
+		});
+		channel.port1.start();
+		await lanes.transport.open();
+		void (async () => {
+			for await (const frame of lanes.transport.incoming) {
+				if (closed) return;
+				channel.port1.postMessage(
+					createTerminayHostBytePacket(serverId, frame),
+				);
+			}
+		})()
+			.catch(() => undefined)
+			.finally(() => {
+				if (closed) return;
+				void close().finally(onLost);
+			});
+		try {
+			deliver(serverId, channel.port2);
+		} catch (error) {
+			closed = true;
+			channel.port1.close();
+			channel.port2.close();
+			await lanes.transport.close({ code: 'normal' }).catch(() => undefined);
+			throw error;
+		}
+		return Object.freeze({ serverId, close });
+	} catch (error) {
+		await lanes.transport.close({ code: 'normal' }).catch(() => undefined);
+		throw error;
+	}
+}
+
+function sanitizedDesktopConnectionProfiles(
+	selectedProfileId: string,
+): Readonly<{
+	profile: Readonly<{
+		id: string;
+		isLocal: boolean;
+		label: string;
+		status: 'connected' | 'offline' | 'unavailable';
+	}>;
+	profiles: readonly Readonly<{
+		id: string;
+		isLocal: boolean;
+		label: string;
+		status: 'connected' | 'offline' | 'unavailable';
+	}>[];
+}> {
+	loadRememberedRemoteConnections();
+	const profiles = [
+		{
+			id: embeddedLocalProfileId,
+			isLocal: true,
+			label: 'Local',
+			status:
+				selectedProfileId === embeddedLocalProfileId
+					? ('connected' as const)
+					: ('offline' as const),
+		},
+		...[...rememberedRemoteConnections.values()]
+			.sort((left, right) => left.label.localeCompare(right.label))
+			.map((remote) => ({
+				id: remote.id,
+				isLocal: false,
+				label: remote.label,
+				status:
+					remote.id === selectedProfileId
+						? ('connected' as const)
+						: ('offline' as const),
+			})),
+	];
+	const profile = profiles.find(
+		(candidate) => candidate.id === selectedProfileId,
+	);
+	if (profile === undefined)
+		throw new Error('The Desktop window profile is unavailable.');
+	return Object.freeze({
+		profile: Object.freeze(profile),
+		profiles: Object.freeze(
+			profiles.map((candidate) => Object.freeze(candidate)),
+		),
+	});
+}
+
+function getRunningTerminalCount(): number {
+	const authority = serverTerminalAuthority;
+	if (authority === null) return 0;
+	return authority.list().filter((session) => {
+		// A session can be listed while its activity is not registered, and
+		// asking then throws. This runs while the application is quitting,
+		// where an uncaught error aborts the process instead of quitting it.
+		try {
+			return (
+				authority.activity.get({
+					serverId: session.serverId,
+					projectId: session.projectId,
+					sessionId: session.id,
+				})?.foregroundBusy === true
+			);
+		} catch {
+			return false;
+		}
+	}).length;
+}
+
+async function getRunningTerminalCountForWindow(
+	webContentsId: number,
+): Promise<number> {
+	const authority = serverTerminalAuthority;
+	if (authority === null) return 0;
+	// A torn-off window owns a logical workspace view.  Its terminal stream can
+	// still be replaying into the new renderer when the user closes the window,
+	// so a transient renderer subscription is not a safe destructive-close
+	// boundary.  Resolve the terminal scope from the canonical view instead.
+	const viewId = workspaceViewByWebContents.get(webContentsId);
+	const projectIds = authority.workspace.state.views[viewId ?? '']?.projectIds;
+	if (projectIds === undefined) return 0;
+	const observations = await Promise.all(
+		[...new Set(projectIds)].map(async (projectId) => {
+			try {
+				return await authority.service.observeProjectForegroundProcesses(
+					projectId,
+				);
+			} catch {
+				// Missing observation is not a running process.
+				return [];
+			}
+		}),
+	);
+	return observations.flat().filter((observation) => observation.foregroundBusy)
+		.length;
+}
+
+if (process.env.TERMINAY_TEST === '1') {
+	Object.defineProperty(
+		globalThis,
+		'__terminayTestRunningTerminalCountForWindow',
+		{
+			configurable: true,
+			value: getRunningTerminalCountForWindow,
+		},
+	);
+	// The revision of the workspace the embedded server holds now, so a test
+	// can wait until a window has drawn everything committed so far.
+	Object.defineProperty(globalThis, '__terminayTestWorkspaceRevision', {
+		configurable: true,
+		value: () => serverTerminalAuthority?.workspace.state.revision ?? 0,
+	});
+}
+
+// macOS Dock tile, and on Linux the launcher count of desktops that read one.
+// Elsewhere Electron reports failure, which is the specified outcome.
+const appBadge = createAppBadgeTracker((count) => {
+	app.setBadgeCount(count);
+});
+app.on('will-quit', () => appBadge.reset());
+
+if (process.env.TERMINAY_TEST === '1') {
+	Object.defineProperty(globalThis, '__terminayTestAppBadgeTotal', {
+		configurable: true,
+		value: () => appBadge.total(),
+	});
+}
+
+/**
+ * E2E-only: the embedded server's held clock, and what a test needs to see to
+ * know which period it is in. Nothing here acts on the workspace.
+ */
+function exposeTestServerClock(
+	authority: ServerTerminalAuthority,
+	clock: ManualServerClock,
+): void {
+	const decoder = new TextDecoder();
+	// What each terminal has been sent, in order. Activity hears each write
+	// before this does, so what is here has been judged as input.
+	const inputs = new Map<string, string>();
+	const inputDecoder = new TextDecoder();
+	authority.service.onInput((identity, bytes) => {
+		const previous = inputs.get(identity.sessionId) ?? '';
+		inputs.set(
+			identity.sessionId,
+			(previous + inputDecoder.decode(bytes)).slice(-65_536),
+		);
+	});
+	Object.defineProperty(globalThis, '__terminayTestServerClock', {
+		configurable: true,
+		value: Object.freeze({
+			advance: (milliseconds: number) => clock.advance(milliseconds),
+			notificationSettleMs: NOTIFICATION_SETTLE_MS,
+			notifications: () => {
+				const manager = authority.composition.notifications;
+				return {
+					pending: manager?.pendingCount ?? 0,
+					published: Object.keys(manager?.snapshot().notifications ?? {})
+						.length,
+					revision: manager?.revision ?? 0,
+				};
+			},
+			activity: (sessionId: string) => {
+				const snapshot = authority.activity.snapshot().sessions[sessionId];
+				return snapshot === undefined
+					? undefined
+					: {
+							acknowledged: snapshot.acknowledged,
+							attention: snapshot.attention,
+							revision: authority.activity.revision,
+							source: snapshot.source,
+							status: snapshot.status,
+						};
+			},
+			input: (sessionId: string) => inputs.get(sessionId) ?? '',
+			// The output the server has taken in. Activity reads each chunk in the
+			// same turn that retains it, so what is here has been judged.
+			output: (sessionId: string) => {
+				let text = '';
+				let fromPosition: number | undefined;
+				for (;;) {
+					const read = authority.service.readRetainedOutput(sessionId, {
+						maxBytes: 1 << 20,
+						...(fromPosition === undefined ? {} : { fromPosition }),
+					});
+					text += decoder.decode(read.bytes, { stream: read.hasMore });
+					if (!read.hasMore) return text;
+					fromPosition = read.nextPosition;
+				}
+			},
+		}),
+	});
+}
+
+function getOpenProjectWindowCount(): number {
+	let count = 0;
+	for (const window of appWindows) {
+		if (!window.isDestroyed()) count += 1;
+	}
+	return count;
+}
+const fileBufferService = new FileBufferService(() => app.getPath('home'));
+const fileWatchService = new FileWatchService(fileBufferService);
+const gitDiffService = new GitDiffService(fileBufferService);
+const aiTabMetadataService = new AiTabMetadataService(app.getPath('home'));
+const parakeetRuntime = new ParakeetRuntime({
+	rootDirectory: path.join(app.getPath('userData'), 'dictation', 'parakeet'),
+});
+warmAiTabMetadataProviderEnv();
+
+const recordingService = new TerminalRecordingService({
+	getHomePath: () => app.getPath('home'),
+	getLibraryIndexPath: () =>
+		path.join(app.getPath('userData'), 'recording-roots.json'),
+	getSettings: () => readTerminalSettings(),
+	onStateChanged: () => undefined,
+});
+
+function handleServerTerminalEvent(event: TerminalEvent): void {
+	if (event.type === 'output') {
+		const data = new TextDecoder().decode(event.bytes);
+		try {
+			recordingService.appendOutput(event.sessionId, data);
+		} catch {
+			/* recording is optional */
+		}
+		return;
+	}
+
+	if (event.type === 'exit') {
+		mcpCapabilities.onTerminalExit(event.sessionId);
+		recordingService.finalize(event.sessionId, event.exitCode, event.signal);
+	}
+}
+
+const serverRecordingService = new RecordingService({
+	serverId: embeddedServerId,
+	recordingRoot: embeddedStorePaths.recordings,
+	homeDirectory: app.getPath('home'),
+	libraryIndexPath: embeddedStorePaths.recordingLibrary,
+	migrateStoredMetadata: (metadata) =>
+		migrateLegacyEmbeddedRecordingServerId(metadata, embeddedServerId),
+});
+const serverRecordingAdapter = new ServerRecordingAdapter(
+	serverRecordingService,
+	{
+		serverId: embeddedServerId,
+		resolveSessionProject: (sessionId) =>
+			serverTerminalAuthority?.service
+				.listSessions()
+				.find((session) => session.sessionId === sessionId)?.projectId,
+	},
+);
+
+const embeddedServerSettingsPath = path.join(
+	app.getPath('userData'),
+	'server-settings.v1.json',
+);
+const embeddedServerSettings = new ServerSettingsRepository({
+	load: async () => {
+		try {
+			return JSON.parse(
+				await readFile(embeddedServerSettingsPath, 'utf8'),
+			) as unknown;
+		} catch (error) {
+			if ((error as { code?: string }).code === 'ENOENT')
+				return readTerminalSettings();
+			throw error;
+		}
+	},
+	backup: async (source) => {
+		const backupPath = `${embeddedServerSettingsPath}.pre-migration.json`;
+		await mkdir(path.dirname(backupPath), { recursive: true, mode: 0o700 });
+		try {
+			await writeFile(backupPath, JSON.stringify(source), {
+				encoding: 'utf8',
+				flag: 'wx',
+				mode: 0o600,
+			});
+		} catch (error) {
+			if ((error as { code?: string }).code !== 'EEXIST') throw error;
+		}
+	},
+	commit: async (state) => {
+		await mkdir(path.dirname(embeddedServerSettingsPath), {
+			recursive: true,
+			mode: 0o700,
+		});
+		const temporary = `${embeddedServerSettingsPath}.${randomUUID()}.tmp`;
+		try {
+			await writeFile(temporary, JSON.stringify(state), {
+				encoding: 'utf8',
+				flag: 'wx',
+				mode: 0o600,
+			});
+			await rename(temporary, embeddedServerSettingsPath);
+		} finally {
+			await rm(temporary, { force: true }).catch(() => undefined);
+		}
+	},
+});
+
+/**
+ * Remote exposure is a selected-server feature. Its non-secret configuration
+ * therefore comes from the embedded server repository, not the Desktop
+ * device-settings projection. The pairing-PIN verifier remains local and is
+ * deliberately not included in the server settings snapshot.
+ */
+function readEmbeddedRemoteAccessSettings(): TerminalSettings['remoteAccess'] {
+	const serverSettings =
+		embeddedServerSettings.settings as Partial<TerminalSettings>;
+	return normalizeTerminalSettings({
+		...defaultTerminalSettings,
+		...serverSettings,
+	}).remoteAccess;
+}
+
+function loadEmbeddedRemoteDevices(dataRoot: string) {
+	const file = path.join(dataRoot, 'remote-devices.v1.json');
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
+		return Array.isArray(parsed) ? parsed : [];
+	} catch (error) {
+		if (
+			typeof error === 'object' &&
+			error !== null &&
+			(error as { code?: unknown }).code === 'ENOENT'
+		) {
+			return [];
+		}
+		throw error;
+	}
+}
+
+function saveEmbeddedRemoteDevices(dataRoot: string, records: unknown): void {
+	const file = path.join(dataRoot, 'remote-devices.v1.json');
+	mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+	const temporary = `${file}.tmp`;
+	writeFileSync(temporary, JSON.stringify(records), {
+		encoding: 'utf8',
+		mode: 0o600,
+	});
+	renameSync(temporary, file);
+}
+
+const embeddedShellProfiles = new ShellProfileCatalogueService({
+	settings: embeddedServerSettings,
+	discovery: new ShellProfileDiscoveryService(
+		await createNodeShellDiscoveryHost(process.env),
+	),
+	projectReferences: (profileId) =>
+		serverTerminalAuthority === null
+			? []
+			: Object.values(serverTerminalAuthority.workspace.state.projects)
+					.filter((project) => project.defaultShellProfileId === profileId)
+					.map((project) => project.id),
+});
+const embeddedMacroPath = path.join(
+	app.getPath('userData'),
+	'server-macros.v1.json',
+);
+const embeddedMacros = new MacroRepository({
+	load: async () => {
+		try {
+			return JSON.parse(await readFile(embeddedMacroPath, 'utf8')) as unknown;
+		} catch (error) {
+			if ((error as { code?: string }).code === 'ENOENT')
+				return { macros: readMacros() };
+			throw error;
+		}
+	},
+	commit: async (state) => {
+		await mkdir(path.dirname(embeddedMacroPath), {
+			recursive: true,
+			mode: 0o700,
+		});
+		const temporary = `${embeddedMacroPath}.${randomUUID()}.tmp`;
+		try {
+			await writeFile(temporary, JSON.stringify(state), {
+				encoding: 'utf8',
+				flag: 'wx',
+				mode: 0o600,
+			});
+			await rename(temporary, embeddedMacroPath);
+		} finally {
+			await rm(temporary, { force: true }).catch(() => undefined);
+		}
+	},
+});
+
+// Automations: automations.v1.json + automation-runs.v1.json in userData.
+const embeddedAutomationBackends = createAutomationFileBackends(
+	app.getPath('userData'),
+);
+// Connected MCP servers: mcp-connected-servers.v1.json in userData. The file
+// holds no credential; those are in the vault.
+const embeddedConnectedServersBackend = createJsonFileBackend<unknown>(
+	path.join(app.getPath('userData'), 'mcp-connected-servers.v1.json'),
+);
+/** Terminay's client side of the user's connected MCP servers (ADR-0037). */
+const mcpGateway = new ConnectedServerGateway({
+	projectRoot: (projectId) =>
+		serverTerminalAuthority?.workspace.state.projects[projectId]?.root,
+	clientVersion: app.getVersion(),
+});
+let removeMcpGatewayBindings: (() => void) | undefined;
+
+const embeddedAutomations = new AutomationRepository(
+	embeddedAutomationBackends.definitions,
+	{
+		resolveMacro: async (macroId) =>
+			(await embeddedMacros.load()).macros.find(
+				(macro) => macro.id === macroId,
+			),
+	},
+);
+const embeddedAutomationRuns = new AutomationRunLog(
+	embeddedAutomationBackends.runs,
+);
+
+function embeddedMacroKeyBytes(key: string): Uint8Array {
+	const value = (
+		{
+			Enter: '\r',
+			Tab: '\t',
+			Escape: '\x1b',
+			Backspace: '\x7f',
+			ArrowUp: '\x1b[A',
+			ArrowDown: '\x1b[B',
+			ArrowRight: '\x1b[C',
+			ArrowLeft: '\x1b[D',
+		} as Readonly<Record<string, string>>
+	)[key];
+	if (value === undefined) throw new Error(`Unsupported macro key: ${key}`);
+	return new TextEncoder().encode(value);
+}
+
+await desktopDiagnostics.record(
+	{
+		component: 'local-server',
+		event: 'local-server.starting',
+		severity: 'info',
+		source: 'local-server',
+	},
+	{ channel: 'lifecycle' },
+);
+const embeddedVaultAdapter = await ElectronSafeStorageVaultAdapter.open({
+	repository: new FileSafeStorageVaultRepository(
+		path.join(app.getPath('userData'), 'vault', 'safe-storage.v1.json'),
+	),
+	codec:
+		desktopTestCredentialCodec === undefined
+			? {
+					backend: selectedSafeStorageBackend,
+					decrypt: (encrypted) => safeStorage.decryptString(encrypted),
+					encrypt: (plainText) => safeStorage.encryptString(plainText),
+					isAvailable: () => safeStorage.isEncryptionAvailable(),
+				}
+			: {
+					backend:
+						desktopTestCredentialCodec.backend ??
+						(() => 'terminay_test_ephemeral'),
+					decrypt: desktopTestCredentialCodec.decrypt,
+					encrypt: desktopTestCredentialCodec.encrypt,
+					isAvailable: desktopTestCredentialCodec.isAvailable,
+				},
+});
+const embeddedVault = createServerVaultComposition(embeddedVaultAdapter);
+const embeddedRuntimeReady = prepareEmbeddedRuntime();
+
+async function prepareEmbeddedRuntime(): Promise<BrowserWindow> {
+	process.stderr.write('[Terminay] waiting for app.whenReady()\n');
+	desktopStartupTimeline.begin('electron-ready');
+	await app.whenReady();
+	desktopStartupTimeline.end('electron-ready');
+	process.stderr.write('[Terminay] app.whenReady resolved\n');
+	desktopStartupTimeline.begin('startup-window');
+	const embeddedStartupWindow = createWindow({ deferCanonicalLaunch: true });
+	if (embeddedStartupWindow === null)
+		throw new Error('The embedded workspace window could not be created.');
+	embeddedStartupWindowForRecovery = embeddedStartupWindow;
+	desktopStartupTimeline.end('startup-window');
+	// Paint a self-contained loading document before any workspace, extension, or
+	// server initialization. The verified server UI replaces it only once its
+	// local session and document endpoint are ready. Awaiting the paint avoids
+	// overlapping `loadURL` with persistence recovery, which leaves Chromium
+	// pending and Playwright waiting forever for the first window.
+	desktopStartupTimeline.begin('first-paint');
+	try {
+		await embeddedStartupWindow.loadURL(desktopStartupLoadingDocument());
+		if (!embeddedStartupWindow.isDestroyed()) embeddedStartupWindow.show();
+	} catch (error) {
+		if (!embeddedStartupWindow.isDestroyed())
+			console.error('[window] startup loading document failed', error);
+	}
+	desktopStartupTimeline.end('first-paint');
+	// This is the only navigation the loading document ever receives. Every
+	// phase, including this one, reveals its line with an inserted style rule.
+	startupPhaseWindow = embeddedStartupWindow;
+	revealStartupPhaseLine('first-paint');
+	beginStartupPhase('workspace-restore');
+	const embeddedWorkspace = await openEmbeddedWorkspaceWithRecovery(
+		embeddedStartupWindow,
+	);
+	endStartupPhase('workspace-restore');
+	beginStartupPhase('server-compose');
+	// The harness switches below are read at construction, so the settings
+	// must be loaded first. Composition's own load is idempotent after this.
+	await embeddedServerSettings.load();
+	// E2E-only: a smaller retained replay window so a suite can outrun it during
+	// a real Local transport loss. Inert without the E2E marker.
+	const replayBytesOverride = embeddedTerminalReplayBytesOverride(process.env);
+	// E2E-only: a shorter notification settle period. Inert without the marker.
+	const notificationSettleOverride =
+		embeddedNotificationSettleMsOverride(process.env);
+	// E2E-only: activity and notifications keep the test's time. Inert without
+	// the marker.
+	const serverClock = embeddedManualServerClock(process.env);
+	const sessionHolderDiagnosticEvent = createSessionHolderDiagnostics();
+	const authority: ServerTerminalAuthority = new ServerTerminalAuthority({
+		...(serverClock === undefined ? {} : { clock: serverClock }),
+		serverId: embeddedServerId,
+		dataRoot: app.getPath('userData'),
+		...(sessionHolderEnabled()
+			? {
+					sessionHolder: {
+						buildId: sessionHolderBuildId(),
+						launch: ({ env }) =>
+							launchDetachedSessionHolder(
+								process.execPath,
+								[getSessionHolderEntryPath()],
+								// Electron's binary runs the holder as plain Node. The holder
+								// is not an application instance and opens no window.
+								{ ...process.env, ELECTRON_RUN_AS_NODE: '1', ...env },
+							),
+						limitMs: backgroundTerminalLimitMs(
+							embeddedServerSettings.settings.keepTerminalsAfterQuit,
+						),
+					},
+				}
+			: {}),
+		...(replayBytesOverride === undefined
+			? {}
+			: { maxReplayBytes: replayBytesOverride }),
+		...(notificationSettleOverride === undefined
+			? {}
+			: { notificationSettleMs: notificationSettleOverride }),
+		push: {
+			enrolments: new PushEnrolmentStore(
+				createFilePushEnrolmentPersistence(
+					path.join(app.getPath('userData'), 'push-enrolments.v1.json'),
+				),
+			),
+			// Posted to the manager host beside this server's own session origin.
+			origin: () => {
+				const sessionOrigin = desktopRemoteExposure?.currentSessionOrigin;
+				return sessionOrigin === undefined
+					? undefined
+					: pushOriginForSessionOrigin(sessionOrigin);
+			},
+		},
+		extensionHostChildEntrypoint: path.join(MAIN_DIST, 'extensionHostEntry.js'),
+		builtInExtensionArtifactRoot: embeddedBuiltInExtensionArtifactRoot({
+			appRoot: process.env.APP_ROOT,
+			isPackaged: app.isPackaged,
+			resourcesPath: process.resourcesPath,
+		}),
+		vault: embeddedVault,
+		parakeetRuntime,
+		defaultProjectRoot: () => app.getPath('home'),
+		shellProfiles: embeddedShellProfiles,
+		terminalLaunchEnvironmentFor: (intent, placement) => {
+			if (!mcpCapabilities.isEnabled()) return undefined;
+			// Reach comes only from the canonical project kind the launch
+			// resolver read from server state (ADR-0030): an automation-space
+			// terminal gets workspace reach, every other terminal project reach.
+			const capability = mcpCapabilities.mint(
+				intent.identity.sessionId,
+				intent.identity.projectId,
+				'write',
+				placement,
+			);
+			return getTerminalControlEnv(capability);
+		},
+		aiMetadata: aiTabMetadataService,
+		saveSparseFile: (request) => fileBufferService.saveSparseFile(request),
+		recordings: serverRecordingAdapter,
+		settings: embeddedServerSettings,
+		workspaceRepository: embeddedWorkspace,
+		applicationFeatures: {
+			mcpInstall: { serverCommand: getMcpServerCommand },
+			remoteAccess: {
+				getStatus: () => currentRemoteAccessStatus(),
+				command: async (operation, value) => {
+					switch (operation) {
+						case 'toggle-server':
+							return toggleRemoteServer();
+						case 'create-pairing-link':
+							return createRemotePairingLink();
+						case 'revoke-device':
+							return revokeRemoteDevice(value ?? '');
+						case 'close-connection':
+							return closeRemoteConnection(value ?? '');
+						case 'approve-device':
+							return desktopRemoteExposure.approveDevice(value ?? '');
+						case 'deny-device':
+							return desktopRemoteExposure.denyDevice(value ?? '');
+						case 'reset-identity':
+							return desktopRemoteExposure.resetIdentity();
+						default:
+							throw new Error('Remote access operation is unavailable.');
+					}
+				},
+			},
+		},
+		automations: {
+			repository: embeddedAutomations,
+			runLog: embeddedAutomationRuns,
+		},
+		mcpApprovals: true,
+		// A chat's capability is minted here, where the control socket lives,
+		// and only the agent chat service is handed this (ADR-0068).
+		agentChatMcp: {
+			mint: (chatId, reach) => mcpCapabilities.mintChat(chatId, reach),
+			revoke: (chatId) => {
+				mcpCapabilities.revokeChat(chatId);
+			},
+			serverEntry: (token) => {
+				const command = getMcpServerCommand();
+				return {
+					command: command.command,
+					args: [...command.args],
+					env: {
+						...(command.env ?? {}),
+						...definedEnv(getTerminalControlEnv({ token })),
+					},
+				};
+			},
+			// The dispatcher reports each Terminay call a chat makes, in
+			// Terminay's own words, so provider reports of them are not shown.
+			notesCalls: true,
+		},
+		connectedServers: {
+			backend: embeddedConnectedServersBackend,
+			vault: embeddedVault.vault,
+		},
+		appWindows: {
+			terminalTitle: (terminalSessionId) =>
+				authority?.composition.terminalTitles?.displayedTitleForSession(
+					terminalSessionId,
+				),
+			// Windows last as long as their terminals, across restarts (ADR-0076).
+			storeDirectory: path.join(
+				app.getPath('userData'),
+				APP_WINDOW_STORE_DIRECTORY_NAME,
+			),
+			onStoreError: (error, windowId) =>
+				console.warn('[app-windows] record not kept', windowId ?? '', error),
+		},
+		macros: {
+			repository: embeddedMacros,
+			environmentFor: (request, target) => {
+				const terminalAuthority = authority;
+				const authorization = {
+					...target,
+					clientId: request.context.clientId,
+					scope:
+						request.context.authScope === 'admin'
+							? ('admin' as const)
+							: ('write' as const),
+				};
+				return {
+					target,
+					write: (_candidate, bytes) =>
+						terminalAuthority.service.input(target, bytes, authorization),
+					key: (_candidate, key) =>
+						terminalAuthority.service.input(
+							target,
+							embeddedMacroKeyBytes(key),
+							authorization,
+						),
+					waitForInactivity: (_candidate, milliseconds, signal) =>
+						terminalAuthority.service.waitForInactivity(target, milliseconds, {
+							authorization,
+							signal,
+						}),
+				};
+			},
+		},
+		onEvent: handleServerTerminalEvent,
+		// The token lives in the running shell and cannot be replaced, so the
+		// capability follows its terminal to the new project (ADR-0074). Entering
+		// the automation space would widen it to workspace reach, so that revokes.
+		onTerminalRehomed: (move) => {
+			if (move.targetProjectId === AUTOMATION_SPACE_PROJECT_ID)
+				mcpCapabilities.revokeSession(move.sessionId);
+			else mcpCapabilities.followTerminal(move.sessionId, move.targetProjectId);
+		},
+		// An extension host that dies is otherwise invisible: the child suppresses
+		// Node's own stack print so it can report the error itself, and a packaged
+		// child has no readable stderr. Extensions are trusted code and this
+		// history is local and never uploaded automatically, so the reported error
+		// is recorded as it was raised.
+		onExtensionHostDiagnostic: (diagnostic) => {
+			void desktopDiagnostics.record(
+				{
+					component: 'local-server',
+					event: `local-server.extension.${diagnostic.transition}`,
+					fields: {
+						extensionId: diagnostic.extensionId,
+						...(diagnostic.exitCode === undefined
+							? {}
+							: { exitCode: diagnostic.exitCode }),
+						...(diagnostic.signal === undefined
+							? {}
+							: { signal: diagnostic.signal }),
+						...(diagnostic.consecutiveFailures === undefined
+							? {}
+							: { consecutiveFailures: diagnostic.consecutiveFailures }),
+						...(diagnostic.restartAt === undefined
+							? {}
+							: { restartAt: diagnostic.restartAt }),
+						...(diagnostic.deliberate === undefined
+							? {}
+							: { deliberate: diagnostic.deliberate }),
+						...(diagnostic.afterChildGone === undefined
+							? {}
+							: { afterChildGone: diagnostic.afterChildGone }),
+						...(diagnostic.errorCode === undefined
+							? {}
+							: { errorCode: diagnostic.errorCode }),
+						...(diagnostic.failedWrites === undefined
+							? {}
+							: { failedWrites: diagnostic.failedWrites }),
+						...(diagnostic.pendingCalls === undefined
+							? {}
+							: { pendingCalls: diagnostic.pendingCalls }),
+						...(diagnostic.activeAgentPublications === undefined
+							? {}
+							: {
+									activeAgentPublications: diagnostic.activeAgentPublications,
+								}),
+						...(diagnostic.error === undefined
+							? {}
+							: {
+									errorName: diagnostic.error.name,
+									errorMessage: diagnostic.error.message,
+									...(diagnostic.error.stack === undefined
+										? {}
+										: { errorStack: diagnostic.error.stack }),
+								}),
+					},
+					severity:
+						diagnostic.transition === 'failed' ||
+						diagnostic.transition === 'quarantined'
+							? 'error'
+							: diagnostic.transition === 'channel-write-failed' ||
+									diagnostic.transition === 'child-error' ||
+									(diagnostic.transition === 'child-exited' &&
+										diagnostic.deliberate !== true)
+								? 'warning'
+								: 'info',
+					source: 'local-server-extensions',
+				},
+				{ channel: 'lifecycle' },
+			);
+		},
+		agentHarnessSwitches: agentHarnessSwitchesFromSettings(
+			embeddedServerSettings.settings,
+		),
+		// A session source's own account of what went wrong, such as a provider
+		// it could not read or a process watch running degraded. It carries no
+		// path or conversation content.
+		onAgentSessionSourceDiagnostic: (record) => {
+			void desktopDiagnostics.record(
+				{
+					component: 'local-server',
+					event: 'local-server.agent.source-diagnostic',
+					fields: {
+						sourceId: record.sourceId,
+						extensionId: record.extensionId,
+						code: record.diagnostic.code,
+						message: record.diagnostic.message,
+					},
+					severity: 'warning',
+					source: 'local-server-agents',
+				},
+				{ channel: 'lifecycle' },
+			);
+		},
+		onAgentSessionSourceStartFailure: (sourceId, error) => {
+			void desktopDiagnostics.record(
+				{
+					component: 'local-server',
+					event: 'local-server.agent.source-start-failed',
+					fields: {
+						sourceId,
+						errorMessage:
+							error instanceof Error ? error.message : String(error),
+					},
+					severity: 'warning',
+					source: 'local-server-agents',
+				},
+				{ channel: 'lifecycle' },
+			);
+		},
+		onDeliveryDiagnostic: (diagnostic) => {
+			if (diagnostic.phase !== 'terminal_congestion') return;
+			void desktopDiagnostics.record(
+				{
+					component: 'local-server',
+					event: 'local-server.terminal-congestion',
+					fields: {
+						code: diagnostic.code,
+						queuedBytes: diagnostic.queuedBytes,
+						queuedFrames: diagnostic.queuedFrames,
+						confirmedPosition: diagnostic.confirmedPosition,
+						headPosition: diagnostic.headPosition,
+					},
+					severity: 'warning',
+					source: 'local-server-protocol',
+				},
+				{ channel: 'lifecycle' },
+			);
+		},
+		revealPathOnHost: (target) => shell.showItemInFolder(target),
+		onFileOperationFailure: (failure) => {
+			void desktopDiagnostics.record(
+				{
+					component: 'local-server',
+					event: 'local-server.file-operation.failed',
+					fields: {
+						operation: failure.operation,
+						code: failure.code,
+					},
+					severity: 'warning',
+					source: 'local-server-files',
+				},
+				{ channel: 'lifecycle' },
+			);
+		},
+		onGitObservation: (report) => {
+			void desktopDiagnostics.record(gitObservationDiagnosticEvent(report), {
+				channel: 'lifecycle',
+			});
+		},
+		onWorktreeCaptureObservation: (report) => {
+			void desktopDiagnostics.record(worktreeCaptureDiagnosticEvent(report), {
+				channel: 'lifecycle',
+			});
+		},
+		onSessionHolderObservation: (report) => {
+			void desktopDiagnostics.record(sessionHolderDiagnosticEvent(report), {
+				channel: 'lifecycle',
+			});
+		},
+		// These callbacks run only after the server has accepted the operation.
+		// Recording and remote bookkeeping must never be driven by renderer intent.
+		onAcceptedWrite: ({ sessionId, data }) => {
+			try {
+				recordingService.appendInput(
+					sessionId,
+					typeof data === 'string' ? data : new TextDecoder().decode(data),
+				);
+			} catch {
+				// Recording remains optional and cannot affect a committed PTY write.
+			}
+		},
+		onAcceptedResize: ({ sessionId, cols, rows }) => {
+			try {
+				recordingService.appendResize(sessionId, cols, rows);
+				recordingService.updateSessionMetadata(sessionId, { cols, rows });
+			} catch {
+				// Recording remains optional and cannot affect a committed PTY resize.
+			}
+		},
+	});
+	endStartupPhase('server-compose');
+	beginStartupPhase('workspace-init');
+	await recoverEmbeddedWorkspaceOperation(embeddedStartupWindow, () =>
+		authority.initializeWorkspace(),
+	);
+	serverTerminalAuthority = authority;
+	if (serverClock !== undefined) exposeTestServerClock(authority, serverClock);
+	if (process.env.TERMINAY_TEST === '1')
+		Object.defineProperty(globalThis, '__terminayTestTerminalHandoff', {
+			configurable: true,
+			value: installTestTerminalHandoff(authority.service),
+		});
+	// An approval and a session grant live exactly as long as the calling
+	// terminal's capability: exit, move, disable, and restart all end them.
+	removeMcpApprovalRevocation?.();
+	removeMcpApprovalRevocation = mcpCapabilities.onRevoked(
+		(_digest, terminalSessionId) =>
+			authority.composition.mcpApprovals?.revokeTerminal(terminalSessionId),
+	);
+	bindMcpGateway(authority);
+	endStartupPhase('workspace-init');
+	beginStartupPhase('mcp-endpoint');
+	applyMcpSetting(embeddedServerSettings.settings);
+	// Terminals that outlived the previous process still carry the control
+	// token they were started with; reinstate its authority for the ones that
+	// are running, then keep the saved copy current.
+	if (authority.keepsTerminalsAcrossRestart) {
+		restoreSavedMcpCapabilities(authority);
+		removeMcpCapabilityPersistence?.();
+		removeMcpCapabilityPersistence = mcpCapabilities.onChanged(
+			saveMcpCapabilities,
+		);
+		saveMcpCapabilities();
+	}
+	pruneMcpCapabilities(authority);
+	if (mcpCapabilityPruneTimer !== undefined)
+		clearInterval(mcpCapabilityPruneTimer);
+	mcpCapabilityPruneTimer = setInterval(
+		() => pruneMcpCapabilities(authority),
+		MCP_CAPABILITY_PRUNE_INTERVAL_MS,
+	);
+	mcpCapabilityPruneTimer.unref();
+	removeMcpSettingsObserver?.();
+	removeMcpSettingsObserver = embeddedServerSettings.onChange((state) => {
+		applyMcpSetting(state.settings);
+		applyServerAgentSettings(state.settings);
+	});
+	await startMcpControlEndpoint();
+	endStartupPhase('mcp-endpoint');
+	beginStartupPhase('bundle-hosts');
+	localServerUiSession = new LocalServerUiSession({
+		bundleRoot: SERVER_UI_DIST,
+		serverId: authority.service.serverId,
+	});
+	remoteServerUiBundleHost = new DesktopServerBundleHost({
+		capabilities: {
+			clipboardWrite: 1,
+			filePicker: 1,
+			nativeMenus: 1,
+			nativeWindows: 1,
+			notifications: 1,
+			osIntegration: 1,
+			updater: 1,
+			connections: 1,
+		},
+	});
+	endStartupPhase('bundle-hosts');
+	beginStartupPhase('remote-exposure');
+	const desktopWebRtcRuntimeRoot = resolveDesktopWebRtcRuntimeRoot({
+		isPackaged: app.isPackaged,
+		resourcesPath: process.resourcesPath,
+		environment: process.env,
+	});
+	const dataRoot = app.getPath('userData');
+	// The pairing PIN is gone: any verifier left by an earlier build is dead
+	// material and is removed rather than read.
+	rmSync(getRemotePairingPinVerifierPath(), { force: true });
+	desktopRemoteExposure = new DesktopServerOwnedExposure({
+		serverId: authority.service.serverId,
+		hostKeyStore: createProtectedHostKeyStore({
+			file: path.join(dataRoot, 'remote-host-key.v2.protected.json'),
+			legacyPlaintextFile: path.join(dataRoot, 'remote-host-key.v1.json'),
+			codec: {
+				isAvailable: () =>
+					safeStorage.isEncryptionAvailable() &&
+					selectedSafeStorageBackend() !== 'basic_text',
+				encrypt: (plainText) => safeStorage.encryptString(plainText),
+				decrypt: (encrypted) => safeStorage.decryptString(encrypted),
+			},
+		}),
+		initialDevices: loadEmbeddedRemoteDevices(dataRoot),
+		persistDevices: (devices) => {
+			saveEmbeddedRemoteDevices(dataRoot, devices);
+			// A device that is no longer trusted is sent no further push.
+			serverTerminalAuthority?.composition.push?.retainDevices(
+				devices
+					.filter((device) => device.revokedAt === null)
+					.map((device) => device.deviceId),
+			);
+		},
+		onApprovalRequested: (approval) => {
+			const notification = new Notification({
+				title: `${approval.deviceName} wants to pair`,
+				body: `Match code ${approval.matchCode}. Open Settings › Remote Access to approve or deny.`,
+			});
+			notification.on('click', () => {
+				sendCommandToFocusedWindow('open-remote-control');
+			});
+			notification.show();
+		},
+		resolveIceServers: () =>
+			parseHostedIceServers(
+				readEmbeddedRemoteAccessSettings().webRtcIceServers,
+			),
+		onStatusChanged: () => {
+			authority.notifyRemoteAccessChanged();
+		},
+		// Remote device connected trigger (automations).
+		onConnectionAdmitted: (admission) => {
+			serverTerminalAuthority?.composition.onConnectionAdmitted(admission);
+		},
+		onDiagnostic: (event) => {
+			void desktopDiagnostics.record(hostedPairingDiagnosticEvent(event), {
+				channel: 'lifecycle',
+			});
+		},
+		acceptApplication: (transport, authenticatedClient) => {
+			if (serverTerminalAuthority === null) {
+				throw new Error('The embedded server is unavailable.');
+			}
+			return serverTerminalAuthority.composition.core.accept(transport, {
+				authenticatedClient,
+			});
+		},
+		getUiArchive: async () => {
+			const archive = await buildServerUiArchive({
+				entryPath: 'server.html',
+				protocolVersion: '1',
+				publicDirectory: SERVER_UI_DIST,
+				rendererDirectory: SERVER_UI_DIST,
+			});
+			return { bundleId: archive.bundleId, bytes: archive.bytes };
+		},
+		resolveSessionOrigin: () =>
+			loadOrCreateSessionOrigin(
+				dataRoot,
+				readEmbeddedRemoteAccessSettings().webRtcHostedDomain,
+			),
+		...(desktopWebRtcRuntimeRoot === undefined &&
+		!(
+			process.env.TERMINAY_TEST === '1' &&
+			process.env.TERMINAY_TEST_ALLOW_UNAVAILABLE_WEBRTC_UI === '1'
+		)
+			? {
+					webRtcUnavailableReason:
+						'Desktop WebRTC Relay is unavailable in this build because its authenticated hosted signaling runtime is not installed.',
+					ensureWebRtcRuntimeAvailable: () => {
+						throw new Error(
+							'Desktop WebRTC runtime is unavailable in this build. Install a build with an approved production WebRTC runtime before enabling WebRTC Remote Access.',
+						);
+					},
+				}
+			: desktopWebRtcRuntimeRoot === undefined
+				? {}
+				: { webrtcRuntimeRoot: desktopWebRtcRuntimeRoot }),
+	});
+	endStartupPhase('remote-exposure');
+	return embeddedStartupWindow;
+}
+
+async function createServerOwnedTerminalSession(
+	projectId: string,
+	cwd?: string,
+	projectRootOrigin?: 'explicit' | 'server-default',
+	activePanelId?: string,
+	folderId?: string,
+	profileId?: string,
+): Promise<Awaited<ReturnType<ServerTerminalAuthority['create']>>> {
+	const id = randomUUID();
+	const settings = readTerminalSettings();
+	try {
+		const session = await serverTerminalAuthority!.create({
+			sessionId: id,
+			projectId,
+			...(cwd === undefined ? {} : { cwd }),
+			...(projectRootOrigin === undefined ? {} : { projectRootOrigin }),
+			...(activePanelId === undefined ? {} : { activePanelId }),
+			...(folderId === undefined ? {} : { folderId }),
+			...(profileId === undefined ? {} : { profileId }),
+			env: getTerminalSpawnEnv(),
+			cols: 80,
+			rows: 24,
+		});
+		if (settings.recording.recordNewTerminals) {
+			try {
+				recordingService.start(id, {
+					cwd: session.cwd,
+					shell: session.shellPath ?? 'System default',
+				});
+			} catch {
+				// Recording storage failure never prevents the PTY from starting.
+			}
+		}
+		return session;
+	} catch (error) {
+		mcpCapabilities.revokeSession(id);
+		recordingService.finalize(id, null, null, 'failed');
+		throw error;
+	}
+}
+
+function serverTerminalRendererListener(
+	rendererId: number,
+):
+	| ((
+			event: import('./serverTerminalAuthority').ServerTerminalRendererEvent,
+	  ) => void)
+	| null {
+	const target = webContents.fromId(rendererId);
+	if (!target || target.isDestroyed()) return null;
+	return (event) => {
+		if (target.isDestroyed()) return;
+		try {
+			if (event.type === 'output') {
+				target.send('terminal:data', { id: event.id, data: event.data ?? '' });
+			} else if (event.type === 'exit') {
+				target.send('terminal:exit', {
+					id: event.id,
+					exitCode: event.exitCode ?? 0,
+					signal: event.signal ?? null,
+				});
+			}
+		} catch {
+			// Window is shutting down; the subscription is detached by destroyed.
+		}
+	};
+}
+
+function attachServerTerminalRenderer(
+	sessionId: string,
+	rendererId: number,
+	fromPosition = 0,
+): void {
+	if (!serverTerminalAuthority) return;
+	const listener = serverTerminalRendererListener(rendererId);
+	if (!listener) return;
+	serverTerminalAuthority.attachRenderer(
+		sessionId,
+		rendererId,
+		listener,
+		fromPosition,
+	);
+}
+
+let appUpdater: AppUpdater | null = null;
+
+function getAppUpdater(): AppUpdater {
+	if (appUpdater === null) {
+		appUpdater = createAppUpdater({
+			currentVersion: app.getVersion(),
+			isPackaged: app.isPackaged,
+			platform: process.platform,
+			appImagePath: process.env.APPIMAGE,
+			executablePath: process.execPath,
+			localAppData: process.env.LOCALAPPDATA,
+			isWritable: (target) => {
+				try {
+					accessSync(target, fsConstants.W_OK);
+					return true;
+				} catch {
+					return false;
+				}
+			},
+			channel: readTerminalSettings().updateChannel,
+			loadUpdater: async () => {
+				const { default: electronUpdater } = await import('electron-updater');
+				return electronUpdater.autoUpdater;
+			},
+			fetch: (url, init) => fetch(url, { ...init, redirect: 'follow' }),
+			log: (message, error) => console.warn(message, error ?? ''),
+			onStatusChanged: () => broadcastAppUpdateStatusChanged(),
+		});
+		setInterval(() => {
+			void appUpdater?.check({ force: true });
+		}, UPDATE_CHECK_INTERVAL_MS).unref();
+	}
+	return appUpdater;
+}
+
+function broadcastAppUpdateStatusChanged(): void {
+	for (const window of BrowserWindow.getAllWindows()) {
+		if (window.webContents.isDestroyed()) continue;
+		window.webContents.send('server-ui-host:event', {
+			type: 'updater.status.changed',
+		});
+	}
+}
+
+let aboutWindow: BrowserWindow | null = null;
+
+/** About Terminay: one sandboxed, script-free window. Its only way out is the
+ * three links it renders, which open in the default browser. */
+function showAboutWindow(): void {
+	if (aboutWindow && !aboutWindow.isDestroyed()) {
+		aboutWindow.show();
+		aboutWindow.focus();
+		return;
+	}
+	const isMac = process.platform === 'darwin';
+	const usesOverlayTitlebar = process.platform === 'win32';
+	const window = new BrowserWindow({
+		width: 440,
+		height: 500,
+		useContentSize: true,
+		resizable: false,
+		minimizable: false,
+		maximizable: false,
+		fullscreenable: false,
+		show: false,
+		title: 'About Terminay',
+		backgroundColor: '#0d1117',
+		icon: getWindowIconPath(),
+		autoHideMenuBar: true,
+		titleBarStyle: isMac || usesOverlayTitlebar ? 'hidden' : 'default',
+		titleBarOverlay: usesOverlayTitlebar
+			? { color: '#0d1117', symbolColor: '#9bb0c8', height: 32 }
+			: false,
+		trafficLightPosition: isMac ? { x: 14, y: 14 } : undefined,
+		webPreferences: {
+			// An in-memory partition of its own, so its policy never touches a
+			// workspace session.
+			partition: 'terminay-about',
+			contextIsolation: true,
+			nodeIntegration: false,
+			sandbox: true,
+			webSecurity: true,
+			webviewTag: false,
+		},
+	});
+	const contents = window.webContents;
+	secureSession(contents.session);
+	contents.on('will-attach-webview', (event) => event.preventDefault());
+	const openLink = (url: string): void => {
+		const allowed = aboutWindowExternalUrl(url);
+		if (allowed !== null) void openInBrowser(allowed).catch(() => undefined);
+	};
+	contents.setWindowOpenHandler(({ url }) => {
+		openLink(url);
+		return { action: 'deny' };
+	});
+	contents.on('will-navigate', (event, url) => {
+		event.preventDefault();
+		openLink(url);
+	});
+	contents.on('will-redirect', (event) => event.preventDefault());
+	window.once('ready-to-show', () => window.show());
+	window.on('closed', () => {
+		if (aboutWindow === window) aboutWindow = null;
+	});
+	aboutWindow = window;
+	void window.loadURL(aboutWindowDocument({ version: app.getVersion() }));
+}
+
+let manualUpdateCheck: Promise<void> | null = null;
+
+/** Help > Check for Updates…: checks now, whatever the hourly pacing says. */
+function checkForUpdatesFromMenu(): void {
+	if (manualUpdateCheck !== null) return;
+	manualUpdateCheck = getAppUpdater()
+		.check({ manual: true })
+		.then(async (status) => {
+			broadcastAppUpdateStatusChanged();
+			const { message, detail } = describeManualCheck(status);
+			await dialog.showMessageBox({
+				type:
+					status.errorMessage !== null && !status.hasUpdate
+						? 'warning'
+						: 'info',
+				buttons: ['OK'],
+				noLink: true,
+				title: 'Check for Updates',
+				message,
+				detail,
+			});
+		})
+		.catch((error) => console.warn('[updater] manual check failed', error))
+		.finally(() => {
+			manualUpdateCheck = null;
+		});
+}
+
+function getTerminalSettingsPath(): string {
+	return path.join(app.getPath('userData'), 'terminal-settings.json');
+}
+
+function getRemotePairingPinVerifierPath(): string {
+	return path.join(app.getPath('userData'), 'remote-pairing-pin-verifier');
+}
+
+function getRemoteAccessSettingsPath(): string {
+	return path.join(app.getPath('userData'), 'remote-access-settings.json');
+}
+
+function readRemoteAccessSettings(): TerminalSettings['remoteAccess'] {
+	let candidate: unknown;
+	try {
+		candidate = JSON.parse(readFileSync(getRemoteAccessSettingsPath(), 'utf8'));
+	} catch {}
+	return normalizeTerminalSettings({
+		...defaultTerminalSettings,
+		remoteAccess: candidate,
+	}).remoteAccess;
+}
+
+function writeRemoteAccessSettings(
+	settings: TerminalSettings['remoteAccess'],
+): void {
+	const settingsPath = getRemoteAccessSettingsPath();
+	invalidateTerminalSettingsCache();
+	mkdirSync(path.dirname(settingsPath), { recursive: true });
+	writeFileSync(settingsPath, JSON.stringify(settings, null, 2), {
+		mode: 0o600,
+	});
+}
+
+function getMacrosPath(): string {
+	return path.join(app.getPath('userData'), 'macros.json');
+}
+
+function invalidateTerminalSettingsCache(): void {
+	cachedTerminalSettings = undefined;
+}
+
+/** Arm the watch that makes caching safe. Caching only happens once this has
+ * produced a live watcher: without one, a stale value could never be noticed.
+ *
+ * Nothing reached from here may read a module binding declared below the first
+ * call site, and no callback may throw: this runs during module evaluation, and
+ * an uncaught exception in the main process aborts the app. */
+function ensureTerminalSettingsWatcher(): void {
+	if (terminalSettingsWatcher !== undefined) return;
+	try {
+		const directory = app.getPath('userData');
+		mkdirSync(directory, { recursive: true });
+		// Held in the closure rather than at module scope, so the set exists
+		// whenever the watch can fire.
+		const watchedNames = new Set([
+			'terminal-settings.json',
+			'remote-access-settings.json',
+		]);
+		const watcher = watchFileSystemPath(
+			directory,
+			{ persistent: false },
+			(_event, name) => {
+				try {
+					if (name === null || watchedNames.has(String(name)))
+						invalidateTerminalSettingsCache();
+				} catch {
+					/* a settings read falls back to disk rather than take the app down */
+				}
+			},
+		);
+		watcher.on('error', () => {
+			try {
+				terminalSettingsWatcher = undefined;
+				cachedTerminalSettings = undefined;
+				watcher.close();
+			} catch {
+				/* a faulted watcher may already be closed */
+			}
+		});
+		terminalSettingsWatcher = watcher;
+	} catch {
+		terminalSettingsWatcher = undefined;
+	}
+}
+
+function readTerminalSettings(): TerminalSettings {
+	ensureTerminalSettingsWatcher();
+	if (cachedTerminalSettings !== undefined) return cachedTerminalSettings;
+	const settings = loadTerminalSettingsFromDisk();
+	if (terminalSettingsWatcher !== undefined) cachedTerminalSettings = settings;
+	return settings;
+}
+
+function loadTerminalSettingsFromDisk(): TerminalSettings {
+	const settingsPath = getTerminalSettingsPath();
+	const remoteAccess = readRemoteAccessSettings();
+
+	try {
+		if (!existsSync(settingsPath)) {
+			return {
+				...defaultTerminalSettings,
+				remoteAccess,
+			};
+		}
+
+		const fileContents = readFileSync(settingsPath, 'utf8');
+		const settings = normalizeTerminalSettings(JSON.parse(fileContents));
+		return {
+			...settings,
+			remoteAccess,
+		};
+	} catch {
+		return {
+			...defaultTerminalSettings,
+			remoteAccess,
+		};
+	}
+}
+
+function writeTerminalSettings(settings: TerminalSettings): TerminalSettings {
+	const normalized = normalizeTerminalSettings(settings);
+	const settingsPath = getTerminalSettingsPath();
+	invalidateTerminalSettingsCache();
+	writeRemoteAccessSettings(normalized.remoteAccess);
+
+	mkdirSync(path.dirname(settingsPath), { recursive: true });
+	writeFileSync(
+		settingsPath,
+		JSON.stringify(selectDeviceTerminalSettings(normalized), null, 2),
+	);
+	return normalized;
+}
+
+function sendDeviceTerminalSettings(webContents: Electron.WebContents): void {
+	if (webContents.isDestroyed()) return;
+	webContents.send('server-ui-host:event', {
+		type: 'device.settings.changed',
+		settings: selectDeviceTerminalSettings(readTerminalSettings()),
+	});
+}
+
+function broadcastDeviceTerminalSettings(): void {
+	for (const window of BrowserWindow.getAllWindows()) {
+		sendDeviceTerminalSettings(window.webContents);
+	}
+}
+
+function sendPerformanceLogging(webContents: Electron.WebContents): void {
+	if (webContents.isDestroyed()) return;
+	webContents.send('server-ui-host:event', {
+		type: 'diagnostics.performance-logging.changed',
+		enabled: desktopPerformanceLogging.isEnabled(),
+	});
+}
+
+function sendWindowFullScreenState(webContents: Electron.WebContents): void {
+	const window = BrowserWindow.fromWebContents(webContents);
+	if (window === null || webContents.isDestroyed()) return;
+	webContents.send('server-ui-host:event', {
+		type: 'window.fullscreen-state',
+		fullScreen: window.isFullScreen(),
+	});
+}
+
+function broadcastPerformanceLogging(): void {
+	for (const window of BrowserWindow.getAllWindows()) {
+		sendPerformanceLogging(window.webContents);
+	}
+}
+
+/** The bounded projection the Performance Log window may receive. Values only:
+ * no file path, handle, directory listing, or log-reading capability. */
+async function buildPerformanceSnapshot(): Promise<Record<string, unknown>> {
+	const sessions = (serverTerminalAuthority?.service.listSessions() ?? []).map(
+		(session) => ({
+			sessionId: session.sessionId,
+			projectId: session.projectId,
+			status: session.status,
+			...(session.pid === undefined ? {} : { pid: session.pid }),
+		}),
+	);
+	const terminals = await desktopTerminalResources.sample(sessions);
+	return {
+		startup: desktopStartupTimeline.snapshot(),
+		samples: desktopRuntimeMetrics.samples(),
+		terminals: {
+			at: terminals.at,
+			diskAvailable: terminals.diskAvailable,
+			// Session identity only; the window resolves names from its own
+			// workspace state, so no title crosses the boundary.
+			sessions: sessions.map((session) => ({
+				sessionId: session.sessionId,
+				projectId: session.projectId,
+				usage: terminals.sessions[session.sessionId] ?? {
+					available: false,
+					reason: 'unreadable',
+				},
+			})),
+		},
+	};
+}
+
+async function broadcastPerformanceSnapshot(): Promise<void> {
+	if (performanceLogWindows.size === 0) return;
+	let snapshot: Record<string, unknown>;
+	try {
+		snapshot = await buildPerformanceSnapshot();
+	} catch {
+		// A sampling failure must never take down the window or the collector.
+		return;
+	}
+	for (const window of BrowserWindow.getAllWindows()) {
+		if (!performanceLogWindows.has(window.webContents.id)) continue;
+		if (window.webContents.isDestroyed()) continue;
+		window.webContents.send('server-ui-host:event', {
+			type: 'diagnostics.performance-snapshot.changed',
+			snapshot,
+		});
+	}
+}
+
+/** Begin sampling for one Performance Log window and release it on close. */
+function bindPerformanceLogWindow(window: BrowserWindow): void {
+	const id = window.webContents.id;
+	if (performanceLogWindows.has(id)) return;
+	performanceLogWindows.set(id, desktopRuntimeMetrics.subscribe());
+	const release = () => {
+		const stop = performanceLogWindows.get(id);
+		if (stop === undefined) return;
+		performanceLogWindows.delete(id);
+		stop();
+	};
+	window.once('closed', release);
+	window.webContents.once('destroyed', release);
+}
+
+function readMacros(): MacroDefinition[] {
+	const macrosPath = getMacrosPath();
+
+	try {
+		if (!existsSync(macrosPath)) {
+			return defaultMacros;
+		}
+
+		const fileContents = readFileSync(macrosPath, 'utf8');
+		return normalizeMacros(JSON.parse(fileContents));
+	} catch {
+		return defaultMacros;
+	}
+}
+
+function resolveNodePtyRoot(): string {
+	try {
+		return path.dirname(
+			createRequire(import.meta.url).resolve('node-pty/package.json'),
+		);
+	} catch {
+		return path.join(process.cwd(), 'node_modules', 'node-pty');
+	}
+}
+
+function ensureNodePtySpawnHelperIsExecutable(): void {
+	if (process.platform === 'win32') {
+		return;
+	}
+
+	const nodePtyRoot = resolveNodePtyRoot();
+	const helperPaths = [
+		path.join(nodePtyRoot, 'build', 'Release', 'spawn-helper'),
+		path.join(nodePtyRoot, 'build', 'Debug', 'spawn-helper'),
+		path.join(
+			nodePtyRoot,
+			'prebuilds',
+			`${process.platform}-${process.arch}`,
+			'spawn-helper',
+		),
+	];
+
+	for (const helperPath of helperPaths) {
+		if (!existsSync(helperPath)) {
+			continue;
+		}
+
+		try {
+			chmodSync(helperPath, 0o755);
+		} catch {
+			// If chmod fails we continue and let the normal spawn error surface.
+		}
+	}
+}
+
+function getTerminalSpawnEnv(capability?: {
+	readonly token: string;
+}): Record<string, string | undefined> {
+	// The canonical resolver already starts from the host environment and then
+	// applies the selected profile. Keep this overlay to server-protected,
+	// per-session values so it cannot accidentally overwrite profile variables.
+	const env: Record<string, string | undefined> = {};
+
+	// xterm.js renders true color, but many CLI tools only enable 24-bit output
+	// when COLORTERM explicitly advertises it.
+	env.COLORTERM = 'truecolor';
+	// xterm.js follows OSC 8 hyperlinks, which keep a URL whole when a program
+	// hard-wraps it across rows. Tools using supports-hyperlinks, Claude Code
+	// among them, only emit them for terminals they recognise or when told to.
+	env.FORCE_HYPERLINK = process.env.FORCE_HYPERLINK ?? '1';
+	Object.assign(env, getTerminalControlEnv(capability));
+
+	if (process.platform !== 'darwin') {
+		return env;
+	}
+
+	const utf8Locale =
+		process.env.LC_ALL ||
+		process.env.LC_CTYPE ||
+		process.env.LANG ||
+		'en_US.UTF-8';
+	const normalizedLocale = utf8Locale.toUpperCase().includes('UTF-8')
+		? utf8Locale
+		: 'en_US.UTF-8';
+
+	// GUI-launched macOS apps may not inherit a UTF-8 locale, which breaks non-ASCII PTY I/O like emoji.
+	env.LANG = normalizedLocale;
+	env.LC_CTYPE = normalizedLocale;
+
+	return env;
+}
+
+function definedEnv(
+	env: Record<string, string | undefined>,
+): Record<string, string> {
+	return Object.fromEntries(
+		Object.entries(env).filter(
+			(entry): entry is [string, string] => entry[1] !== undefined,
+		),
+	);
+}
+
+function getTerminalControlEnv(capability?: {
+	readonly token: string;
+}): Record<string, string | undefined> {
+	if (capability === undefined) return {};
+	// A terminal can be launched before the endpoint is listening, so the
+	// address is worked out here the same way the endpoint works it out. With
+	// nowhere for the socket to go there is no address to give; startup reports
+	// that when it reaches the endpoint.
+	let placement: ControlSocketPlacement;
+	try {
+		placement = resolveMcpControlSocketPlacement();
+	} catch {
+		return {};
+	}
+	return {
+		[CONTROL_SOCKET_ENV]: placement.path,
+		[CONTROL_TOKEN_ENV]: capability.token,
+	};
+}
+
+function mcpControlSocketPlacementOptions() {
+	return {
+		dataDirectory: app.getPath('userData'),
+		platform: process.platform,
+		temporaryDirectory: os.tmpdir(),
+		...(process.env.XDG_RUNTIME_DIR
+			? { runtimeDirectory: process.env.XDG_RUNTIME_DIR }
+			: {}),
+	};
+}
+
+let mcpControlSocketPlacement: ControlSocketPlacement | null = null;
+
+/**
+ * Where the control socket is (ADR-0054): in the data directory when its path
+ * fits a Unix socket, and otherwise in a runtime directory named for the data
+ * directory, so the address is the same after a relaunch. Deciding it reads
+ * nothing from disk; whether a runtime directory may be used is checked when
+ * the endpoint starts.
+ */
+function resolveMcpControlSocketPlacement(): ControlSocketPlacement {
+	mcpControlSocketPlacement ??= resolveControlSocketPlacement(
+		mcpControlSocketPlacementOptions(),
+	);
+	return mcpControlSocketPlacement;
+}
+
+/** Whether this Desktop keeps its terminals in a session holder (ADR-0035). */
+function sessionHolderEnabled(): boolean {
+	return isSessionHolderEnabled({
+		dataRoot: app.getPath('userData'),
+		env: process.env,
+		platform: process.platform,
+	});
+}
+
+/**
+ * The holder entry, addressed through `app.asar` in a packaged app, never
+ * through `app.asar.unpacked`. The holder runs under Electron's own binary, so
+ * it reads the archive as the main process does, and it must: node-pty derives
+ * its spawn helper's location by replacing `app.asar` with `app.asar.unpacked`
+ * in its own path. Loaded from the unpacked directory, that path already
+ * contains the replacement and becomes `app.asar.unpacked.unpacked`, and every
+ * shell fails to start.
+ */
+function getSessionHolderEntryPath(): string {
+	return path.join(MAIN_DIST, 'sessionHolderEntry.js');
+}
+
+/** Changes whenever the holder this build would start changes. */
+function sessionHolderBuildId(): string {
+	let stamp = 'unbuilt';
+	try {
+		stamp = String(statSync(getSessionHolderEntryPath()).mtimeMs);
+	} catch {
+		/* a missing entry fails at launch, with a clearer error */
+	}
+	return `${app.getVersion()}:${stamp}`;
+}
+
+function getMcpCapabilityFilePath(): string {
+	return path.join(app.getPath('userData'), 'mcp-capabilities.v1.json');
+}
+
+/** Digests only: nothing in this file can be presented to the endpoint. */
+function saveMcpCapabilities(): void {
+	const target = getMcpCapabilityFilePath();
+	const temporary = `${target}.tmp`;
+	try {
+		writeFileSync(temporary, JSON.stringify(mcpCapabilities.snapshot()), {
+			mode: 0o600,
+		});
+		chmodSync(temporary, 0o600);
+		renameSync(temporary, target);
+	} catch (error) {
+		console.error('[mcp] saving terminal capabilities failed', error);
+	}
+}
+
+function runningTerminalSessionIds(
+	authority: ServerTerminalAuthority,
+): Set<string> {
+	return new Set(
+		authority.service
+			.listSessions()
+			.filter((session) => session.status === 'running')
+			.map((session) => session.sessionId),
+	);
+}
+
+function restoreSavedMcpCapabilities(authority: ServerTerminalAuthority): void {
+	let saved: unknown;
+	try {
+		saved = JSON.parse(readFileSync(getMcpCapabilityFilePath(), 'utf8'));
+	} catch {
+		return;
+	}
+	if (!Array.isArray(saved)) return;
+	mcpCapabilities.restore(saved, runningTerminalSessionIds(authority));
+}
+
+function pruneMcpCapabilities(authority: ServerTerminalAuthority): void {
+	try {
+		mcpCapabilities.prune(runningTerminalSessionIds(authority));
+	} catch (error) {
+		console.error('[mcp] pruning terminal capabilities failed', error);
+	}
+}
+
+function getMcpEntryPath(): string {
+	const entry = path.join(MAIN_DIST, 'serverMcpEntry.js');
+	return entry.replace(`app.asar${path.sep}`, `app.asar.unpacked${path.sep}`);
+}
+
+function getMcpServerCommand(): McpServerCommand {
+	return {
+		command: process.execPath,
+		args: [getMcpEntryPath()],
+		env: { ELECTRON_RUN_AS_NODE: '1' },
+	};
+}
+
+/** Agent status and per-harness switches, as the server settings hold them.
+ * Sources stop when agent status is off and drop a harness switched off. */
+function applyServerAgentSettings(settings: Record<string, unknown>): void {
+	const authority = serverTerminalAuthority;
+	if (authority === null) return;
+	authority.agents.setIntegrationEnabled(
+		agentIntegrationEnabledFromSettings(settings),
+	);
+	authority.agentSources.setHarnessSwitches(
+		agentHarnessSwitchesFromSettings(settings),
+	);
+}
+
+function applyMcpSetting(settings: Record<string, unknown>): void {
+	const candidate = settings.terminayMcp;
+	const enabled =
+		typeof candidate === 'object' &&
+		candidate !== null &&
+		typeof (candidate as { enabled?: unknown }).enabled === 'boolean'
+			? (candidate as { enabled: boolean }).enabled
+			: true;
+	mcpCapabilities.setEnabled(enabled);
+	// With MCP off no agent can reach a window it opened, and a window must not
+	// go on calling the servers that were connected for agents.
+	if (!enabled) {
+		serverTerminalAuthority?.composition.appWindows?.endAll();
+		mcpGateway.closeAll();
+	}
+}
+
+async function startMcpControlEndpoint(): Promise<void> {
+	if (mcpControlEndpoint !== null) return;
+	// Throws when the socket has nowhere to go, or when the runtime directory
+	// it would go in is not the user's own; startup then says so.
+	const placement = await placeControlSocket(
+		mcpControlSocketPlacementOptions(),
+	);
+	const endpoint = createControlEndpoint({
+		socketPath: placement.path,
+		tightenParentDirectory: placement.location !== 'runtime-directory',
+		capabilities: mcpCapabilities,
+		dispatch: createTerminalControlAdapter({
+			adapter: createDesktopMcpTerminalAdapter(),
+			automations: createDesktopMcpAutomationAdapter(),
+			appWindows: createDesktopMcpAppWindowAdapter(),
+			notifications: createDesktopMcpNotificationAdapter(),
+			workspaceView: createDesktopMcpWorkspaceViewAdapter(),
+			appControl: createDesktopMcpAppControlAdapter(),
+			settings: createDesktopMcpSettingsAdapter(),
+			macros: createDesktopMcpMacroAdapter(),
+			takeModelContext: (context, maxBytes) =>
+				serverTerminalAuthority?.composition.appWindows?.takeModelContext(
+					context.terminalSessionId,
+					maxBytes,
+				) ?? [],
+			permissions: createDesktopMcpPermissionGate(),
+		}),
+		onError: (error) => console.error('[mcp] control endpoint failed', error),
+	});
+	mcpControlEndpoint = endpoint;
+	try {
+		await endpoint.start();
+	} catch (error) {
+		if (mcpControlEndpoint === endpoint) mcpControlEndpoint = null;
+		throw error;
+	}
+}
+
+async function stopMcpControlEndpoint(): Promise<void> {
+	removeMcpSettingsObserver?.();
+	removeMcpSettingsObserver = undefined;
+	const endpoint = mcpControlEndpoint;
+	mcpControlEndpoint = null;
+	// With MCP off, or the server stopping, connected servers stop too.
+	mcpGateway.closeAll();
+	if (endpoint !== null) await endpoint.stop();
+	else mcpCapabilities.revokeAll();
+}
+
+/**
+ * Keep the gateway's entries equal to the registry's, report its status back
+ * for Settings, and route an MCP App view's own requests to the server that
+ * supplied the view, behind the Connected Server Tools policy.
+ */
+function bindMcpGateway(authority: ServerTerminalAuthority): void {
+	removeMcpGatewayBindings?.();
+	const { connectedServers, appWindows, mcpApprovals } = authority.composition;
+	if (connectedServers === undefined) return;
+	// Resolving reads the vault, so two saves in quick succession can finish out
+	// of order. Only the latest one is applied.
+	let syncs = 0;
+	const sync = (): void => {
+		syncs += 1;
+		const current = syncs;
+		void connectedServers
+			.resolved()
+			.then((entries) => {
+				if (current === syncs) mcpGateway.setEntries(entries);
+			})
+			.catch((error) => console.error('[mcp] connected servers failed', error));
+	};
+	connectedServers.bindStatus(() => mcpGateway.status());
+	const stopRegistry = connectedServers.onChanged(sync);
+	const stopGateway = mcpGateway.onChanged(() =>
+		connectedServers.notifyStatusChanged(),
+	);
+	// A project that closes takes its local servers with it.
+	const stopWorkspace = authority.workspace.subscribe((_event, record) => {
+		for (const projectId of record.removed.projects ?? [])
+			mcpGateway.closeProject(projectId);
+	});
+	appWindows?.bindViewRequests(async (window, method, params, signal) => {
+		if (window.source.kind !== 'mcp-app')
+			throw protocolError('forbidden', 'This window has no server.');
+		const outcome = await mcpApprovals?.authorize({
+			terminalSessionId: window.terminalSessionId,
+			projectId: window.projectId,
+			operation: 'call_connected_tool',
+			group: 'connectedServerTools',
+			agent: `The window "${window.title}"`,
+			terminalTitle:
+				mcpTerminalTitle(window.terminalSessionId, window.projectId) ??
+				'this terminal',
+			summary: `use ${window.source.server}'s tool ${String(params.name ?? params.uri ?? '')}`,
+			details: [],
+			signal,
+		});
+		// A view sees a refusal as a refusal, with the reason, never as a fault.
+		if (outcome !== undefined && !outcome.ok)
+			throw protocolError('forbidden', outcome.error.message);
+		try {
+			return await mcpGateway.callFromView(
+				window.projectId,
+				window.source.server,
+				method,
+				params,
+				signal,
+			);
+		} catch (error) {
+			const code = (error as { code?: unknown } | null)?.code;
+			throw protocolError(
+				code === 'not_found' ? 'not_found' : code === 'forbidden' ? 'forbidden' : 'unavailable',
+				error instanceof Error ? error.message.slice(0, 500) : 'The request failed.',
+			);
+		}
+	});
+	removeMcpGatewayBindings = () => {
+		stopRegistry();
+		stopGateway();
+		stopWorkspace();
+	};
+	sync();
+}
+
+/** The window tools, bound to whichever authority is composed when called. */
+function createDesktopMcpAppWindowAdapter(): AppWindowControlAdapter {
+	const bound = (): AppWindowControlAdapter => {
+		const windows = serverTerminalAuthority?.composition.appWindows;
+		if (windows === undefined)
+			throw new ControlEndpointError(
+				'unsupported_op',
+				'App windows are unavailable on this server.',
+			);
+		return createAppWindowControlAdapter({ windows, gateway: mcpGateway });
+	};
+	return {
+		showWindow: (params, context, signal) =>
+			bound().showWindow(params, context, signal),
+		closeWindow: (params, context, signal) =>
+			bound().closeWindow(params, context, signal),
+		listWindows: (context, signal) => bound().listWindows(context, signal),
+		listConnectedTools: (context, signal, after) =>
+			bound().listConnectedTools(context, signal, after),
+		callConnectedTool: (params, context, signal, mayShowWindow) =>
+			bound().callConnectedTool(params, context, signal, mayShowWindow),
+	};
+}
+
+// Opaque project handles for workspace reach (ADR-0030); project reach never
+// names a project. One codec, so a handle from list_terminals is the same
+// handle get_layout gives and every view tool accepts.
+const mcpProjectHandles = new ProjectHandleCodec(embeddedServerId);
+
+/** The view tools, bound to whichever authority is composed when called
+ * (ADR-0070). */
+function createDesktopMcpWorkspaceViewAdapter(): WorkspaceViewControlAdapter {
+	const bound = (): WorkspaceViewControlAdapter => {
+		const authority = requireMcpAuthority();
+		const { workspaceView } = authority.composition;
+		if (workspaceView === undefined)
+			throw new ControlEndpointError(
+				'unsupported_op',
+				'Reading and changing the window layout is unavailable on this server.',
+			);
+		return createWorkspaceViewAdapter({
+			relay: workspaceView.relay,
+			targetFor: workspaceView.targetFor,
+			state: () => authority.workspace.state,
+			apply: (command, context) => applyMcpWorkspaceCommand(context, command),
+			projectHandles: mcpProjectHandles,
+		});
+	};
+	return {
+		getLayout: (p, c, s) => bound().getLayout(p, c, s),
+		focusTab: (p, c, s) => bound().focusTab(p, c, s),
+		moveTab: (p, c, s) => bound().moveTab(p, c, s),
+		resizePane: (p, c, s) => bound().resizePane(p, c, s),
+		arrangeTabs: (p, c, s) => bound().arrangeTabs(p, c, s),
+		focusProject: (p, c, s) => bound().focusProject(p, c, s),
+		selectFolder: (p, c, s) => bound().selectFolder(p, c, s),
+		createFolder: (p, c, s) => bound().createFolder(p, c, s),
+		renameFolder: (p, c, s) => bound().renameFolder(p, c, s),
+		deleteFolder: (p, c, s) => bound().deleteFolder(p, c, s),
+		reorderFolders: (p, c, s) => bound().reorderFolders(p, c, s),
+		focusHome: (p, c, s) => bound().focusHome(p, c, s),
+		moveTabToFolder: (p, c, s) => bound().moveTabToFolder(p, c, s),
+		openFile: (p, c, s) => bound().openFile(p, c, s),
+		closeTab: (p, c, s) => bound().closeTab(p, c, s),
+		anchorFor: (r, c, s) => bound().anchorFor(r, c, s),
+		placeTerminal: (p, c, s) => bound().placeTerminal(p, c, s),
+	};
+}
+
+// Opaque workspace window handles (ADR-0072), one codec like the project
+// handles, so list_projects and list_workspace_windows agree.
+const mcpWindowHandles = new WindowHandleCodec(embeddedServerId);
+// The start chooser's folder validation, from the same verified home the
+// composition's chooser and terminals use. It canonicalises; it lists nothing.
+const mcpRootFolders = new RootFolderBrowser({
+	homeDirectory: nodeTerminalLaunchPathAuthority.homeDirectory,
+});
+
+/** The project and window tools, bound to whichever authority is composed
+ * when called (ADR-0072). Every change runs the server's own workspace
+ * operation as the MCP principal. */
+function createDesktopMcpAppControlAdapter(): AppControlAdapter {
+	const bound = (): AppControlAdapter => {
+		const authority = requireMcpAuthority();
+		const operations = authority.composition.workspaceOperations?.operations;
+		if (operations === undefined)
+			throw new ControlEndpointError(
+				'unsupported_op',
+				'Projects and windows are unavailable on this server.',
+			);
+		const { workspaceView } = authority.composition;
+		return createAppControlAdapter({
+			state: () => authority.workspace.state,
+			command: async (operation, payload, signal) => {
+				const handler = (
+					operations.commands as Record<
+						string,
+						((request: unknown) => unknown) | undefined
+					>
+				)?.[operation];
+				if (handler === undefined)
+					throw new ControlEndpointError(
+						'unsupported_op',
+						`${operation} is unavailable on this server.`,
+					);
+				const outcome = await handler(
+					mcpPrincipalCommandRequest(operation, payload, signal),
+				);
+				return typeof outcome === 'object' &&
+					outcome !== null &&
+					'result' in outcome
+					? (outcome as { result: unknown }).result
+					: outcome;
+			},
+			projectHandles: mcpProjectHandles,
+			windowHandles: mcpWindowHandles,
+			canonicalFolder: (root) => mcpRootFolders.canonicalDirectory(root),
+			openFirstTerminal: async (projectId) =>
+				(await createServerOwnedTerminalSession(projectId)).id,
+			busyTerminals: async (projectId, signal) =>
+				// A terminal whose program cannot be observed counts as busy.
+				(
+					await authority.service.observeProjectForegroundProcesses(
+						projectId,
+						undefined,
+						undefined,
+						signal,
+					)
+				).filter(
+					(observation) =>
+						observation.foregroundBusy || observation.observation === 'limited',
+				).length,
+			liveTerminals: (projectId) =>
+				authority
+					.list()
+					.filter(
+						(entry) =>
+							entry.projectId === projectId && entry.status === 'running',
+					).length,
+			...(workspaceView === undefined
+				? {}
+				: {
+						view: {
+							relay: workspaceView.relay,
+							targetFor: workspaceView.targetFor,
+						},
+					}),
+		});
+	};
+	return {
+		listProjects: (p, c, s) => bound().listProjects(p, c, s),
+		createProject: (p, c, s) => bound().createProject(p, c, s),
+		updateProject: (p, c, s) => bound().updateProject(p, c, s),
+		moveProject: (p, c, s) => bound().moveProject(p, c, s),
+		closeProject: (p, c, s) => bound().closeProject(p, c, s),
+		listWorkspaceWindows: (p, c, s) => bound().listWorkspaceWindows(p, c, s),
+		openWorkspaceWindow: (p, c, s) => bound().openWorkspaceWindow(p, c, s),
+		renameWorkspaceWindow: (p, c, s) => bound().renameWorkspaceWindow(p, c, s),
+		closeWorkspaceWindow: (p, c, s) => bound().closeWorkspaceWindow(p, c, s),
+	};
+}
+
+/** One composed part of the MCP authority, or `unsupported_op` without it. */
+function requireMcpComposition<
+	K extends 'settingsOperations' | 'shellProfileOperations' | 'macroOperations',
+>(key: K): NonNullable<ServerTerminalAuthority['composition'][K]> {
+	const part = requireMcpAuthority().composition[key];
+	if (part === undefined)
+		throw new ControlEndpointError(
+			'unsupported_op',
+			'That is unavailable on this server.',
+		);
+	return part as NonNullable<ServerTerminalAuthority['composition'][K]>;
+}
+
+type McpOperationRegistries = NonNullable<
+	ServerTerminalAuthority['composition']['settingsOperations']
+>['operations'];
+
+function registryHandler(
+	handlers:
+		| ReadonlyMap<string, unknown>
+		| Readonly<Record<string, unknown>>
+		| undefined,
+	operation: string,
+): ((request: unknown) => unknown) | undefined {
+	const handler =
+		handlers instanceof Map
+			? handlers.get(operation)
+			: (handlers as Readonly<Record<string, unknown>> | undefined)?.[
+					operation
+				];
+	return typeof handler === 'function'
+		? (handler as (request: unknown) => unknown)
+		: undefined;
+}
+
+/** Run one server query as the MCP principal (ADR-0072). */
+async function runMcpRegistryQuery(
+	registries: McpOperationRegistries,
+	operation: string,
+	payload: JsonValue,
+	signal: AbortSignal,
+): Promise<unknown> {
+	const handler = registryHandler(registries.queries, operation);
+	if (handler === undefined)
+		throw new ControlEndpointError(
+			'unsupported_op',
+			`${operation} is unavailable on this server.`,
+		);
+	const outcome = await handler(
+		mcpPrincipalQueryRequest(operation, payload, signal),
+	);
+	return typeof outcome === 'object' &&
+		outcome !== null &&
+		'result' in outcome &&
+		!(outcome as { body?: unknown }).body
+		? (outcome as { result: unknown }).result
+		: outcome;
+}
+
+/** Run one server command as the MCP principal (ADR-0072). */
+async function runMcpRegistryCommand(
+	registries: McpOperationRegistries,
+	operation: string,
+	payload: JsonValue,
+	signal: AbortSignal,
+	expectedRevision?: number,
+): Promise<unknown> {
+	const handler = registryHandler(registries.commands, operation);
+	if (handler === undefined)
+		throw new ControlEndpointError(
+			'unsupported_op',
+			`${operation} is unavailable on this server.`,
+		);
+	const outcome = await handler(
+		mcpPrincipalCommandRequest(operation, payload, signal, expectedRevision),
+	);
+	return typeof outcome === 'object' && outcome !== null && 'result' in outcome
+		? (outcome as { result: unknown }).result
+		: outcome;
+}
+
+/** The settings and shell profile tools, bound to whichever authority is
+ * composed when called (ADR-0072). */
+function createDesktopMcpSettingsAdapter(): SettingsControlAdapter {
+	const bound = (): SettingsControlAdapter =>
+		createSettingsControlAdapter({
+			query: (operation, payload, signal) =>
+				runMcpRegistryQuery(
+					operation.startsWith('settings.')
+						? requireMcpComposition('settingsOperations').operations
+						: requireMcpComposition('shellProfileOperations').operations,
+					operation,
+					payload,
+					signal,
+				),
+			command: (operation, payload, signal, expectedRevision) =>
+				runMcpRegistryCommand(
+					operation.startsWith('settings.')
+						? requireMcpComposition('settingsOperations').operations
+						: requireMcpComposition('shellProfileOperations').operations,
+					operation,
+					payload,
+					signal,
+					expectedRevision,
+				),
+			state: () => requireMcpAuthority().workspace.state,
+			projectHandles: mcpProjectHandles,
+		});
+	return {
+		getSettings: (p, c, s) => bound().getSettings(p, c, s),
+		updateSettings: (p, c, s) => bound().updateSettings(p, c, s),
+		listShellProfiles: (p, c, s) => bound().listShellProfiles(p, c, s),
+		saveShellProfile: (p, c, s) => bound().saveShellProfile(p, c, s),
+		deleteShellProfile: (p, c, s) => bound().deleteShellProfile(p, c, s),
+		reorderShellProfiles: (p, c, s) => bound().reorderShellProfiles(p, c, s),
+		setDefaultShellProfile: (p, c, s) => bound().setDefaultShellProfile(p, c, s),
+	};
+}
+
+/** The macro tools, bound to whichever authority is composed when called
+ * (ADR-0072). */
+function createDesktopMcpMacroAdapter(): MacroControlAdapter {
+	const bound = (): MacroControlAdapter =>
+		createMacroControlAdapter({
+			query: (operation, payload, signal) =>
+				runMcpRegistryQuery(
+					requireMcpComposition('macroOperations').operations,
+					operation,
+					payload,
+					signal,
+				),
+			command: (operation, payload, signal) =>
+				runMcpRegistryCommand(
+					requireMcpComposition('macroOperations').operations,
+					operation,
+					payload,
+					signal,
+				),
+			resolveTerminal: (context, reference) => {
+				const target = resolveMcpTerminal(context, reference);
+				return {
+					serverId: requireMcpAuthority().service.serverId,
+					projectId: target.projectId,
+					sessionId: target.id,
+				};
+			},
+		});
+	return {
+		listMacros: (p, c, s) => bound().listMacros(p, c, s),
+		runMacro: (p, c, s) => bound().runMacro(p, c, s),
+		cancelMacro: (p, c, s) => bound().cancelMacro(p, c, s),
+	};
+}
+
+function createDesktopMcpTerminalAdapter(): TerminalControlAdapter {
+	const terminal = (context: ControlRequestContext, reference: string) =>
+		resolveMcpTerminal(context, reference);
+	const projectHandles = mcpProjectHandles;
+	const liveTerminalsIn = (projectId: string) =>
+		requireMcpAuthority()
+			.list()
+			.filter(
+				(entry) => entry.projectId === projectId && entry.status === 'running',
+			).length;
+	return {
+		getMcpCapabilities: (context) => ({
+			tools: desktopMcpToolAvailability(context),
+		}),
+		listTerminals: (context) => {
+			const authority = requireMcpAuthority();
+			const activityBySession = authority.activity.snapshot().sessions;
+			const workspaceReach = reachOf(context) === 'workspace';
+			return {
+				terminals: authority
+					.list()
+					.filter((entry) => mcpReaches(context, entry.projectId))
+					.map((entry) => {
+						const panel = mcpPanelFor(entry.id, entry.projectId);
+						const activity = activityBySession[entry.id];
+						const snapshot = authority.service.getSession(entry.id);
+						return {
+							terminal: entry.id,
+							...(workspaceReach
+								? workspaceProjectFields(
+										projectHandles,
+										authority.workspace.state,
+										entry.projectId,
+									)
+								: {}),
+							name: mcpTerminalTitle(entry.id, entry.projectId) ?? entry.id,
+							status: entry.status,
+							active:
+								panel?.id ===
+								authority.workspace.state.projects[entry.projectId]
+									?.activePanelId,
+							self: entry.id === context.terminalSessionId,
+							cwd: entry.cwd,
+							activity: activity?.status ?? 'idle',
+							attention: activity?.attention ?? false,
+							output_position: snapshot?.outputPosition ?? 0,
+							replay_from: snapshot?.replayFrom ?? 0,
+						};
+					}),
+			};
+		},
+		readTerminal: async (params, context) => {
+			const target = terminal(context, params.terminal);
+			const authority = requireMcpAuthority();
+			const authorization = mcpAuthorization(target.projectId);
+			if (params.format === 'raw') {
+				const rawBytes = Math.floor(params.maxBytes / 4) * 3;
+				const read = authority.service.readRetainedOutput(target.id, {
+					authorization,
+					...(params.after === undefined ? {} : { fromPosition: params.after }),
+					maxBytes: Math.max(1, rawBytes),
+				});
+				const bytes = rawBytes === 0 ? read.bytes.subarray(0, 0) : read.bytes;
+				const next = read.fromPosition + bytes.byteLength;
+				return {
+					terminal: target.id,
+					format: 'raw',
+					encoding: 'base64',
+					output: Buffer.from(bytes).toString('base64'),
+					from: read.fromPosition,
+					next,
+					replay_from: read.replayFrom,
+					output_position: read.outputPosition,
+					history_lost: read.historyLost,
+					dropped_bytes: read.droppedBytes,
+					truncated_tail: next < read.outputPosition,
+				};
+			}
+			const presentation = await authority.service.readPresentation(target.id, {
+				authorization,
+				format: params.format,
+				maxBytes: params.maxBytes,
+				...(params.lines === undefined ? {} : { maxRows: params.lines }),
+			});
+			return {
+				terminal: target.id,
+				format: params.format,
+				output:
+					params.format === 'text'
+						? (presentation.rows ?? []).join('\n')
+						: (presentation.ansi ?? ''),
+				output_position: presentation.outputPosition,
+				dimensions: presentation.dimensions,
+				presentation_truncated: presentation.truncated,
+				dropped_bytes: presentation.droppedBytes,
+				dropped_rows: presentation.droppedRows,
+			};
+		},
+		searchTerminal: async (params, context) => {
+			const target = terminal(context, params.terminal);
+			const presentation = await requireMcpAuthority().service.readPresentation(
+				target.id,
+				{
+					authorization: mcpAuthorization(target.projectId),
+					format: 'text',
+					maxBytes: params.maxBytes,
+				},
+			);
+			return buildMcpTerminalSearchResult(target.id, presentation, params);
+		},
+		getTerminalStatus: (params, context) => {
+			const target = terminal(context, params.terminal);
+			const authority = requireMcpAuthority();
+			const activity = authority.activity.get({
+				serverId: target.serverId,
+				projectId: target.projectId,
+				sessionId: target.id,
+			});
+			return {
+				terminal: target.id,
+				status: target.status,
+				cwd: target.cwd,
+				activity: activity?.status ?? 'idle',
+				attention: activity?.attention ?? false,
+				output_position:
+					authority.service.getSession(target.id)?.outputPosition ?? 0,
+				replay_from: authority.service.getSession(target.id)?.replayFrom ?? 0,
+			};
+		},
+		openTerminal: async (params, context) => {
+			// A workspace-reach caller opens in the automation space unless it
+			// names a project, and the space exists only once something has
+			// needed it. A chat may be the first thing that does.
+			if (reachOf(context) === 'workspace' && params.project === undefined)
+				requireMcpAuthority().composition.workspaceOperations?.ensureAutomationSpace(
+					app.getPath('home'),
+				);
+			const state = requireMcpAuthority().workspace.state;
+			const projectId = resolveOpenTerminalProject({
+				context,
+				codec: projectHandles,
+				state,
+				project: params.project,
+				liveTerminals: liveTerminalsIn,
+			});
+			// The caller's panel anchors cwd inheritance only in its own project,
+			// and the new terminal joins the folder that panel is in.
+			const callerPanel =
+				projectId === context.projectId
+					? mcpPanelFor(context.terminalSessionId, context.projectId)
+					: undefined;
+			const opened = await createServerOwnedTerminalSession(
+				projectId,
+				params.cwd,
+				undefined,
+				callerPanel?.id,
+				callerPanel?.folderId,
+				params.shellProfile,
+			);
+			// An automation terminal's opens join the run that owns it, so the
+			// Automations section groups them under that run (ADR-0030).
+			if (reachOf(context) === 'workspace')
+				await serverTerminalAuthority?.composition.automationExecutor
+					?.recordOpenedTerminal(context.terminalSessionId, opened.id)
+					.catch(() => undefined);
+			const panel = mcpPanelFor(opened.id, projectId);
+			if (params.name !== undefined && panel !== undefined)
+				applyMcpWorkspaceCommand(context, {
+					type: 'panel.update',
+					panelId: panel.id,
+					patch: { title: params.name },
+				});
+			if (reachOf(context) === 'workspace')
+				return {
+					terminal: opened.id,
+					...workspaceProjectFields(projectHandles, state, projectId),
+					status: opened.status,
+				};
+			return { terminal: opened.id, status: opened.status };
+		},
+		writeTerminal: async (params, context) => {
+			const target = terminal(context, params.terminal);
+			const data = params.submit === true ? `${params.text}\r` : params.text;
+			await requireMcpAuthority().write(
+				target.id,
+				data,
+				mcpAuthorization(target.projectId),
+			);
+			return {
+				terminal: target.id,
+				bytes: new TextEncoder().encode(data).byteLength,
+			};
+		},
+		runCommand: async (params, context) => {
+			const target = terminal(context, params.terminal);
+			const service = requireMcpAuthority().service;
+			const bracketed = await service.bracketedPasteMode(
+				target.id,
+				mcpAuthorization(target.projectId),
+			);
+			const from = service.getSession(target.id)?.outputPosition ?? 0;
+			const data = commandSubmissionInput(params.command, bracketed);
+			await requireMcpAuthority().write(
+				target.id,
+				data,
+				mcpAuthorization(target.projectId),
+			);
+			return {
+				terminal: target.id,
+				command_id: context.requestId,
+				from,
+				submitted_bytes: new TextEncoder().encode(data).byteLength,
+				submitted: true,
+				bracketed,
+			};
+		},
+		closeTerminal: async (params, context) => {
+			const target = terminal(context, params.terminal);
+			await requireMcpAuthority().kill(
+				target.id,
+				mcpAuthorization(target.projectId),
+			);
+			return { terminal: target.id, closed: true };
+		},
+		// Showing a terminal is the agent's client's to do (ADR-0070): the host
+		// only resolves it within scope.
+		focusTerminal: (params, context) => ({
+			terminal: terminal(context, params.terminal).id,
+		}),
+		renameTerminal: (params, context) => {
+			const target = terminal(context, params.terminal);
+			const panel = mcpPanelFor(target.id, target.projectId);
+			if (panel === undefined)
+				throw new ControlEndpointError(
+					'terminal_not_found',
+					'The requested terminal is unavailable.',
+				);
+			applyMcpWorkspaceCommand(context, {
+				type: 'panel.update',
+				panelId: panel.id,
+				patch: { title: params.name },
+			});
+			return { terminal: target.id, name: params.name };
+		},
+		splitTerminal: async (params, context) => {
+			const target = terminal(context, params.terminal);
+			assertAutomationSpaceCapacity(
+				isAutomationSpace(
+					requireMcpAuthority().workspace.state.projects[target.projectId],
+				),
+				liveTerminalsIn(target.projectId),
+			);
+			// A split lands beside its target, so it is created in the target's
+			// folder: a folder's layout holds only that folder's panels.
+			const targetPanel = mcpPanelFor(target.id, target.projectId);
+			const opened = await createServerOwnedTerminalSession(
+				target.projectId,
+				undefined,
+				undefined,
+				targetPanel?.id,
+				targetPanel?.folderId,
+			);
+			// Where it appears is the agent's client's to decide (ADR-0070).
+			const panel = mcpPanelFor(opened.id, target.projectId);
+			if (params.name !== undefined && panel !== undefined)
+				applyMcpWorkspaceCommand(context, {
+					type: 'panel.update',
+					panelId: panel.id,
+					patch: { title: params.name },
+				});
+			if (reachOf(context) === 'workspace')
+				await serverTerminalAuthority?.composition.automationExecutor
+					?.recordOpenedTerminal(context.terminalSessionId, opened.id)
+					.catch(() => undefined);
+			return { terminal: opened.id, status: opened.status };
+		},
+		waitForIdle: async (params, context, signal) => {
+			const target = terminal(context, params.terminal);
+			await requireMcpAuthority().service.waitForInactivity(
+				target.id,
+				params.seconds * 1000,
+				{ authorization: mcpAuthorization(target.projectId), signal },
+			);
+			return { terminal: target.id, idle: true };
+		},
+		waitForCommand: () => {
+			throw new ControlEndpointError(
+				'unsupported_op',
+				'Structured command-completion observation is unavailable.',
+			);
+		},
+		waitForAttention: () => {
+			throw new ControlEndpointError(
+				'unsupported_op',
+				'Attention waiting is unavailable.',
+			);
+		},
+		...createTerminalMetadataAdapter({
+			state: () => requireMcpAuthority().workspace.state,
+			apply: (command, context) => applyMcpWorkspaceCommand(context, command),
+			resolveTerminal: (context, reference) => {
+				const target = terminal(context, reference);
+				return { sessionId: target.id, projectId: target.projectId };
+			},
+			projectHandles,
+		}),
+	};
+}
+
+function desktopMcpToolAvailability(context: ControlRequestContext): readonly {
+	readonly tool: string;
+	readonly available: boolean;
+	readonly permission: 'allow' | 'ask' | 'deny';
+}[] {
+	const unavailable = new Set<ControlOperation>([
+		'wait_for_command',
+		'wait_for_attention',
+	]);
+	const approvals = serverTerminalAuthority?.composition.mcpApprovals;
+	if (serverTerminalAuthority?.composition.appWindows === undefined)
+		for (const tool of ['show_window', 'close_window', 'list_windows'] as const)
+			unavailable.add(tool);
+	const composition = serverTerminalAuthority?.composition;
+	if (composition?.notifications === undefined)
+		for (const tool of [
+			'send_notification',
+			'list_notifications',
+			'dismiss_notification',
+		] as const)
+			unavailable.add(tool);
+	if (composition?.settingsOperations === undefined)
+		for (const tool of ['get_settings', 'update_settings'] as const)
+			unavailable.add(tool);
+	if (composition?.shellProfileOperations === undefined)
+		for (const tool of [
+			'list_shell_profiles',
+			'save_shell_profile',
+			'delete_shell_profile',
+			'reorder_shell_profiles',
+			'set_default_shell_profile',
+		] as const)
+			unavailable.add(tool);
+	if (composition?.macroOperations === undefined)
+		for (const tool of ['list_macros', 'run_macro', 'cancel_macro'] as const)
+			unavailable.add(tool);
+	return CONTROL_TOOL_OPERATIONS.map((tool) => {
+		const group = CONTROL_PERMISSION_GROUPS[tool];
+		return {
+			tool,
+			available: !unavailable.has(tool),
+			permission:
+				group === undefined || approvals === undefined
+					? 'allow'
+					: approvals.effectivePolicy(group, context.terminalSessionId),
+		};
+	});
+}
+
+/** The notification tools, bound to whichever authority is composed when called. */
+function createDesktopMcpNotificationAdapter(): NotificationControlAdapter {
+	const bound = (): NotificationControlAdapter => {
+		const notifications = serverTerminalAuthority?.composition.notifications;
+		if (notifications === undefined)
+			throw new ControlEndpointError(
+				'unsupported_op',
+				'Notifications are unavailable on this server.',
+			);
+		const operations =
+			serverTerminalAuthority?.composition.notificationOperations?.operations;
+		return createNotificationControlAdapter({
+			notifications,
+			// A user's own dismissal: an activity notification acknowledges its
+			// terminal.
+			...(operations === undefined
+				? {}
+				: {
+						dismiss: async (record) =>
+							(
+								(await runMcpRegistryCommand(
+									operations,
+									'notifications.dismiss',
+									{
+										id: record.id,
+										projectId: record.projectId,
+										sessionId: record.sessionId,
+									},
+									new AbortController().signal,
+								)) as { dismissed?: unknown } | null
+							)?.dismissed === true,
+					}),
+			reaches: (context, owner) =>
+				mcpReaches(context, owner.projectId) &&
+				requireMcpAuthority()
+					.list()
+					.some(
+						(entry) =>
+							entry.id === owner.sessionId &&
+							entry.projectId === owner.projectId,
+					),
+		});
+	};
+	return {
+		sendNotification: (params, context, signal) =>
+			bound().sendNotification(params, context, signal),
+		dismissNotification: (params, context, signal) =>
+			bound().dismissNotification(params, context, signal),
+		listNotifications: (params, context, signal) =>
+			bound().listNotifications(params, context, signal),
+	};
+}
+
+function requireAutomationMcp() {
+	const automations = requireMcpAuthority().composition.automationMcp;
+	if (automations === undefined)
+		throw new ControlEndpointError(
+			'unsupported_op',
+			'Automations are unavailable on this server.',
+		);
+	return automations;
+}
+
+/** Run an automation call, turning a service refusal into a public error. */
+async function automationMcpCall<T>(work: () => Promise<T>): Promise<T> {
+	try {
+		return await work();
+	} catch (error) {
+		const mapped = automationControlError(error);
+		if (mapped !== undefined)
+			throw new ControlEndpointError(mapped.code, mapped.message);
+		throw error;
+	}
+}
+
+/** A run's subject is visible only when its project is in the caller's reach. */
+function mcpSeesSubject(
+	context: ControlRequestContext,
+	subject: AutomationSubject,
+): boolean {
+	return subject.kind === 'device' || mcpReaches(context, subject.projectId);
+}
+
+function mcpAutomationSubject(
+	context: ControlRequestContext,
+	reference: string,
+): { readonly subject: AutomationSubject; readonly title: string } {
+	const target = resolveMcpTerminal(context, reference);
+	const authority = requireMcpAuthority();
+	const session = authority.service.getSession(target.id);
+	const title = mcpTerminalTitle(target.id, target.projectId) ?? target.id;
+	return {
+		subject: {
+			kind: 'terminal',
+			serverId: authority.service.serverId,
+			projectId: target.projectId,
+			sessionId: target.id,
+			...(session?.createdAt === undefined
+				? {}
+				: { sessionCreatedAt: session.createdAt }),
+			title,
+		},
+		title,
+	};
+}
+
+function createDesktopMcpAutomationAdapter(): AutomationControlAdapter {
+	const actor = (context: ControlRequestContext) => ({
+		terminalSessionId: context.terminalSessionId,
+	});
+	return {
+		listAutomations: () =>
+			automationMcpCall(() => requireAutomationMcp().list()),
+		getAutomation: (params) =>
+			automationMcpCall(() => requireAutomationMcp().get(params.automationId)),
+		listAutomationRuns: (params, context) =>
+			automationMcpCall(() =>
+				requireAutomationMcp().runs(
+					params.automationId,
+					params.limit,
+					(subject) => mcpSeesSubject(context, subject),
+				),
+			),
+		createAutomation: (params, context) =>
+			automationMcpCall(() =>
+				requireAutomationMcp().create(params.definition, actor(context)),
+			),
+		updateAutomation: (params, context) =>
+			automationMcpCall(() =>
+				requireAutomationMcp().update(
+					params.automationId,
+					params.definition,
+					params.revision,
+					actor(context),
+				),
+			),
+		deleteAutomation: (params, context) =>
+			automationMcpCall(() =>
+				requireAutomationMcp().remove(
+					params.automationId,
+					params.revision,
+					actor(context),
+				),
+			),
+		setAutomationEnabled: (params, context) =>
+			automationMcpCall(() =>
+				requireAutomationMcp().setEnabled(
+					params.automationId,
+					params.enabled,
+					params.revision,
+					actor(context),
+				),
+			),
+		runAutomation: (params, context) =>
+			automationMcpCall(() =>
+				requireAutomationMcp().run(
+					params.automationId,
+					params.terminal === undefined
+						? undefined
+						: mcpAutomationSubject(context, params.terminal).subject,
+					actor(context),
+				),
+			),
+		stopAutomationRun: (params, context) =>
+			automationMcpCall(() =>
+				requireAutomationMcp().stop(params.runId, actor(context)),
+			),
+		removeAutomationRun: (params, context) =>
+			automationMcpCall(() =>
+				requireAutomationMcp().removeRun(params.runId, actor(context)),
+			),
+		pruneAutomationRuns: (params, context) =>
+			automationMcpCall(() =>
+				requireAutomationMcp().pruneRuns(
+					params.automationId,
+					params.olderThanDays,
+					actor(context),
+				),
+			),
+		dismissMissedRuns: (params, context) =>
+			automationMcpCall(() =>
+				requireAutomationMcp().dismissMissed(
+					params.automationId,
+					actor(context),
+				),
+			),
+	};
+}
+
+/** The agent detected in a terminal, as its session source names it. */
+function mcpAgentLabel(terminalSessionId: string): string {
+	const entries =
+		serverTerminalAuthority?.agents.entriesForTerminal(terminalSessionId) ?? [];
+	const entry =
+		entries.find((candidate) => candidate.kind === 'root') ?? entries[0];
+	const label =
+		entry?.harnessDisplayName?.trim() || entry?.providerDisplayName?.trim();
+	return label === undefined || label === '' ? 'An agent' : label;
+}
+
+function createDesktopMcpPermissionGate(): ControlPermissionGate {
+	const gate = (): ControlPermissionGate | undefined => {
+		const approvals = serverTerminalAuthority?.composition.mcpApprovals;
+		return approvals === undefined
+			? undefined
+			: createMcpPermissionGate({
+					approvals,
+					describe: describeMcpRequest,
+					chatAgentName: (chatId) =>
+						serverTerminalAuthority?.composition.agentChat?.agentName(chatId),
+				});
+	};
+	return {
+		authorize: async (request) => {
+			const refusal = await gate()?.authorize(request);
+			if (refusal === undefined) noteChatMcpCall(request);
+			return refusal;
+		},
+	};
+}
+
+/** Show a permitted Terminay call in the chat that made it, in our words. */
+function noteChatMcpCall(request: {
+	readonly op: ControlOperation;
+	readonly params: Readonly<Record<string, unknown>>;
+	readonly context: ControlRequestContext;
+}): void {
+	const chatId = request.context.chat?.chatId;
+	const chats = serverTerminalAuthority?.composition.agentChat;
+	if (chatId === undefined || chats === undefined) return;
+	const text = describeChatMcpCall(request.op, request.params, (reference) => {
+		try {
+			const target = resolveMcpTerminal(request.context, reference);
+			return mcpTerminalTitle(target.id, target.projectId);
+		} catch {
+			return undefined;
+		}
+	});
+	if (text !== undefined) chats.noteMcpCall(chatId, text);
+}
+
+async function describeMcpRequest(request: {
+	readonly op: ControlOperation;
+	readonly group: string;
+	readonly params: Readonly<Record<string, unknown>>;
+	readonly context: ControlRequestContext;
+}): Promise<
+	| McpApprovalDescription
+	| {
+			readonly ok: false;
+			readonly error: { code: ControlEndpointError['code']; message: string };
+	  }
+> {
+	const { op, params, context } = request;
+	const terminalTitle =
+		mcpTerminalTitle(context.terminalSessionId, context.projectId) ??
+		'a terminal';
+	const agent = mcpAgentLabel(context.terminalSessionId);
+	try {
+		const described = await describeMcpOperation(
+			op,
+			params,
+			context,
+			request.group,
+		);
+		return { agent, terminalTitle, ...described };
+	} catch (error) {
+		const mapped =
+			automationControlError(error) ??
+			(error instanceof ControlEndpointError
+				? { code: error.code, message: error.message }
+				: undefined);
+		if (mapped !== undefined) return { ok: false, error: mapped };
+		throw error;
+	}
+}
+
+/** Plain words and full details for one MCP request's approval prompt. */
+async function describeMcpOperation(
+	op: ControlOperation,
+	params: Readonly<Record<string, unknown>>,
+	context: ControlRequestContext,
+	group?: string,
+): Promise<Pick<McpApprovalDescription, 'summary' | 'details'>> {
+	const text = (value: unknown): string =>
+		typeof value === 'string' ? value : '';
+	const definition = () => {
+		const { automation_id: _id, revision: _revision, ...rest } = params;
+		return rest;
+	};
+	const targetTitle = () => {
+		const reference = text(params.terminal);
+		if (reference === '') return 'a terminal';
+		const target = resolveMcpTerminal(context, reference);
+		return mcpTerminalTitle(target.id, target.projectId) ?? target.id;
+	};
+	switch (op) {
+		case 'create_automation':
+			return requireAutomationMcp().describe({
+				kind: 'create',
+				input: definition(),
+			});
+		case 'update_automation':
+			return requireAutomationMcp().describe({
+				kind: 'update',
+				automationId: text(params.automation_id),
+				input: definition(),
+			});
+		case 'delete_automation':
+			return requireAutomationMcp().describe({
+				kind: 'delete',
+				automationId: text(params.automation_id),
+			});
+		case 'set_automation_enabled':
+			return requireAutomationMcp().describe({
+				kind: 'setEnabled',
+				automationId: text(params.automation_id),
+				enabled: params.enabled === true,
+			});
+		case 'run_automation':
+			return requireAutomationMcp().describe({
+				kind: 'run',
+				automationId: text(params.automation_id),
+				...(params.terminal === undefined
+					? {}
+					: {
+							subjectTitle: mcpAutomationSubject(context, text(params.terminal))
+								.title,
+						}),
+			});
+		case 'stop_automation_run':
+			return requireAutomationMcp().describe({
+				kind: 'stop',
+				runId: text(params.run_id),
+			});
+		case 'list_automations':
+			return { summary: 'list your automations', details: [] };
+		case 'get_automation':
+		case 'list_automation_runs':
+			return {
+				summary: `read the automation ${text(params.automation_id)}${op === 'list_automation_runs' ? "'s run history" : ''}`,
+				details: [],
+			};
+		case 'run_command':
+			return {
+				summary: `run a command in ${targetTitle()}`,
+				details: [
+					{ label: 'Command', value: text(params.command), code: true },
+				],
+			};
+		case 'write_terminal':
+			return {
+				summary: `type into ${targetTitle()}`,
+				details: [
+					{ label: 'Text', value: text(params.text), code: true },
+					{ label: 'Submit', value: params.submit === true ? 'Yes' : 'No' },
+				],
+			};
+		case 'open_terminal':
+			return {
+				summary: 'open a new terminal',
+				details: [
+					...(typeof params.name === 'string'
+						? [{ label: 'Name', value: params.name }]
+						: []),
+					...(typeof params.cwd === 'string'
+						? [{ label: 'Working directory', value: params.cwd }]
+						: []),
+				],
+			};
+		case 'close_terminal':
+			return { summary: `close ${targetTitle()}`, details: [] };
+		case 'focus_terminal':
+			return { summary: `switch to ${targetTitle()}`, details: [] };
+		case 'rename_terminal':
+			return {
+				summary: `rename ${targetTitle()} to "${text(params.name)}"`,
+				details: [],
+			};
+		case 'split_terminal':
+			return { summary: `split ${targetTitle()}`, details: [] };
+		case 'list_terminals':
+			return { summary: 'list your terminals', details: [] };
+		case 'show_window':
+			return {
+				summary:
+					params.window === undefined
+						? `show a window titled "${text(params.title)}" in this terminal`
+						: `update its window to "${text(params.title)}"`,
+				details: [],
+			};
+		case 'close_window':
+			return { summary: 'close one of its windows', details: [] };
+		case 'list_windows':
+			return { summary: 'list the windows in this terminal', details: [] };
+		case 'send_notification':
+		case 'list_notifications':
+		case 'dismiss_notification':
+			return describeNotificationRequest(op, params);
+		case 'remove_automation_run':
+			return requireAutomationMcp().describe({
+				kind: 'removeRun',
+				runId: text(params.run_id),
+			});
+		case 'prune_automation_runs':
+			return requireAutomationMcp().describe({
+				kind: 'pruneRuns',
+				automationId: text(params.automation_id),
+				olderThanDays:
+					typeof params.older_than_days === 'number' ? params.older_than_days : 0,
+			});
+		case 'dismiss_missed_runs':
+			return requireAutomationMcp().describe({
+				kind: 'dismissMissed',
+				...(typeof params.automation_id === 'string'
+					? { automationId: params.automation_id }
+					: {}),
+			});
+		case 'get_settings':
+			return { summary: 'read the server settings', details: [] };
+		case 'update_settings': {
+			// The prompt is the whole request: every setting with its current
+			// and requested value. A request that could never apply is refused
+			// here, so nobody is asked to approve it.
+			const operations = requireMcpComposition('settingsOperations').operations;
+			const state = settingsState(
+				await runMcpRegistryQuery(
+					operations,
+					SETTINGS_OPERATIONS.get,
+					{},
+					new AbortController().signal,
+				),
+			);
+			return describeSettingsUpdate(
+				planSettingsUpdate(
+					typeof params.settings === 'object' && params.settings !== null
+						? (params.settings as Record<string, unknown>)
+						: {},
+					state,
+				),
+			);
+		}
+		case 'list_shell_profiles':
+			return { summary: 'list the shell profiles', details: [] };
+		case 'save_shell_profile': {
+			const profile =
+				typeof params.profile === 'object' && params.profile !== null
+					? (params.profile as Record<string, unknown>)
+					: {};
+			const target =
+				typeof profile.target === 'object' && profile.target !== null
+					? (profile.target as Record<string, unknown>)
+					: undefined;
+			return {
+				summary:
+					typeof profile.id === 'string'
+						? `change the shell profile ${profile.id}`
+						: `add the shell profile "${text(profile.name)}"`,
+				details: [
+					...(typeof profile.name === 'string'
+						? [{ label: 'Name', value: profile.name }]
+						: []),
+					...(target === undefined
+						? []
+						: [
+								{
+									label: 'Runs',
+									value:
+										target.kind === 'executable'
+											? text(target.executable)
+											: target.kind === 'wsl'
+												? `WSL ${text(target.distribution)}`
+												: 'System default shell',
+									code: true,
+								},
+							]),
+					...(Array.isArray(profile.args)
+						? [{ label: 'Arguments', value: profile.args.join(' '), code: true }]
+						: []),
+					...(typeof profile.environment === 'object' &&
+					profile.environment !== null
+						? [
+								{
+									label: 'Environment variables',
+									value: Object.keys(profile.environment).join(', '),
+									code: true,
+								},
+							]
+						: []),
+				],
+			};
+		}
+		case 'delete_shell_profile':
+			return {
+				summary: `delete the shell profile ${text(params.profile_id)}`,
+				details: [],
+			};
+		case 'reorder_shell_profiles':
+			return { summary: 'reorder the shell profiles', details: [] };
+		case 'set_default_shell_profile':
+			return {
+				summary: `make ${text(params.profile_id)} the default shell profile`,
+				details: [],
+			};
+		case 'list_macros':
+			return { summary: 'list the macros', details: [] };
+		case 'run_macro':
+			return {
+				summary: `run the macro ${text(params.macro_id)} in ${targetTitle()}`,
+				details: Object.entries(
+					typeof params.values === 'object' && params.values !== null
+						? (params.values as Record<string, unknown>)
+						: {},
+				).map(([field, value]) => ({
+					label: `Field ${field}`,
+					value: String(value),
+					code: true,
+				})),
+			};
+		case 'cancel_macro':
+			return { summary: 'cancel a macro run', details: [] };
+		case 'update_terminal':
+			return {
+				summary: `change ${targetTitle()}`,
+				details: (['icon', 'color', 'note'] as const).flatMap((field) =>
+					params[field] === undefined
+						? []
+						: [
+								{
+									label: field[0]!.toUpperCase() + field.slice(1),
+									value: params[field] === null ? 'None' : text(params[field]),
+								},
+							],
+				),
+			};
+		case 'move_terminal_to_project':
+			return {
+				summary: `move ${targetTitle()} to ${mcpProjectTitle(context, params.project) ?? 'another project'}`,
+				details: [],
+			};
+		case 'focus_home':
+			return { summary: 'show Home', details: [] };
+		case 'delete_folder':
+			return { summary: 'delete a folder', details: [] };
+		case 'reorder_folders':
+			return { summary: 'reorder folders', details: [] };
+		case 'list_projects':
+			return { summary: 'list your projects', details: [] };
+		case 'create_project':
+			return {
+				summary: `create a project${typeof params.name === 'string' ? ` named "${params.name}"` : ''}`,
+				details: [{ label: 'Folder', value: text(params.root), code: true }],
+			};
+		case 'update_project':
+			return {
+				summary: `change ${mcpProjectTitle(context, params.project) ?? 'a project'}`,
+				details: [
+					...(['name', 'icon', 'color', 'root'] as const).flatMap((field) =>
+						typeof params[field] === 'string'
+							? [{ label: field[0]!.toUpperCase() + field.slice(1), value: params[field] as string }]
+							: [],
+					),
+					...(params.shell_profile === undefined
+						? []
+						: [{ label: 'Default shell profile', value: text(params.shell_profile) || 'None' }]),
+				],
+			};
+		case 'move_project':
+			return {
+				summary: `move ${mcpProjectTitle(context, params.project) ?? 'a project'}`,
+				details: [],
+			};
+		case 'close_project':
+			return {
+				summary: `close ${mcpProjectTitle(context, params.project) ?? 'a project'}${params.force === true ? ', even with programs running' : ''}`,
+				details: [],
+			};
+		case 'list_workspace_windows':
+			return { summary: 'list your windows', details: [] };
+		case 'open_workspace_window':
+			return {
+				summary: `open a window${typeof params.name === 'string' ? ` named "${params.name}"` : ''}`,
+				details: [],
+			};
+		case 'rename_workspace_window':
+			return { summary: `rename a window to "${text(params.name)}"`, details: [] };
+		case 'close_workspace_window':
+			return { summary: 'close a window', details: [] };
+		case 'call_connected_tool':
+			// One call asks twice: to run the tool, then to show its view.
+			return group === 'appWindows'
+				? {
+						summary: `show the view of ${text(params.name)} in a window in this terminal`,
+						details: [],
+					}
+				: {
+						summary: `use the connected tool ${text(params.name)}`,
+						details: [
+							{
+								label: 'Arguments',
+								value: JSON.stringify(params.arguments ?? {}, null, 2),
+								code: true,
+							},
+						],
+					};
+		default:
+			return {
+				summary: `${op.replaceAll('_', ' ')} ${targetTitle()}`,
+				details: [],
+			};
+	}
+}
+
+/** The name of a project a caller named by handle, if it reaches it. */
+function mcpProjectTitle(
+	context: ControlRequestContext,
+	handle: unknown,
+): string | undefined {
+	const state = requireMcpAuthority().workspace.state;
+	const projectId =
+		typeof handle === 'string'
+			? mcpProjectHandles.resolve(handle, state)
+			: reachOf(context) === 'workspace'
+				? undefined
+				: context.projectId;
+	if (projectId === undefined || !mcpReaches(context, projectId)) return undefined;
+	const name = state.projects[projectId]?.name;
+	return name === undefined ? undefined : `the project "${name}"`;
+}
+
+function buildMcpTerminalSearchResult(
+	terminal: string,
+	presentation: Awaited<
+		ReturnType<ServerTerminalAuthority['service']['readPresentation']>
+	>,
+	params: Parameters<NonNullable<TerminalControlAdapter['searchTerminal']>>[0],
+) {
+	const rows = presentation.rows ?? [];
+	const query = params.caseSensitive
+		? params.query
+		: params.query.toLocaleLowerCase();
+	const matches: Array<{
+		row: number;
+		text: string;
+		before: readonly string[];
+		after: readonly string[];
+	}> = [];
+	let matchesTruncated = false;
+	for (let row = 0; row < rows.length; row += 1) {
+		const text = rows[row] ?? '';
+		const comparable = params.caseSensitive ? text : text.toLocaleLowerCase();
+		if (!comparable.includes(query)) continue;
+		if (matches.length >= params.maxMatches) {
+			matchesTruncated = true;
+			break;
+		}
+		let context = params.contextLines;
+		let candidate: (typeof matches)[number];
+		do {
+			candidate = {
+				row,
+				text,
+				before: rows.slice(Math.max(0, row - context), row),
+				after: rows.slice(row + 1, row + 1 + context),
+			};
+			if (
+				Buffer.byteLength(JSON.stringify([...matches, candidate]), 'utf8') <=
+				params.maxBytes
+			)
+				break;
+			context -= 1;
+		} while (context >= 0);
+		if (
+			Buffer.byteLength(JSON.stringify([...matches, candidate]), 'utf8') >
+			params.maxBytes
+		) {
+			matchesTruncated = true;
+			break;
+		}
+		matches.push(candidate);
+	}
+	return {
+		terminal,
+		query: params.query,
+		matches,
+		output_position: presentation.outputPosition,
+		dimensions: presentation.dimensions,
+		matches_truncated: matchesTruncated,
+		presentation_truncated: presentation.truncated,
+	};
+}
+
+function requireMcpAuthority(): ServerTerminalAuthority {
+	if (serverTerminalAuthority === null)
+		throw new ControlEndpointError(
+			'not_in_terminay',
+			'The local Terminay server is unavailable.',
+		);
+	return serverTerminalAuthority;
+}
+
+function mcpPanelFor(sessionId: string, projectId: string) {
+	return Object.values(requireMcpAuthority().workspace.state.panels).find(
+		(panel) =>
+			panel.type === 'terminal' &&
+			panel.projectId === projectId &&
+			panel.sessionId === sessionId,
+	);
+}
+
+/** The title a terminal's tab displays, as the server resolves it: a name a
+ * person gave it, else its program's title, else its default name. A program
+ * title is live state the title service holds, not a panel field (ADR-0058). */
+function mcpTerminalTitle(
+	sessionId: string,
+	projectId: string,
+): string | undefined {
+	return (
+		requireMcpAuthority().composition.terminalTitles?.displayedTitleForSession(
+			sessionId,
+		) ?? mcpPanelFor(sessionId, projectId)?.title
+	);
+}
+
+/** Whether a capability reaches a project on this server (ADR-0030). */
+function mcpReaches(
+	context: ControlRequestContext,
+	projectId: string,
+): boolean {
+	// A terminal the server still remembers after its project was closed is
+	// gone from the workspace, so MCP neither lists nor addresses it.
+	if (requireMcpAuthority().workspace.state.projects[projectId] === undefined)
+		return false;
+	return reachOf(context) === 'workspace' || projectId === context.projectId;
+}
+
+function resolveMcpTerminal(context: ControlRequestContext, reference: string) {
+	const candidates = requireMcpAuthority()
+		.list()
+		.filter((entry) => mcpReaches(context, entry.projectId))
+		.filter(
+			(entry) =>
+				entry.id === reference ||
+				mcpTerminalTitle(entry.id, entry.projectId) === reference,
+		);
+	if (candidates.length === 1) return candidates[0]!;
+	if (candidates.length > 1)
+		throw new ControlEndpointError(
+			'ambiguous_terminal',
+			'The terminal reference is ambiguous.',
+			candidates.map((entry) => entry.id),
+		);
+	throw new ControlEndpointError(
+		'terminal_not_found',
+		'The requested terminal is unavailable.',
+	);
+}
+
+/** Authorize by the target's own project; `resolveMcpTerminal` has already
+ * confirmed the capability reaches it. */
+function mcpAuthorization(projectId: string) {
+	return {
+		serverId: requireMcpAuthority().service.serverId,
+		projectId,
+		scope: 'write' as const,
+	};
+}
+
+function applyMcpWorkspaceCommand(
+	context: ControlRequestContext,
+	command: Parameters<
+		NonNullable<
+			ServerTerminalAuthority['composition']['workspaceOperations']
+		>['applyHostCommand']
+	>[1],
+): void {
+	const authority = requireMcpAuthority();
+	const applied = authority.composition.workspaceOperations?.applyHostCommand(
+		`mcp:${context.requestId}:${Math.random().toString(36).slice(2)}`.slice(
+			0,
+			128,
+		),
+		command,
+		authority.workspace.state.revision,
+	);
+	if (applied === undefined || !applied.ok)
+		throw new ControlEndpointError(
+			'internal',
+			'The workspace rejected the control operation.',
+		);
+}
+
+function detachSessionsForWebContents(webContentsId: number): void {
+	// A renderer closing is a client lifecycle event, never a PTY lifecycle.
+	serverTerminalAuthority?.detachRendererAll(webContentsId);
+}
+
+let isQuitting = false;
+let isQuitConfirmed = false;
+let quitConfirmationPending = false;
+/** The user chose to end their terminals rather than keep them running. */
+let endTerminalsOnQuit = false;
+
+function getFirstAppWindow(): BrowserWindow | null {
+	for (const window of appWindows) {
+		if (!window.isDestroyed()) {
+			return window;
+		}
+	}
+	return null;
+}
+
+function sendCommandToWindow(
+	targetWindow: BrowserWindow,
+	command: AppCommand,
+): void {
+	if (isQuitting) {
+		return;
+	}
+
+	if (targetWindow.isDestroyed()) {
+		return;
+	}
+
+	targetWindow.webContents.send('server-ui-host:event', {
+		type: 'menu.command',
+		command,
+	});
+}
+
+function sendCommandToFocusedWindow(command: AppCommand): void {
+	const targetWindow = BrowserWindow.getFocusedWindow() ?? getFirstAppWindow();
+	if (targetWindow === null) return;
+	if (closeAuxiliaryWindowForCommand(targetWindow, command)) return;
+	sendCommandToWindow(targetWindow, command);
+}
+
+/** Settings and its siblings have no terminal to close, so the close
+ * shortcut closes the window. Unsaved macro edits still ask first. */
+function closeAuxiliaryWindowForCommand(
+	window: BrowserWindow,
+	command: AppCommand,
+): boolean {
+	if (!closesAuxiliaryWindow(command) || !auxiliaryWindows.has(window))
+		return false;
+	window.close();
+	return true;
+}
+
+function isMacQuitInput(input: Electron.Input): boolean {
+	return (
+		process.platform === 'darwin' &&
+		input.meta &&
+		!input.control &&
+		!input.alt &&
+		!input.shift &&
+		input.key.toLowerCase() === 'q'
+	);
+}
+
+function bindAppShortcuts(webContents: Electron.WebContents): void {
+	webContents.on('before-input-event', (event, input) => {
+		if (input.type === 'keyDown' && isMacQuitInput(input)) {
+			event.preventDefault();
+			app.quit();
+			return;
+		}
+
+		if (input.type !== 'keyDown') {
+			return;
+		}
+
+		const command = findCommandForKeyboardEvent(
+			{
+				altKey: input.alt,
+				ctrlKey: input.control,
+				key: input.key,
+				metaKey: input.meta,
+				shiftKey: input.shift,
+			},
+			readTerminalSettings().keyboardShortcuts,
+			process.platform === 'darwin',
+		);
+
+		if (!command) {
+			// Project windows receive terminal Copy from their Edit menu
+			// accelerator; menu-less windows handle it here instead.
+			const owner = BrowserWindow.fromWebContents(webContents);
+			if (
+				owner &&
+				!appWindows.has(owner) &&
+				isMenuLessCopyInput(input, process.platform)
+			) {
+				event.preventDefault();
+				sendCopyRequestToFocusedWindow(owner);
+			}
+			return;
+		}
+
+		event.preventDefault();
+		const owner = BrowserWindow.fromWebContents(webContents);
+		if (owner && closeAuxiliaryWindowForCommand(owner, command)) return;
+		webContents.send('server-ui-host:event', {
+			type: 'menu.command',
+			command,
+		});
+	});
+}
+
+function getMenuShortcut(
+	settings: TerminalSettings,
+	command: AppCommand,
+): string | undefined {
+	const shortcut = getCommandShortcut(settings.keyboardShortcuts, command);
+	if (isReservedSystemAccelerator(shortcut, process.platform === 'darwin')) {
+		return undefined;
+	}
+
+	return shortcut.length > 0 ? shortcut : undefined;
+}
+
+function sendCopyRequestToFocusedWindow(
+	browserWindow?: Electron.BaseWindow,
+): void {
+	const target =
+		browserWindow instanceof BrowserWindow
+			? browserWindow
+			: BrowserWindow.getFocusedWindow();
+	target?.webContents.copy();
+	target?.webContents.send('terminal:copy-requested');
+}
+
+function createAppMenu(
+	settings: TerminalSettings = readTerminalSettings(),
+): void {
+	const template: Electron.MenuItemConstructorOptions[] = [
+		buildTerminayMenu({
+			platform: process.platform,
+			shortcut: (command) => getMenuShortcut(settings, command),
+			dispatch: (command) => sendCommandToFocusedWindow(command),
+			showAbout: () => showAboutWindow(),
+		}),
+		{
+			label: 'Terminal',
+			submenu: [
+				{
+					label: 'Split Horizontally',
+					accelerator: getMenuShortcut(settings, 'split-horizontal'),
+					click: () => sendCommandToFocusedWindow('split-horizontal'),
+				},
+				{
+					label: 'Split Vertically',
+					accelerator: getMenuShortcut(settings, 'split-vertical'),
+					click: () => sendCommandToFocusedWindow('split-vertical'),
+				},
+				{
+					label: 'Pop Out Active Terminal',
+					accelerator: getMenuShortcut(settings, 'popout-active'),
+					click: () => sendCommandToFocusedWindow('popout-active'),
+				},
+				{
+					label: 'Edit Active Tab…',
+					accelerator: getMenuShortcut(settings, 'edit-active-tab'),
+					click: () => sendCommandToFocusedWindow('edit-active-tab'),
+				},
+				{
+					label: 'Open Command Bar',
+					accelerator: getMenuShortcut(settings, 'open-command-bar'),
+					click: () => sendCommandToFocusedWindow('open-command-bar'),
+				},
+				{
+					label: 'Start Dictation',
+					accelerator: getMenuShortcut(settings, 'start-dictation'),
+					click: () => sendCommandToFocusedWindow('start-dictation'),
+				},
+				{
+					label: 'Clear Terminal',
+					accelerator: getMenuShortcut(settings, 'clear-terminal'),
+					click: () => sendCommandToFocusedWindow('clear-terminal'),
+				},
+				{ type: 'separator' },
+				{
+					label: 'Close Terminal',
+					accelerator: getMenuShortcut(settings, 'close-active'),
+					click: () => sendCommandToFocusedWindow('close-active'),
+				},
+			],
+		},
+		{
+			label: 'Edit',
+			submenu: [
+				{ role: 'undo' },
+				{ role: 'redo' },
+				{ type: 'separator' },
+				{ role: 'cut' },
+				{
+					label: 'Copy',
+					accelerator:
+						process.platform === 'darwin' ? 'CmdOrCtrl+C' : 'CmdOrCtrl+Shift+C',
+					click: (_menuItem, browserWindow) =>
+						sendCopyRequestToFocusedWindow(browserWindow ?? undefined),
+				},
+				{ role: 'paste' },
+				{ role: 'selectAll' },
+			],
+		},
+		{
+			label: 'View',
+			submenu: [
+				{
+					label: 'Reset Zoom',
+					accelerator: 'CmdOrCtrl+0',
+					click: () => resetZoom(),
+				},
+				{
+					label: 'Zoom In',
+					accelerator: 'CmdOrCtrl+=',
+					click: () => zoomIn(),
+				},
+				{
+					label: 'Zoom Out',
+					accelerator: 'CmdOrCtrl+-',
+					click: () => zoomOut(),
+				},
+				{ type: 'separator' },
+				{
+					label: 'Show Dashboard',
+					accelerator: getMenuShortcut(settings, 'show-dashboard'),
+					click: () => sendCommandToFocusedWindow('show-dashboard'),
+				},
+				{
+					// The renderer owns the setting; toggling it writes the device
+					// settings, which rebuilds this menu with the new checked state.
+					label: 'Show Status Bar',
+					type: 'checkbox',
+					checked: settings.showStatusBar,
+					accelerator: getMenuShortcut(settings, 'toggle-status-bar'),
+					click: () => sendCommandToFocusedWindow('toggle-status-bar'),
+				},
+				{ type: 'separator' },
+				{
+					label: 'Edit Active Project…',
+					accelerator: getMenuShortcut(settings, 'edit-active-project'),
+					click: () => sendCommandToFocusedWindow('edit-active-project'),
+				},
+				{
+					label: 'Set Project Root to Working Directory',
+					accelerator: getMenuShortcut(
+						settings,
+						'set-project-root-folder-to-working-directory',
+					),
+					click: () =>
+						sendCommandToFocusedWindow(
+							'set-project-root-folder-to-working-directory',
+						),
+				},
+				{
+					label: 'Toggle File Explorer Sidebar',
+					accelerator: getMenuShortcut(
+						settings,
+						'toggle-file-explorer-sidebar',
+					),
+					click: () =>
+						sendCommandToFocusedWindow('toggle-file-explorer-sidebar'),
+				},
+				{
+					label: 'Force Reload',
+					click: (_menuItem, browserWindow) => {
+						if (browserWindow instanceof BrowserWindow) {
+							browserWindow.webContents.reloadIgnoringCache();
+						}
+					},
+				},
+				{ role: 'toggleDevTools' },
+			],
+		},
+		// Standard multi-window menu (Minimise, Zoom, Bring All to Front, window
+		// list / cycling). macOS injects its own extras (Fill, Centre, etc.).
+		{ role: 'windowMenu' },
+		{
+			label: 'Help',
+			submenu: [
+				{
+					label: 'Check for Updates…',
+					click: () => checkForUpdatesFromMenu(),
+				},
+				{ type: 'separator' },
+				...createDiagnosticsHelpMenuItems({
+					directory: desktopDiagnostics.directory,
+					clearManagedArtifacts: () =>
+						desktopDiagnostics.clearManagedArtifacts(),
+					recordCleared: () => desktopDiagnostics.recordCleared(),
+					performanceLog: {
+						// The window is a route on the workspace bundle; without a local
+						// workspace window there is nothing to present it.
+						canOpen: () =>
+							(BrowserWindow.getFocusedWindow() ?? getFirstAppWindow()) !==
+							null,
+						open: () => sendCommandToFocusedWindow('open-performance-log'),
+					},
+					reportFailure: (operation, error) => {
+						void desktopDiagnostics.record(
+							{
+								component: 'diagnostics',
+								event: 'diagnostics.writer.degraded',
+								fields: { operation },
+								severity: 'warning',
+								source: 'diagnostics-menu',
+								message: error,
+							},
+							{ channel: 'lifecycle' },
+						);
+					},
+				}),
+				...(process.platform === 'darwin'
+					? []
+					: [
+							{ type: 'separator' as const },
+							{ label: 'About Terminay', click: () => showAboutWindow() },
+						]),
+			],
+		},
+	];
+
+	const menu = Menu.buildFromTemplate(template);
+	Menu.setApplicationMenu(menu);
+	// setApplicationMenu re-attaches the menu to every window on Windows and
+	// Linux; only project-host windows keep it.
+	applyWindowMenus(BrowserWindow.getAllWindows(), {
+		isProjectHost: (window) => appWindows.has(window),
+		menu,
+		platform: process.platform,
+	});
+}
+
+async function presentCanonicalAuxiliaryRoute(
+	sourceWindow: BrowserWindow,
+	request: TerminayHostActionRequest,
+	context: TerminayHostContext,
+): Promise<void> {
+	if (request.action.type !== 'route.present') return;
+	const workspaceRoute = new URL(
+		request.action.route,
+		'https://terminay.invalid',
+	);
+	const workspaceViewId = workspaceRoute.searchParams.get('view');
+	if (
+		request.action.disposition === 'native-window' &&
+		workspaceRoute.pathname === '/' &&
+		workspaceViewId !== null &&
+		request.action.logicalViewId === `workspace:${workspaceViewId}` &&
+		/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(workspaceViewId)
+	) {
+		const x = Number(workspaceRoute.searchParams.get('x'));
+		const y = Number(workspaceRoute.searchParams.get('y'));
+		if (!Number.isFinite(x) || !Number.isFinite(y))
+			throw new Error('The workspace window position is invalid.');
+		const presentationId = `${context.profileId}:workspace:${workspaceViewId}`;
+		const existing = auxiliaryWindowsByPresentation.get(presentationId);
+		if (existing !== undefined && !existing.isDestroyed()) {
+			existing.show();
+			existing.focus();
+			return;
+		}
+		let workspaceWindow: BrowserWindow | null;
+		if (context.profileId === embeddedLocalProfileId) {
+			workspaceWindow = createWindow({
+				bounds: { x, y },
+				workspaceViewId,
+			});
+		} else {
+			const profile = rememberedRemoteConnections.get(context.profileId);
+			if (profile === undefined)
+				throw new Error('The selected remote profile is no longer available.');
+			// The window does not exist yet; it adopts this id once it does.
+			const windowId = desktopWindowIds.mint();
+			const lanes = await openDesktopRemoteLanes(profile, windowId);
+			try {
+				workspaceWindow = createWindow({
+					bounds: { x, y },
+					workspaceViewId,
+					serverUiLaunch: await prepareCanonicalRemoteLaunch(profile, lanes),
+					serverUiTransport: lanes.transport,
+				});
+			} catch (error) {
+				await lanes.transport.close({ code: 'normal' }).catch(() => undefined);
+				throw error;
+			}
+			if (workspaceWindow !== null) {
+				desktopWindowIds.adopt(workspaceWindow.webContents.id, windowId);
+				remoteProfileBindingsByWebContents.set(
+					workspaceWindow.webContents.id,
+					profile.id,
+				);
+			}
+		}
+		if (workspaceWindow === null) throw new Error('Desktop is closing.');
+		auxiliaryWindowsByPresentation.set(presentationId, workspaceWindow);
+		// Do not let the source renderer tear down its only presentation while the
+		// destination is still only a BrowserWindow shell.  A workspace move is
+		// authoritative before this call, but the destination must have loaded its
+		// canonical document before the source may close its view.
+		try {
+			await waitForCanonicalWorkspaceDocument(workspaceWindow);
+		} catch (error) {
+			auxiliaryWindowsByPresentation.delete(presentationId);
+			if (!workspaceWindow.isDestroyed()) workspaceWindow.close();
+			throw error;
+		}
+		workspaceWindow.once('ready-to-show', () => {
+			if (!workspaceWindow.isDestroyed()) {
+				workspaceWindow.show();
+				workspaceWindow.focus();
+			}
+		});
+		return;
+	}
+	const auxiliary = canonicalAuxiliaryRequest(request.action);
+	const presentationId = `${context.profileId}:${auxiliary.logicalViewId}`;
+	const existing = auxiliaryWindowsByPresentation.get(presentationId);
+	if (existing !== undefined && !existing.isDestroyed()) {
+		const current = new URL(existing.webContents.getURL());
+		const requested = new URL(auxiliary.route, 'https://terminay.invalid');
+		if (current.search !== requested.search) {
+			current.search = requested.search;
+			// Settings may keep its page to protect unsaved edits.
+			await existing.loadURL(current.toString()).catch(() => undefined);
+		}
+		if (existing.isMinimized()) existing.restore();
+		existing.show();
+		existing.focus();
+		return;
+	}
+	auxiliaryWindowsByPresentation.delete(presentationId);
+	const auxiliaryWorkArea = screen.getDisplayMatching(
+		sourceWindow.getBounds(),
+	).workArea;
+
+	let auxiliaryWindow: BrowserWindow | null;
+	if (context.profileId === embeddedLocalProfileId) {
+		auxiliaryWindow = createWindow({
+			auxiliary: { ...auxiliary, presentationId },
+			auxiliaryWorkArea,
+		});
+	} else {
+		loadRememberedRemoteConnections();
+		const profile = rememberedRemoteConnections.get(context.profileId);
+		if (profile === undefined)
+			throw new Error('The selected remote profile is no longer available.');
+		// The window does not exist yet; it adopts this id once it does.
+		const windowId = desktopWindowIds.mint();
+		const lanes = await openDesktopRemoteLanes(profile, windowId);
+		try {
+			auxiliaryWindow = createWindow({
+				auxiliary: { ...auxiliary, presentationId },
+				auxiliaryWorkArea,
+				serverUiLaunch: await prepareCanonicalRemoteLaunch(profile, lanes),
+				serverUiTransport: lanes.transport,
+			});
+		} catch (error) {
+			await lanes.transport.close({ code: 'normal' }).catch(() => undefined);
+			throw error;
+		}
+		if (auxiliaryWindow !== null) {
+			desktopWindowIds.adopt(auxiliaryWindow.webContents.id, windowId);
+			remoteProfileBindingsByWebContents.set(
+				auxiliaryWindow.webContents.id,
+				profile.id,
+			);
+		}
+	}
+	if (auxiliaryWindow === null) throw new Error('Desktop is closing.');
+	auxiliaryWindowsByPresentation.set(presentationId, auxiliaryWindow);
+	auxiliaryWindow.setParentWindow(sourceWindow);
+	auxiliaryWindow.once('ready-to-show', () => {
+		if (auxiliaryWindow.isDestroyed()) return;
+		auxiliaryWindow.show();
+		auxiliaryWindow.focus();
+	});
+}
+
+function waitForCanonicalWorkspaceDocument(
+	window: BrowserWindow,
+): Promise<void> {
+	return new Promise((resolve, reject) => {
+		// A popout's logical view is already authoritative before this call.  Do
+		// not close/rebind the source window merely because the child has finished
+		// parsing HTML: its server port and React workspace projection still need
+		// to mount.  Waiting for the canonical root keeps the move atomic from the
+		// user's point of view and prevents a blank secondary presentation.
+		let settled = false;
+		let retry: ReturnType<typeof setTimeout> | undefined;
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		const cleanup = () => {
+			if (timeout !== undefined) clearTimeout(timeout);
+			if (retry !== undefined) clearTimeout(retry);
+			window.webContents.off('did-finish-load', onLoaded);
+			window.webContents.off('did-fail-load', onFailed);
+			window.off('closed', onClosed);
+		};
+		const settle = (error?: Error) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			if (error === undefined) resolve();
+			else reject(error);
+		};
+		const waitForMountedRoot = () => {
+			if (settled || window.isDestroyed()) return;
+			const currentUrl = window.webContents.getURL();
+			if (
+				currentUrl.length === 0 ||
+				currentUrl === 'about:blank' ||
+				window.webContents.isLoadingMainFrame()
+			) {
+				retry = setTimeout(waitForMountedRoot, 25);
+				return;
+			}
+			void window.webContents
+				.executeJavaScript(
+					'Boolean(document.querySelector("[data-terminay-app-component]"))',
+				)
+				.then((mounted) => {
+					if (settled) return;
+					if (mounted === true) settle();
+					else retry = setTimeout(waitForMountedRoot, 25);
+				})
+				.catch(() => {
+					if (!settled) retry = setTimeout(waitForMountedRoot, 25);
+				});
+		};
+		const onLoaded = () => waitForMountedRoot();
+		const onFailed = (
+			_event: Electron.Event,
+			errorCode: number,
+			errorDescription: string,
+			_validatedURL: string,
+			isMainFrame: boolean,
+		) => {
+			if (!isMainFrame || errorCode === -3) return;
+			settle(
+				new Error(
+					`Unable to load the canonical workspace window: ${errorDescription}.`,
+				),
+			);
+		};
+		const onClosed = () => {
+			settle(
+				new Error('The canonical workspace window closed before mounting.'),
+			);
+		};
+		window.webContents.on('did-finish-load', onLoaded);
+		window.webContents.on('did-fail-load', onFailed);
+		window.once('closed', onClosed);
+		timeout = setTimeout(() => {
+			settle(new Error('Timed out mounting the canonical workspace window.'));
+		}, 15_000);
+		waitForMountedRoot();
+	});
+}
+
+async function openEmbeddedWorkspaceWithRecovery(
+	window: BrowserWindow,
+): Promise<Awaited<ReturnType<typeof openCanonicalWorkspace>>> {
+	const openWorkspace = () =>
+		openCanonicalWorkspace({
+			backend: createEmbeddedWorkspaceStateBackend({
+				filePath: embeddedStorePaths.workspace,
+				migrate: (state) =>
+					migrateLegacyEmbeddedWorkspaceServerId(state, embeddedServerId),
+				testFault: embeddedWorkspacePersistenceFault(process.env),
+			}),
+			serverId: embeddedServerId,
+			defaultProjectRoot: app.getPath('home'),
+		});
+	return recoverEmbeddedWorkspaceOperation(window, openWorkspace);
+}
+
+async function recoverEmbeddedWorkspaceOperation<T>(
+	window: BrowserWindow,
+	operation: () => Promise<T>,
+): Promise<T> {
+	try {
+		return await operation();
+	} catch (initialError) {
+		// This recovery surface is specifically for the canonical workspace
+		// persistence boundary.  Do not disguise extension activation, server
+		// composition, or a torn application build as damaged application storage.
+		// Those failures must escape to the desktop bootstrap recovery path, which
+		// records the real startup failure and offers a clean process relaunch.
+		if (!isEmbeddedWorkspacePersistenceError(initialError)) {
+			throw initialError;
+		}
+		return new Promise((resolve, reject) => {
+			const renderRecovery = async (cause: unknown): Promise<void> => {
+				console.error('[workspace] canonical persistence unavailable', cause);
+				await showCanonicalLaunchRecovery({
+					window,
+					error: new Error(
+						'Terminay could not read or update its saved workspace. Retry after checking that application storage is available.',
+					),
+					retry: async () => {
+						try {
+							resolve(await operation());
+						} catch (error) {
+							if (!isEmbeddedWorkspacePersistenceError(error)) {
+								reject(error);
+								return;
+							}
+							await renderRecovery(error);
+						}
+					},
+					onRecoveryState: (active) => {
+						if (active) launchRecoveryWebContents.add(window.webContents.id);
+						else launchRecoveryWebContents.delete(window.webContents.id);
+					},
+					onDiagnostic: recordCanonicalRecoveryDiagnostic,
+				});
+			};
+			void renderRecovery(initialError);
+		});
+	}
+}
+
+function createWindow(options?: {
+	auxiliary?: Readonly<{
+		presentationId: string;
+		route: string;
+		title: string;
+	}>;
+	/** The work area an auxiliary window must fit inside. */
+	auxiliaryWorkArea?: Electron.Rectangle;
+	bounds?: { x: number; y: number };
+	initialServerConnection?: 'local' | 'deferred';
+	deferCanonicalLaunch?: boolean;
+	workspaceViewId?: string;
+	serverUiLaunch?: DesktopBundleLaunch;
+	serverUiTransport?: ByteTransport;
+}): BrowserWindow | null {
+	if (isQuitting) {
+		return null;
+	}
+
+	// Normal workspace windows always execute the selected server's verified UI
+	// bundle. Development changes where those bytes are built, never which
+	// renderer, preload, transport, or state owner is selected.
+	const preloadPath = path.join(__dirname, 'serverUiPreload.cjs');
+	const isMac = process.platform === 'darwin';
+	const usesOverlayTitlebar = process.platform === 'win32';
+	const windowIconPath = getWindowIconPath();
+	const isAuxiliary = options?.auxiliary !== undefined;
+	const auxiliaryBounds =
+		options?.auxiliaryWorkArea === undefined
+			? undefined
+			: fitAuxiliaryWindowBounds(
+					AUXILIARY_WINDOW_PREFERRED_SIZE,
+					options.auxiliaryWorkArea,
+				);
+
+	const window = new BrowserWindow({
+		backgroundColor: '#0d1117',
+		icon: windowIconPath,
+		...(auxiliaryBounds ?? {
+			width: isAuxiliary ? AUXILIARY_WINDOW_PREFERRED_SIZE.width : 1400,
+			height: isAuxiliary ? AUXILIARY_WINDOW_PREFERRED_SIZE.height : 900,
+		}),
+		minHeight: isAuxiliary ? undefined : MAIN_PROJECT_WINDOW_MIN_HEIGHT,
+		// Place a torn-off window's title bar near the drop point, like a browser.
+		...(options?.bounds
+			? {
+					x: Math.round(options.bounds.x) - 120,
+					y: Math.round(options.bounds.y) - 12,
+				}
+			: {}),
+		title: options?.auxiliary?.title ?? 'Terminay',
+		show: !isAuxiliary && options?.deferCanonicalLaunch !== true,
+		// Deliver the first click on an inactive window to the web contents instead of
+		// letting macOS swallow it purely to activate the window (electron/electron#212).
+		// Without this, clicking a background tab focuses the window but the click never
+		// reaches that tab, so keystrokes go to the previously active terminal.
+		acceptFirstMouse: true,
+		titleBarStyle: isMac || usesOverlayTitlebar ? 'hidden' : 'default',
+		titleBarOverlay: usesOverlayTitlebar
+			? {
+					color: '#0f1823',
+					symbolColor: '#9bb0c8',
+					height: 38,
+				}
+			: false,
+		trafficLightPosition: isMac
+			? {
+					x: 14,
+					y: 12,
+				}
+			: undefined,
+		webPreferences: {
+			preload: preloadPath,
+			contextIsolation: true,
+			nodeIntegration: false,
+			partition: getServerUiPartitionName(
+				options?.serverUiLaunch?.partitionKey ?? localServerUiPartitionKey,
+			),
+			sandbox: true,
+			webSecurity: true,
+			webviewTag: false,
+		},
+	});
+	securePrimaryWindow(window);
+	if (isAuxiliary) auxiliaryWindows.add(window);
+	else appWindows.add(window);
+	applyWindowMenu(window, {
+		isProjectHost: !isAuxiliary,
+		menu: Menu.getApplicationMenu(),
+		platform: process.platform,
+	});
+	// Capture the webContents id now; it's unreadable once the window is closed
+	// (accessing window.webContents after destruction throws).
+	const windowWebContentsId = window.webContents.id;
+	if (isAuxiliary) {
+		// Settings refuses to unload while it holds unsaved macro edits. Ask
+		// here, since a native window cannot draw the in-page confirmation.
+		window.webContents.on('will-prevent-unload', (event) => {
+			const choice = dialog.showMessageBoxSync(window, {
+				type: 'question',
+				buttons: ['Discard Changes', 'Keep Editing'],
+				defaultId: 1,
+				cancelId: 1,
+				message: 'Discard unsaved macro changes?',
+				detail: 'Your edits to macros have not been saved.',
+			});
+			// Preventing the event lets the unload go ahead.
+			if (choice === 0) event.preventDefault();
+		});
+	}
+	if (!isAuxiliary)
+		bindMainWindowCloseConfirmation({
+			window,
+			isQuitting: () => isQuitting,
+			getRunningTerminalCount: () =>
+				getRunningTerminalCountForWindow(windowWebContentsId),
+			isLastWindow: () => getOpenProjectWindowCount() <= 1,
+			quitConfirmsItself: () =>
+				serverTerminalAuthority?.keepsTerminalsAcrossRestart === true,
+			showConfirmation: (target, dialogOptions) =>
+				dialog.showMessageBox(target as BrowserWindow, dialogOptions),
+			requestQuit: () => {
+				// With held terminals the quit itself asks whether to keep or end
+				// them, so it must not arrive already confirmed.
+				if (serverTerminalAuthority?.keepsTerminalsAcrossRestart !== true) {
+					isQuitConfirmed = true;
+					isQuitting = true;
+				}
+				app.quit();
+			},
+			requestClose: () => window.close(),
+			onError: (error) =>
+				console.error('[window] close confirmation failed', error),
+		});
+
+	if (options?.workspaceViewId) {
+		workspaceViewByWebContents.set(
+			windowWebContentsId,
+			options.workspaceViewId,
+		);
+		// A project tear-off is an explicit request to work in the destination.
+		// Creating the BrowserWindow from a drag-end callback does not reliably
+		// activate it on macOS, where the first click would otherwise be consumed
+		// solely to focus the window instead of reaching the terminal-tab + button.
+		window.once('ready-to-show', () => {
+			if (window.isDestroyed()) return;
+			window.show();
+			window.focus();
+		});
+	} else if (!isAuxiliary && options?.serverUiLaunch === undefined) {
+		const defaultViewId = serverTerminalAuthority?.workspace.state.viewOrder[0];
+		if (defaultViewId !== undefined) {
+			workspaceViewByWebContents.set(windowWebContentsId, defaultViewId);
+		}
+	}
+
+	// macOS hides the traffic lights in fullscreen; the renderer drops the
+	// space it reserves for them.
+	window.on('enter-full-screen', () =>
+		sendWindowFullScreenState(window.webContents),
+	);
+	window.on('leave-full-screen', () =>
+		sendWindowFullScreenState(window.webContents),
+	);
+
+	// A document that is replaced or lost reports again once it is back; until
+	// then its last count must not linger in the application icon badge.
+	window.webContents.on(
+		'did-start-navigation',
+		(_event, _url, isInPlace, isMainFrame) => {
+			if (isMainFrame && !isInPlace) appBadge.clear(windowWebContentsId);
+		},
+	);
+	window.webContents.on('render-process-gone', () => {
+		appBadge.clear(windowWebContentsId);
+	});
+
+	window.on('closed', () => {
+		appBadge.clear(windowWebContentsId);
+		documentEndpointUnbindByWebContents.get(windowWebContentsId)?.();
+		documentEndpointUnbindByWebContents.delete(windowWebContentsId);
+		void windowConnectionsByWebContents
+			.get(windowWebContentsId)
+			?.dispose()
+			.catch(() => undefined);
+		windowConnectionsByWebContents.delete(windowWebContentsId);
+		releaseDesktopCompositionSlot(windowWebContentsId);
+		releaseServerUiWindowBinding(
+			windowWebContentsId,
+			isQuitting ? 'application-quit' : 'window-close',
+		);
+		releaseLocalServerUiSessionSafely(windowWebContentsId);
+		appWindows.delete(window);
+		workspaceViewByWebContents.delete(windowWebContentsId);
+		if (options?.auxiliary !== undefined) {
+			const key = options.auxiliary.presentationId;
+			if (auxiliaryWindowsByPresentation.get(key) === window)
+				auxiliaryWindowsByPresentation.delete(key);
+		}
+		remoteProfileBindingsByWebContents.delete(windowWebContentsId);
+		desktopWindowIds.release(windowWebContentsId);
+		windowServerControllers.delete(windowWebContentsId);
+		launchRecoveryWebContents.delete(windowWebContentsId);
+		deferredCanonicalLaunches.delete(windowWebContentsId);
+	});
+
+	window.on('page-title-updated', (event, title) => {
+		// The page does not set the title. A workspace window is titled by its
+		// server, which the host knows, followed by what the page says it holds.
+		event.preventDefault();
+		if (window.isDestroyed()) return;
+		if (options?.auxiliary !== undefined) {
+			window.setTitle(options.auxiliary.title);
+			return;
+		}
+		pageTitleDetail = title;
+		applyWindowTitle();
+	});
+
+	window.webContents.setWindowOpenHandler(({ url }) => {
+		const isPopout = isAppNavigation(url) && url.includes('popout.html');
+
+		if (!isPopout) {
+			void openInBrowser(url).catch((error) =>
+				console.error('Failed to open external link', error),
+			);
+			return { action: 'deny' };
+		}
+
+		return {
+			action: 'allow',
+			overrideBrowserWindowOptions: {
+				icon: windowIconPath,
+				title: 'Terminay',
+				width: 1000,
+				height: 700,
+				titleBarStyle: isMac || usesOverlayTitlebar ? 'hidden' : 'default',
+				trafficLightPosition: isMac
+					? {
+							x: 14,
+							y: 12,
+						}
+					: undefined,
+				webPreferences: {
+					preload: preloadPath,
+					contextIsolation: true,
+					nodeIntegration: false,
+					sandbox: true,
+					webSecurity: true,
+					webviewTag: false,
+				},
+			},
+		};
+	});
+
+	window.webContents.on('did-create-window', (childWindow) => {
+		securePrimaryWindow(childWindow);
+	});
+
+	// Startup resolves and verifies the selected server's exact UI artifact
+	// before any workspace renderer executes. A successful Desktop pairing can
+	// replace this window's selected server, so the same mounting transaction is
+	// reusable without returning credentials to the renderer.
+	let switchToPairedDesktopServer: (
+		pairingUrl: string,
+		attemptId: string,
+	) => Promise<void>;
+	let cancelDesktopPairing: (attemptId: string) => void;
+	// The server this window shows. It changes only when a launch is mounted.
+	let boundProfileId: string =
+		options?.serverUiLaunch?.context.profileId ?? embeddedLocalProfileId;
+	// The view it presents there, and the server a torn-off view belongs to.
+	let boundViewKey: WindowViewKey | undefined;
+	let tornOffProfileId: string | undefined;
+	// What the page last asked the title to say about its contents.
+	let pageTitleDetail = '';
+	const applyWindowTitle = () => {
+		if (window.isDestroyed() || options?.auxiliary !== undefined) return;
+		window.setTitle(
+			workspaceWindowTitle(
+				boundProfileId === embeddedLocalProfileId
+					? 'Local'
+					: (rememberedRemoteConnections.get(boundProfileId)?.label ??
+							'Terminay'),
+				pageTitleDetail,
+			),
+		);
+	};
+	const mountCanonicalLaunch = async (
+		launch: DesktopBundleLaunch,
+		transport?: ByteTransport,
+	): Promise<void> => {
+		if (window.isDestroyed()) return;
+		boundProfileId = launch.context.profileId;
+		tornOffProfileId ??= launch.context.profileId;
+		// A project is in one window. The first window on a server presents its
+		// default view; a further one presents a view of its own.
+		const view =
+			options?.auxiliary !== undefined
+				? Object.freeze({ ownView: false, viewId: undefined })
+				: chooseWindowView({
+						...(options?.workspaceViewId !== undefined &&
+						launch.context.profileId === tornOffProfileId
+							? { tornOffViewId: options.workspaceViewId }
+							: {}),
+						othersOnServer: [...windowServerControllers.values()]
+							.filter(
+								(other) =>
+									other.window !== window &&
+									!other.isAuxiliary &&
+									other.currentProfileId() === launch.context.profileId,
+							)
+							.map((other) => other.currentViewKey())
+							.filter((key): key is WindowViewKey => key !== undefined),
+					});
+		boundViewKey = view.viewId ?? 'default';
+		pageTitleDetail = '';
+		applyWindowTitle();
+		documentEndpointUnbindByWebContents.get(windowWebContentsId)?.();
+		documentEndpointUnbindByWebContents.delete(windowWebContentsId);
+		const entryUrl = pathToFileURL(
+			path.join(launch.assetRoot, launch.entryPath),
+		);
+		if (options?.auxiliary !== undefined) {
+			const requested = new URL(
+				options.auxiliary.route,
+				'https://terminay.invalid',
+			);
+			entryUrl.search = requested.search;
+		}
+		// `route.present` is a canonical application route, whose logical view
+		// lives in the query string.  Preserve that route when Desktop opens a
+		// second workspace presentation instead of translating it into a hash:
+		// the server bundle's route shell (and not only App's workspace picker)
+		// then mounts the intended view before the source presentation closes.
+		if (options?.auxiliary === undefined) {
+			if (view.viewId !== undefined) {
+				entryUrl.searchParams.set('view', view.viewId);
+				// The window creates this view if the server does not have it yet.
+				if (view.ownView) entryUrl.searchParams.set('ownView', '1');
+				workspaceViewByWebContents.set(windowWebContentsId, view.viewId);
+			} else {
+				const localDefault =
+					launch.context.profileId === embeddedLocalProfileId
+						? serverTerminalAuthority?.workspace.state.viewOrder[0]
+						: undefined;
+				if (localDefault === undefined)
+					workspaceViewByWebContents.delete(windowWebContentsId);
+				else workspaceViewByWebContents.set(windowWebContentsId, localDefault);
+			}
+		}
+		void windowConnectionsByWebContents.get(windowWebContentsId)?.dispose();
+		const compositionKey = desktopWindowCompositionKey(
+			launch.context.profileId,
+			options?.workspaceViewId,
+			claimDesktopCompositionSlot(
+				windowWebContentsId,
+				desktopWindowCompositionKey(
+					launch.context.profileId,
+					options?.workspaceViewId,
+				),
+			),
+		);
+		const restoredComposition = desktopWindowCompositions.read(compositionKey);
+		// The window's primary stays the profile it was bound with; `attach`
+		// only ever adds to the attached set beside it.
+		const connections = new DesktopWindowConnections({
+			primaryProfileId: launch.context.profileId,
+			primaryServerId: launch.context.serverId,
+			listProfiles: desktopConnectionProfileRecords,
+			openLane: (profile, connectionId, onLost) =>
+				openDesktopConnectionLane(
+					window,
+					windowWebContentsId,
+					profile,
+					connectionId,
+					onLost,
+				),
+			onChanged: (profiles) => {
+				if (window.isDestroyed()) return;
+				window.webContents.send('server-ui-host:event', {
+					type: 'connections.changed',
+					profiles,
+				});
+			},
+			persistComposition: (composition) =>
+				desktopWindowCompositions.write(compositionKey, composition),
+			...(restoredComposition === undefined
+				? {}
+				: { composition: restoredComposition }),
+		});
+		windowConnectionsByWebContents.set(windowWebContentsId, connections);
+		const profiles = connections.list();
+		const primaryProfile: TerminayHostConnectionProfile | undefined =
+			profiles.find((candidate) => candidate.id === launch.context.profileId);
+		const fallbackProfiles = sanitizedDesktopConnectionProfiles(
+			launch.context.profileId,
+		);
+		bindServerUiWindow({
+			window,
+			context: {
+				...launch.context,
+				profile: primaryProfile ?? fallbackProfiles.profile,
+				profiles:
+					primaryProfile === undefined ? fallbackProfiles.profiles : profiles,
+				...(restoredComposition === undefined
+					? {}
+					: { composition: restoredComposition }),
+			},
+			expectedOrigin: entryUrl.toString(),
+			hostPartitionKey: launch.partitionKey,
+			initialUrl: entryUrl.toString(),
+			preloadPath,
+			readTerminalClipboard,
+			onLifecycleDiagnostic: (event) => {
+				void desktopDiagnostics.record(
+					{
+						component: 'renderer',
+						event: 'diagnostics.cleanup.failed',
+						fields: {
+							reason: event.reason,
+							resource: event.resource,
+							webContentsId: windowWebContentsId,
+						},
+						message: event.message,
+						severity: 'warning',
+						source: 'server-ui-lifecycle',
+					},
+					{ channel: 'lifecycle' },
+				);
+			},
+			onHostAction: async (request) => {
+				const action = request.action;
+				switch (action.type) {
+					case 'connection.pair':
+						await switchToPairedDesktopServer(
+							action.pairingUrl,
+							action.attemptId,
+						);
+						return;
+					case 'connection.pair-cancel':
+						cancelDesktopPairing(action.attemptId);
+						return;
+					case 'clipboard.write':
+						clipboard.writeText(action.text);
+						return;
+					case 'file.choose': {
+						const result = await dialog.showOpenDialog(window, {
+							properties: action.multiple
+								? ['openFile', 'multiSelections']
+								: ['openFile'],
+						});
+						return result.canceled ? [] : result.filePaths;
+					}
+					case 'notification.show':
+						new Notification({
+							title: action.title,
+							...(action.body === undefined ? {} : { body: action.body }),
+						}).show();
+						return;
+					case 'badge.count.set':
+						appBadge.set(windowWebContentsId, action.count);
+						return;
+					case 'updater.check':
+						// Renderers poll for status; the host's own timer paces the network.
+						return getAppUpdater().check();
+					case 'updater.install':
+						if (!getAppUpdater().requestRestartToUpdate())
+							throw new Error('No downloaded update is ready to install.');
+						app.quit();
+						return;
+					case 'preview.download':
+						return savePreviewDownload(window, action);
+					case 'os.open-external':
+						await openInBrowser(action.url);
+						return;
+					case 'route.close': {
+						const target =
+							action.presentationId === undefined
+								? window
+								: auxiliaryWindowsByPresentation.get(
+										`${launch.context.profileId}:${action.presentationId}`,
+									);
+						target?.close();
+						return;
+					}
+					case 'route.focus':
+						auxiliaryWindowsByPresentation
+							.get(`${launch.context.profileId}:${action.presentationId}`)
+							?.focus();
+						return;
+					case 'menu.invoke':
+						sendCommandToWindow(window, action.command as AppCommand);
+						return;
+					case 'menu.accelerators.update': {
+						const current = readTerminalSettings();
+						const shortcuts = { ...current.keyboardShortcuts };
+						for (const entry of action.accelerators)
+							shortcuts[entry.command as AppCommand] = entry.accelerator;
+						const settings = writeTerminalSettings({
+							...current,
+							keyboardShortcuts: shortcuts,
+						});
+						createAppMenu(settings);
+						return;
+					}
+					case 'device.settings.update': {
+						if (
+							typeof action.settings !== 'object' ||
+							action.settings === null ||
+							Array.isArray(action.settings)
+						)
+							throw new TypeError('Device settings must be an object.');
+						const current = readTerminalSettings();
+						const settings = writeTerminalSettings({
+							...current,
+							...action.settings,
+						});
+						createAppMenu(settings);
+						broadcastDeviceTerminalSettings();
+						if (settings.updateChannel !== current.updateChannel)
+							void getAppUpdater().setChannel(settings.updateChannel);
+						return selectDeviceTerminalSettings(settings);
+					}
+					case 'route.present':
+						await presentCanonicalAuxiliaryRoute(
+							window,
+							request,
+							launch.context,
+						);
+						return;
+					case 'os.reveal':
+						throw new Error('OS reveal requires a host-issued path token.');
+					case 'workspace.drag.start':
+						beginCanonicalProjectDrag(
+							window.webContents.id,
+							action.viewId,
+							action.preview,
+							{
+								serverId: launch.context.serverId,
+								projectId: action.projectId,
+							},
+						);
+						return;
+					case 'workspace.drag.end':
+						return endCanonicalProjectDrag();
+					case 'connections.list':
+						return { profiles: connections.list() };
+					case 'connections.attach':
+						return await connections.attach(action.profileId);
+					case 'connections.detach':
+						await connections.detach(action.profileId);
+						return;
+					case 'connections.select':
+						await switchWindowToServer(windowWebContentsId, action.profileId);
+						return;
+					case 'connections.open-window':
+						await openServerInNewWindow(action.profileId);
+						return;
+					case 'connections.rename':
+						renameRememberedRemoteConnection(action.profileId, action.label);
+						return;
+					case 'connections.forget':
+						await forgetRememberedRemoteConnection(action.profileId);
+						return;
+					case 'connections.composition.write':
+						connections.writeComposition(action.composition);
+						return;
+					case 'diagnostics.performance-logging.set':
+						return {
+							enabled: await desktopPerformanceLogging.setEnabled(
+								action.enabled,
+							),
+						};
+					case 'diagnostics.performance-snapshot.read': {
+						// Desktop-local evidence about this process and its local
+						// terminals. A window bound to a remote profile is refused.
+						if (launch.context.profileId !== embeddedLocalProfileId)
+							throw new Error(
+								'The performance snapshot is only available for the Local server.',
+							);
+						bindPerformanceLogWindow(window);
+						return await buildPerformanceSnapshot();
+					}
+				}
+			},
+		});
+		const endpointDiagnostic = (resource: string, message: string) => {
+			void desktopDiagnostics.record(
+				{
+					component: 'renderer',
+					event: 'diagnostics.cleanup.failed',
+					fields: { resource, webContentsId: windowWebContentsId },
+					message,
+					severity: 'warning',
+					source: 'server-ui-document-endpoint',
+				},
+				{ channel: 'lifecycle' },
+			);
+		};
+		const targetWebContents = window.webContents;
+		if (transport !== undefined) {
+			const unbindEndpoint = bindRemoteServerUiDocumentEndpoint({
+				diagnostic: endpointDiagnostic,
+				launch,
+				reconnect: () =>
+					reconnectCanonicalDesktopRemoteTransport(
+						launch.context.profileId,
+						desktopWindowIds.for(windowWebContentsId),
+					),
+				sender: targetWebContents,
+				transport,
+			});
+			documentEndpointUnbindByWebContents.set(
+				windowWebContentsId,
+				unbindEndpoint,
+			);
+		} else if (serverTerminalAuthority !== null) {
+			const unbindEndpoint = bindLocalServerUiDocumentEndpoint({
+				acceptPort: (port) =>
+					serverTerminalAuthority?.acceptRendererPort(
+						port as unknown as ServerMessagePort,
+						{ ownerId: windowWebContentsId },
+					),
+				diagnostic: endpointDiagnostic,
+				handle: launch.byteEndpointHandle,
+				sender: targetWebContents,
+			});
+			documentEndpointUnbindByWebContents.set(
+				windowWebContentsId,
+				unbindEndpoint,
+			);
+		}
+		await window.loadURL(entryUrl.toString());
+		if (options?.deferCanonicalLaunch === true && !window.isDestroyed())
+			window.show();
+	};
+	const desktopPairingAttempts = new DesktopPairingAttempts();
+	window.once('closed', () => desktopPairingAttempts.cancelAll());
+	cancelDesktopPairing = (attemptId) => {
+		desktopPairingAttempts.cancel(attemptId);
+	};
+	let desktopPairingGeneration = 0;
+	switchToPairedDesktopServer = async (pairingUrl, attemptId) => {
+		const generation = ++desktopPairingGeneration;
+		const abort = desktopPairingAttempts.begin(attemptId);
+		// The renderer never sees the fragment or the device key: only the match
+		// code to compare with the exposing computer, and where the attempt is.
+		const sendPairingEvent = (
+			event:
+				| Readonly<{
+						type: 'connection.pairing-approval';
+						deviceName: string;
+						matchCode: string;
+						expiresAt: string;
+				  }>
+				| Readonly<{
+						type: 'connection.pairing-progress';
+						state: TerminayPairingProgressState;
+				  }>,
+		) => {
+			if (window.isDestroyed() || generation !== desktopPairingGeneration)
+				return;
+			window.webContents.send('server-ui-host:event', { ...event, attemptId });
+		};
+		try {
+			await runDesktopPairingAttempt({
+				abort,
+				enroll: (hooks) =>
+					enrollPairedDesktopRemoteProfile(
+						pairingUrl,
+						hooks.onMatchCode,
+						hooks.onConnectionStatus,
+						hooks.abort,
+					),
+				rememberProfile: rememberRemoteConnection,
+				connect: async (profile, hooks) => {
+					// The server is shown in the workspace window, so the connection
+					// is that window's. With no workspace window left there is
+					// nothing to connect for: the server is saved and that is all.
+					const target = pairingTarget();
+					if (target === undefined) return undefined;
+					return prepareCanonicalDesktopRemoteConnection(
+						profile,
+						desktopWindowIds.for(target.window.webContents.id),
+						hooks.onConnectionFailure,
+						hooks.onConnectionStatus,
+					);
+				},
+				mount: async (profile, remote) => {
+					if (remote === undefined) return;
+					const target = pairingTarget();
+					if (target === undefined) {
+						await remote.transport
+							.close({ code: 'normal' })
+							.catch(() => undefined);
+						return;
+					}
+					// Remote Control stays Remote Control; the workspace window's
+					// other auxiliary windows presented the server it is leaving.
+					for (const child of target.window.getChildWindows())
+						if (child !== window && !child.isDestroyed()) child.close();
+					await target.mountRemote(profile, remote);
+					if (target.isMainWorkspace) rememberWindowServer(profile.id);
+				},
+				emitApproval: (approval) =>
+					sendPairingEvent({
+						type: 'connection.pairing-approval',
+						deviceName: approval.deviceName,
+						matchCode: approval.matchCode,
+						expiresAt: new Date(approval.expiresAt).toISOString(),
+					}),
+				emitProgress: (state) =>
+					sendPairingEvent({ type: 'connection.pairing-progress', state }),
+			});
+		} finally {
+			desktopPairingAttempts.end(attemptId, abort);
+		}
+	};
+	const serverController: WindowServerController = {
+		window,
+		isAuxiliary: options?.auxiliary !== undefined,
+		isMainWorkspace:
+			options?.auxiliary === undefined && options?.workspaceViewId === undefined,
+		currentProfileId: () => boundProfileId,
+		currentViewKey: () => boundViewKey,
+		mountRemote: async (profile, remote) => {
+			releaseServerUiWindowBinding(windowWebContentsId, 'server-switch');
+			releaseLocalServerUiSessionSafely(windowWebContentsId);
+			remoteProfileBindingsByWebContents.set(windowWebContentsId, profile.id);
+			try {
+				await mountCanonicalLaunch(remote.launch, remote.transport);
+			} catch (error) {
+				remoteProfileBindingsByWebContents.delete(windowWebContentsId);
+				throw error;
+			}
+		},
+		mountLocal: async () => {
+			releaseServerUiWindowBinding(windowWebContentsId, 'server-switch');
+			remoteProfileBindingsByWebContents.delete(windowWebContentsId);
+			await mountCanonicalLaunch(
+				await localServerUiSession.prepare(windowWebContentsId),
+			);
+		},
+	};
+	windowServerControllers.set(windowWebContentsId, serverController);
+	const pairingTarget = (): WindowServerController | undefined => {
+		const parent = window.getParentWindow();
+		const target = pairingTargetWindow({
+			pairingWindow: window,
+			pairingWindowIsAuxiliary: options?.auxiliary !== undefined,
+			parentWindow: parent === null || parent.isDestroyed() ? undefined : parent,
+		});
+		if (target === undefined || target.isDestroyed()) return undefined;
+		const controller = windowServerControllers.get(target.webContents.id);
+		return controller === undefined || controller.isAuxiliary
+			? undefined
+			: controller;
+	};
+	const launchCanonical = async (): Promise<void> => {
+		const launch = await (options?.serverUiLaunch === undefined
+			? localServerUiSession.prepare(windowWebContentsId)
+			: Promise.resolve(options.serverUiLaunch));
+		await mountCanonicalLaunch(launch, options?.serverUiTransport);
+	};
+	const launchWithRecovery = async (): Promise<void> => {
+		try {
+			await launchCanonical();
+		} catch (error) {
+			console.error('[window] canonical server UI launch failed', error);
+			releaseServerUiWindowBinding(windowWebContentsId, 'failed-launch');
+			releaseLocalServerUiSessionSafely(windowWebContentsId);
+			await showCanonicalLaunchRecovery({
+				window,
+				error,
+				retry: launchWithRecovery,
+				onRecoveryState: (active) => {
+					if (active) launchRecoveryWebContents.add(windowWebContentsId);
+					else launchRecoveryWebContents.delete(windowWebContentsId);
+				},
+				onDiagnostic: recordCanonicalRecoveryDiagnostic,
+			});
+		}
+	};
+	if (options?.deferCanonicalLaunch === true)
+		deferredCanonicalLaunches.set(windowWebContentsId, launchWithRecovery);
+	else void launchWithRecovery();
+
+	void getAppUpdater().check();
+
+	return window;
+}
+
+async function launchDeferredCanonicalWindow(
+	window: BrowserWindow,
+): Promise<void> {
+	const launch = deferredCanonicalLaunches.get(window.webContents.id);
+	if (launch === undefined)
+		throw new Error('The embedded workspace launch was not prepared.');
+	deferredCanonicalLaunches.delete(window.webContents.id);
+	await launch();
+}
+
+const REMOTE_SERVER_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+
+/** Learn a standalone server's stable identity from its unauthenticated host
+ * bootstrap. Only identity is read: Desktop never downloads a remote bundle. */
+async function readRemoteServerIdentity(origin: string): Promise<string> {
+	const bootstrapUrl = new URL('/host-bootstrap.json', origin);
+	const response = await fetch(bootstrapUrl, {
+		headers: { accept: 'application/json' },
+		redirect: 'error',
+	});
+	if (!response.ok)
+		throw new Error('The remote server host bootstrap is unavailable.');
+	const bootstrap = (await response.json()) as Record<string, unknown>;
+	if (
+		bootstrap.schemaVersion !== 1 ||
+		typeof bootstrap.serverId !== 'string' ||
+		!REMOTE_SERVER_ID.test(bootstrap.serverId) ||
+		bootstrap.streamPath !== '/protocol/stream'
+	) {
+		throw new Error('The remote server host bootstrap is invalid.');
+	}
+	return bootstrap.serverId;
+}
+
+/** Desktop runs the workspace bundle packaged with it for every connection, so
+ * a remote profile supplies a transport and a server identity and never bundle
+ * bytes. The packaged artifact keeps its own verification; there is no remote
+ * download lane and no per-server bundle cache. */
+async function prepareCanonicalRemoteLaunch(
+	profile: RememberedRemoteConnection,
+	lanes: DesktopRemoteLanes,
+): Promise<DesktopBundleLaunch> {
+	const serverId =
+		lanes.serverId ??
+		profile.serverId ??
+		(await readRemoteServerIdentity(profile.origin));
+	return remoteServerUiBundleHost.prepareLocal({
+		artifact: { rootDirectory: SERVER_UI_DIST },
+		origin: profile.origin,
+		profileId: profile.id,
+		serverId,
+		windowId: `window-${randomUUID()}`,
+	});
+}
+
+/** Consume a one-time pairing URL only in Electron. The resulting profile is
+ * intentionally just origin/id/label metadata; the protected device key stays
+ * inside DesktopDeviceCredentialStore. */
+async function enrollPairedDesktopRemoteProfile(
+	pairingUrl: string,
+	onMatchCode: (
+		approval: Readonly<{
+			deviceName: string;
+			matchCode: string;
+			expiresAt: number;
+		}>,
+	) => void,
+	onConnectionStatus: (status: 'degraded' | 'recovered') => void,
+	abort: AbortSignal,
+): Promise<RememberedRemoteConnection> {
+	const deviceName = 'Terminay Desktop';
+	const enrolled = await establishDesktopDevicePairing({
+		deviceName,
+		pairingUrl,
+		store: createDesktopDeviceCredentialStore(),
+		hosted: {
+			webrtcRuntimeRoot: resolveDesktopWebRtcRuntimeRoot({
+				isPackaged: app.isPackaged,
+				resourcesPath: process.resourcesPath,
+				environment: process.env,
+			}),
+			iceServers: parseHostedIceServers(
+				readEmbeddedRemoteAccessSettings().webRtcIceServers,
+			),
+			signal: desktopHostedSignalOptions(),
+			abort,
+			onMatchCode: (code) => onMatchCode({ deviceName, ...code }),
+			// Nothing is saved yet, so a lost pairing peer is recorded here and
+			// reaches the user as the rejected attempt, not as a saved server.
+			onConnectionFailure: (reason) =>
+				recordDesktopHostedPeerDiagnostic('connection-failed', { reason }),
+			onCandidatePair: (pair) =>
+				recordDesktopHostedPeerDiagnostic('candidate-pair', {
+					localType: pair.localType,
+					protocol: pair.protocol,
+					remoteType: pair.remoteType,
+					pairState: pair.state,
+				}),
+			onConnectionStatus: (status) => {
+				recordDesktopHostedPeerDiagnostic('connection-status', { status });
+				onConnectionStatus(status);
+			},
+		},
+	});
+	const origin = enrolled.origin;
+	loadRememberedRemoteConnections();
+	const existing = [...rememberedRemoteConnections.values()].find(
+		(candidate) => candidate.origin === origin,
+	);
+	return Object.freeze({
+		id: existing?.id ?? `remote:${randomUUID()}`,
+		kind: 'standalone',
+		label: existing?.label ?? enrolled.label ?? new URL(origin).host,
+		origin,
+		...(enrolled.serverId === undefined ? {} : { serverId: enrolled.serverId }),
+	});
+}
+
+/** One authenticated remote lane. A remote profile supplies a transport and,
+ * where the peer proved it, the stable server identity it is bound to. */
+type DesktopRemoteLanes = Readonly<{
+	kind: 'http' | 'webrtc';
+	transport: ByteTransport;
+	serverId?: string;
+}>;
+
+/** Hosted signaling overrides for development relays; production uses none. */
+function desktopHostedSignalOptions(): DesktopHostedSignalOptions | undefined {
+	const connectHost = process.env.TERMINAY_SIGNAL_CONNECT_HOST?.trim();
+	const insecureTls = process.env.TERMINAY_SIGNAL_INSECURE_TLS === '1';
+	if (!connectHost && !insecureTls) return undefined;
+	return Object.freeze({
+		...(connectHost ? { connectHost } : {}),
+		...(insecureTls ? { insecureTls: true } : {}),
+	});
+}
+
+/**
+ * Open the authenticated lanes for a remembered remote profile. A hosted
+ * origin runs the device challenge and ticket on the transcript-verified
+ * WebRTC peer; only a loopback embedded server still uses local HTTP.
+ */
+async function openDesktopRemoteLanes(
+	profile: RememberedRemoteConnection,
+	windowId: string,
+	onConnectionFailure?: () => void,
+	onConnectionStatus?: (status: 'degraded' | 'recovered') => void,
+): Promise<DesktopRemoteLanes> {
+	// One attempt at a time per server: two windows connecting together would
+	// otherwise retire each other's handshake.
+	return desktopProfileConnects.run(profile.id, () =>
+		openDesktopRemoteLanesNow(
+			profile,
+			windowId,
+			onConnectionFailure,
+			onConnectionStatus,
+		),
+	);
+}
+
+async function openDesktopRemoteLanesNow(
+	profile: RememberedRemoteConnection,
+	windowId: string,
+	onConnectionFailure?: () => void,
+	onConnectionStatus?: (status: 'degraded' | 'recovered') => void,
+): Promise<DesktopRemoteLanes> {
+	if (isHostedDesktopOrigin(profile.origin)) {
+		const webrtcRuntimeRoot = resolveDesktopWebRtcRuntimeRoot({
+			isPackaged: app.isPackaged,
+			resourcesPath: process.resourcesPath,
+			environment: process.env,
+		});
+		if (webrtcRuntimeRoot === undefined) {
+			throw new Error(
+				'The selected WebRTC runtime directory is unavailable, so Desktop cannot open a remote connection. Package the runtime, or set TERMINAY_WEBRTC_RUNTIME_ROOT in development.',
+			);
+		}
+		const signal = desktopHostedSignalOptions();
+		const webRtc = await connectDesktopHostedRemote({
+			origin: profile.origin,
+			store: createDesktopDeviceCredentialStore(),
+			webrtcRuntimeRoot,
+			windowId,
+			iceServers: parseHostedIceServers(
+				readEmbeddedRemoteAccessSettings().webRtcIceServers,
+			),
+			...(profile.serverId === undefined
+				? {}
+				: { expectedServerId: profile.serverId }),
+			...(signal === undefined ? {} : { signal }),
+			onConnectionFailure: (reason) => {
+				recordDesktopHostedPeerDiagnostic('connection-failed', { reason });
+				onConnectionFailure?.();
+			},
+			onConnectionStatus: (status) => {
+				recordDesktopHostedPeerDiagnostic('connection-status', { status });
+				onConnectionStatus?.(status);
+			},
+			onCandidatePair: (pair) =>
+				recordDesktopHostedPeerDiagnostic('candidate-pair', {
+					localType: pair.localType,
+					protocol: pair.protocol,
+					remoteType: pair.remoteType,
+					pairState: pair.state,
+				}),
+		});
+		return Object.freeze({
+			kind: 'webrtc' as const,
+			transport: webRtc.transport,
+			serverId: webRtc.serverId,
+		});
+	}
+	const connected = await createDesktopReconnectTransport({
+		origin: profile.origin,
+		store: createDesktopDeviceCredentialStore(),
+	});
+	if (connected.signalingBootstrap === undefined) {
+		return Object.freeze({
+			kind: 'http' as const,
+			transport: connected.transport,
+			...(profile.serverId === undefined ? {} : { serverId: profile.serverId }),
+		});
+	}
+	try {
+		const remoteWebRtcRuntimeRoot = resolveDesktopWebRtcRuntimeRoot({
+			isPackaged: app.isPackaged,
+			resourcesPath: process.resourcesPath,
+			environment: process.env,
+		});
+		const webRtc = await createDesktopBootstrappedWebRtcConnection({
+			bootstrap: connected.signalingBootstrap,
+			expectedOrigin: profile.origin,
+			transportAuth: desktopWebRtcReconnectAuth(connected),
+			...(remoteWebRtcRuntimeRoot === undefined
+				? {}
+				: { webrtcRuntimeRoot: remoteWebRtcRuntimeRoot }),
+		});
+		await connected.transport.close({ code: 'normal' });
+		return Object.freeze({
+			kind: 'webrtc' as const,
+			transport: webRtc.transport,
+			serverId: webRtc.serverId,
+		});
+	} catch (error) {
+		await connected.transport.close({ code: 'normal' }).catch(() => undefined);
+		throw error;
+	}
+}
+
+function desktopWebRtcReconnectAuth(connected: DesktopReconnectTransport) {
+	if (connected.pinnedHostKey === undefined) {
+		throw new Error(
+			'Server host identity is not pinned; explicit re-pairing is required.',
+		);
+	}
+	return Object.freeze({
+		scope: 'reconnect' as const,
+		pinnedHostKey: connected.pinnedHostKey,
+		scopeId: connected.deviceId,
+	});
+}
+
+/** Prepare one authenticated remote lane and bind Desktop's packaged bundle to
+ * it. This is shared by initial pairing, auxiliary windows and reconnection;
+ * the renderer never sees enrollment or reconnect material. */
+async function prepareCanonicalDesktopRemoteConnection(
+	profile: RememberedRemoteConnection,
+	windowId: string,
+	onConnectionFailure?: () => void,
+	onConnectionStatus?: (status: 'degraded' | 'recovered') => void,
+): Promise<
+	Readonly<{ launch: DesktopBundleLaunch; transport: ByteTransport }>
+> {
+	const lanes = await openDesktopRemoteLanes(
+		profile,
+		windowId,
+		onConnectionFailure,
+		onConnectionStatus,
+	);
+	try {
+		return Object.freeze({
+			launch: await prepareCanonicalRemoteLaunch(profile, lanes),
+			transport: lanes.transport,
+		});
+	} catch (error) {
+		await lanes.transport.close({ code: 'normal' }).catch(() => undefined);
+		throw error;
+	}
+}
+
+/** Reconnect a Desktop-owned remote byte lane without reloading the selected
+ * server bundle.  The renderer receives a fresh document MessagePort only
+ * after this authenticated transport has been established. */
+async function reconnectCanonicalDesktopRemoteTransport(
+	profileId: string,
+	windowId: string,
+): Promise<ByteTransport> {
+	loadRememberedRemoteConnections();
+	const profile = rememberedRemoteConnections.get(profileId);
+	if (profile === undefined)
+		throw new Error('The selected remote profile is no longer available.');
+	return (await openDesktopRemoteLanes(profile, windowId)).transport;
+}
+
+function setDockIcon(): void {
+	if (process.platform !== 'darwin') return;
+	const iconPath =
+		getBrandAssetPath('icon.icns') ?? getBrandAssetPath('terminay.png');
+	if (!iconPath) return;
+	const icon = nativeImage.createFromPath(iconPath);
+	if (!icon.isEmpty()) app.dock?.setIcon(icon);
+}
+
+if (process.env.TERMINAY_TEST === '1') {
+	ipcMain.on(
+		'test:renderer-bootstrap-diagnostic',
+		(event, payload: unknown) => {
+			assertTrustedAppSender(event);
+			if (
+				typeof payload !== 'object' ||
+				payload === null ||
+				Array.isArray(payload)
+			)
+				return;
+			const phase = (payload as { phase?: unknown }).phase;
+			const count = (payload as { count?: unknown }).count;
+			if (
+				typeof phase !== 'string' ||
+				phase.length === 0 ||
+				phase.length > 96 ||
+				(count !== undefined &&
+					(!Number.isSafeInteger(count) ||
+						(count as number) < 0 ||
+						(count as number) > 1_000_000))
+			)
+				return;
+			writePortDiagnostic({
+				phase: 'renderer-bootstrap',
+				rendererPhase: phase,
+				...(count === undefined ? {} : { count }),
+			});
+		},
+	);
+}
+
+// Orphaned renderer feature IPC was removed; canonical server authority owns these operations.
+ipcMain.on('server-ui-host:subscribe-events', (event) => {
+	assertBoundServerUiEvent(event);
+	sendTerminalZoom(event.sender);
+	sendDeviceTerminalSettings(event.sender);
+	sendPerformanceLogging(event.sender);
+	sendWindowFullScreenState(event.sender);
+});
+
+// Cross-window drag tracking with Chrome-style tear-off. While a project tab is
+// being dragged, framer-motion keeps it x-locked in its own bar (reorder). The
+// main process polls the cursor; once the cursor is dragged past a threshold
+// away from the source bar, the tab "tears off" into a floating ghost window
+// that follows the cursor and magnetically snaps onto any window's tab bar. The
+// outcome (reorder / merge / popout) is decided on release.
+type ProjectDragPreview = {
+	title: string;
+	emoji: string;
+	color: string;
+	width: number;
+};
+
+const PROJECT_TAB_TEAR_OFF_DISTANCE = 100;
+const PROJECT_TAB_BAR_HEIGHT = 48;
+// Transparent padding around the ghost card so its drop shadow isn't clipped.
+const GHOST_PADDING = 24;
+const GHOST_HEIGHT = 56;
+
+let projectDragPollTimer: ReturnType<typeof setInterval> | null = null;
+let projectDragSourceWebContentsId: number | null = null;
+let projectDragPreview: ProjectDragPreview | null = null;
+let projectDragProject: { serverId: string; projectId: string } | null = null;
+let projectDragTornOff = false;
+// The other window whose bar the torn-off tab is held over, and where.
+let projectDropTargetWebContentsId: number | null = null;
+let projectDropTargetX: number | null = null;
+let tabGhostWindow: BrowserWindow | null = null;
+let ghostWindowWidth = 0;
+
+type ScreenRect = { x: number; y: number; width: number; height: number };
+
+function getBarScreenRect(webContentsId: number | null): ScreenRect | null {
+	if (webContentsId === null) {
+		return null;
+	}
+	for (const window of appWindows) {
+		if (window.isDestroyed() || window.isMinimized()) {
+			continue;
+		}
+		if (window.webContents.id !== webContentsId) {
+			continue;
+		}
+		const content = window.getContentBounds();
+		return {
+			x: content.x,
+			y: content.y,
+			width: content.width,
+			height: Math.min(PROJECT_TAB_BAR_HEIGHT, content.height),
+		};
+	}
+	return null;
+}
+
+function findAppWindowTabBarAtPoint(point: {
+	x: number;
+	y: number;
+}): number | null {
+	for (const window of appWindows) {
+		if (window.isDestroyed() || window.isMinimized()) {
+			continue;
+		}
+		const rect = getBarScreenRect(window.webContents.id);
+		if (rect && pointInRect(point, rect)) {
+			return window.webContents.id;
+		}
+	}
+	return null;
+}
+
+function escapeGhostHtml(value: string): string {
+	return value
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;')
+		.replace(/"/g, '&quot;');
+}
+
+function buildTabGhostUrl(preview: ProjectDragPreview): string {
+	const title = escapeGhostHtml(preview.title || 'Project');
+	const emoji = escapeGhostHtml(preview.emoji);
+	const color = /^#[0-9a-fA-F]{3,8}$/.test(preview.color)
+		? preview.color
+		: '#4db5ff';
+	// Match the in-app active project tab: a project-color tint over the active
+	// tab background (--tab-bg-active #0d1014), white bold label, no border.
+	const badge = emoji ? `<span class="em">${emoji}</span>` : '';
+	const cardWidth = Math.max(80, Math.round(preview.width));
+	const html = `<!doctype html><html><head><meta charset="utf-8"><style>
+    html,body{margin:0;height:100%;background:transparent;overflow:hidden;cursor:grabbing;
+      display:flex;align-items:center;justify-content:center;
+      font-family:'Open Sans','Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;}
+    .tab{display:flex;align-items:center;gap:8px;box-sizing:border-box;
+      width:${cardWidth}px;height:30px;padding:0 12px;
+      border-radius:6px;color:#ffffff;font-size:13px;font-weight:700;letter-spacing:.01em;
+      white-space:nowrap;background:color-mix(in srgb, ${color} 45%, #0d1014);
+      box-shadow:0 10px 28px rgba(0,0,0,.55), 0 2px 8px rgba(0,0,0,.35);}
+    .em{font-size:14px;line-height:1;flex:none;}
+    .ti{overflow:hidden;text-overflow:ellipsis;}
+  </style></head><body><div class="tab">${badge}<span class="ti">${title}</span></div></body></html>`;
+	return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+}
+
+function showTabGhostWindow(preview: ProjectDragPreview): void {
+	ghostWindowWidth =
+		Math.max(80, Math.round(preview.width)) + GHOST_PADDING * 2;
+	if (!tabGhostWindow || tabGhostWindow.isDestroyed()) {
+		tabGhostWindow = new BrowserWindow({
+			width: ghostWindowWidth,
+			height: GHOST_HEIGHT,
+			frame: false,
+			transparent: true,
+			resizable: false,
+			movable: false,
+			minimizable: false,
+			maximizable: false,
+			fullscreenable: false,
+			focusable: false,
+			skipTaskbar: true,
+			hasShadow: false,
+			alwaysOnTop: true,
+			show: false,
+			// This window displays only a generated drag preview, not application
+			// content. Keep that isolation explicit so a future preview change
+			// cannot accidentally inherit a privileged renderer configuration.
+			webPreferences: {
+				contextIsolation: true,
+				nodeIntegration: false,
+				sandbox: true,
+				webSecurity: true,
+				webviewTag: false,
+			},
+		});
+		tabGhostWindow.setIgnoreMouseEvents(true);
+	}
+	tabGhostWindow.setSize(ghostWindowWidth, GHOST_HEIGHT);
+	tabGhostWindow.loadURL(buildTabGhostUrl(preview));
+	tabGhostWindow.showInactive();
+}
+
+// Center the ghost card under the cursor.
+function moveTabGhostToCursor(point: { x: number; y: number }): void {
+	if (tabGhostWindow && !tabGhostWindow.isDestroyed()) {
+		if (!tabGhostWindow.isVisible()) {
+			tabGhostWindow.showInactive();
+		}
+		tabGhostWindow.setBounds({
+			x: Math.round(point.x - ghostWindowWidth / 2),
+			y: Math.round(point.y - GHOST_HEIGHT / 2),
+			width: ghostWindowWidth,
+			height: GHOST_HEIGHT,
+		});
+	}
+}
+
+function destroyTabGhostWindow(): void {
+	if (tabGhostWindow && !tabGhostWindow.isDestroyed()) {
+		tabGhostWindow.destroy();
+	}
+	tabGhostWindow = null;
+}
+
+function setProjectTabTornOff(tornOff: boolean): void {
+	if (tornOff === projectDragTornOff) {
+		return;
+	}
+	projectDragTornOff = tornOff;
+	const source = webContents.fromId(projectDragSourceWebContentsId ?? -1);
+	if (tornOff) {
+		if (projectDragPreview) {
+			showTabGhostWindow(projectDragPreview);
+		}
+		source?.send('server-ui-host:event', {
+			type: 'workspace.drag-state',
+			active: true,
+		});
+	} else {
+		destroyTabGhostWindow();
+		source?.send('server-ui-host:event', {
+			type: 'workspace.drag-state',
+			active: false,
+		});
+	}
+}
+
+/** End the drag session however it ended. The source window was told when its
+ * tab tore off, so it is told here that the tear-off is over. */
+function stopProjectDragTracking(): void {
+	if (projectDragPollTimer) {
+		clearInterval(projectDragPollTimer);
+		projectDragPollTimer = null;
+	}
+	setProjectDropTarget(null);
+	setProjectTabTornOff(false);
+	destroyTabGhostWindow();
+	projectDragSourceWebContentsId = null;
+	projectDragPreview = null;
+	projectDragProject = null;
+}
+
+function sendProjectDropTarget(
+	webContentsId: number,
+	phase: 'hover' | 'leave' | 'drop',
+	x: number,
+): void {
+	if (projectDragProject === null || projectDragPreview === null) return;
+	webContents.fromId(webContentsId)?.send('server-ui-host:event', {
+		type: 'workspace.drop-target',
+		phase,
+		x,
+		serverId: projectDragProject.serverId,
+		projectId: projectDragProject.projectId,
+		title: projectDragPreview.title,
+		emoji: projectDragPreview.emoji,
+		color: projectDragPreview.color,
+	});
+}
+
+/** The pointer's distance from the left edge of a window's content. */
+function projectDropX(
+	webContentsId: number,
+	point: { x: number; y: number },
+): number {
+	const bar = getBarScreenRect(webContentsId);
+	if (bar === null) return 0;
+	return Math.max(0, Math.min(Math.round(point.x - bar.x), bar.width));
+}
+
+/** Tell the window the tab is held over where it is, and the window it has
+ * left that it has gone. */
+function setProjectDropTarget(
+	webContentsId: number | null,
+	point?: { x: number; y: number },
+): void {
+	const previous = projectDropTargetWebContentsId;
+	if (previous !== null && previous !== webContentsId)
+		sendProjectDropTarget(previous, 'leave', 0);
+	if (webContentsId === null || point === undefined) {
+		projectDropTargetWebContentsId = null;
+		projectDropTargetX = null;
+		return;
+	}
+	const x = projectDropX(webContentsId, point);
+	if (previous === webContentsId && projectDropTargetX === x) return;
+	projectDropTargetWebContentsId = webContentsId;
+	projectDropTargetX = x;
+	sendProjectDropTarget(webContentsId, 'hover', x);
+}
+
+function beginCanonicalProjectDrag(
+	senderId: number,
+	viewId: string,
+	preview: ProjectDragPreview,
+	project: { serverId: string; projectId: string },
+): void {
+	workspaceViewByWebContents.set(senderId, viewId);
+	projectDragSourceWebContentsId = senderId;
+	projectDragPreview = preview;
+	projectDragProject = project;
+	projectDragTornOff = false;
+	if (projectDragPollTimer) clearInterval(projectDragPollTimer);
+	projectDragPollTimer = setInterval(() => {
+		const point = screen.getCursorScreenPoint();
+		const sourceBar = getBarScreenRect(projectDragSourceWebContentsId);
+		if (!projectDragTornOff) {
+			if (
+				sourceBar &&
+				distanceToRect(point, sourceBar) > PROJECT_TAB_TEAR_OFF_DISTANCE
+			)
+				setProjectTabTornOff(true);
+			return;
+		}
+		if (sourceBar && pointInRect(point, sourceBar)) {
+			setProjectDropTarget(null);
+			setProjectTabTornOff(false);
+			return;
+		}
+		const target = projectDropWindowAt(point);
+		setProjectDropTarget(target, point);
+		// A strip showing the tab stands in for the floating preview.
+		if (target === null) moveTabGhostToCursor(point);
+		else if (tabGhostWindow && !tabGhostWindow.isDestroyed())
+			tabGhostWindow.hide();
+	}, 16);
+}
+
+/** The window, other than the drag's source, whose project bar is at the
+ * point and which presents a workspace view a project can move into. A
+ * project stays on its server, so a window showing another server is never
+ * one: view ids are only unique within a server. */
+function projectDropWindowAt(point: { x: number; y: number }): number | null {
+	const hit = findAppWindowTabBarAtPoint(point);
+	if (hit === null || hit === projectDragSourceWebContentsId) return null;
+	const sourceProfileId =
+		projectDragSourceWebContentsId === null
+			? undefined
+			: windowServerControllers
+					.get(projectDragSourceWebContentsId)
+					?.currentProfileId();
+	if (
+		sourceProfileId === undefined ||
+		windowServerControllers.get(hit)?.currentProfileId() !== sourceProfileId
+	)
+		return null;
+	return workspaceViewByWebContents.has(hit) ? hit : null;
+}
+
+function endCanonicalProjectDrag():
+	| { action: 'reorder' }
+	| { action: 'merge'; targetViewId: string }
+	| { action: 'popout'; x: number; y: number } {
+	const sourceId = projectDragSourceWebContentsId;
+	const wasTornOff = projectDragTornOff;
+	const point = screen.getCursorScreenPoint();
+	const hit = findAppWindowTabBarAtPoint(point);
+	const target = wasTornOff ? projectDropWindowAt(point) : null;
+	const targetViewId =
+		target === null ? undefined : workspaceViewByWebContents.get(target);
+	if (target !== null && targetViewId !== undefined) {
+		// The drop replaces the hover, so the window is not also told the tab
+		// left; it takes the tab, the front, and the keyboard.
+		sendProjectDropTarget(target, 'drop', projectDropX(target, point));
+		projectDropTargetWebContentsId = null;
+		projectDropTargetX = null;
+		const contents = webContents.fromId(target);
+		const targetWindow =
+			contents === undefined ? null : BrowserWindow.fromWebContents(contents);
+		targetWindow?.show();
+		targetWindow?.focus();
+	}
+	stopProjectDragTracking();
+	if (!wasTornOff || hit === sourceId) return { action: 'reorder' };
+	if (targetViewId !== undefined) return { action: 'merge', targetViewId };
+	if (hit !== null) return { action: 'reorder' };
+	return { action: 'popout', x: point.x, y: point.y };
+}
+
+function currentRemoteAccessStatus(): RemoteAccessStatus {
+	return desktopRemoteExposure.getStatus();
+}
+
+async function toggleRemoteServer(): Promise<RemoteAccessStatus> {
+	return desktopRemoteExposure.toggle();
+}
+
+async function createRemotePairingLink(): Promise<RemoteAccessStatus> {
+	return desktopRemoteExposure.createPairingLink();
+}
+
+async function revokeRemoteDevice(
+	deviceId: string,
+): Promise<RemoteAccessStatus> {
+	return desktopRemoteExposure.revokeDevice(deviceId);
+}
+
+async function closeRemoteConnection(
+	connectionId: string,
+): Promise<RemoteAccessStatus> {
+	return desktopRemoteExposure.closeConnection(connectionId);
+}
+
+if (process.env.TERMINAY_TEST === '1') {
+	ipcMain.handle(
+		'test:create-server-terminal',
+		async (event, payload?: { cwd?: unknown; projectId?: unknown }) => {
+			assertTrustedAppSender(event);
+			if (!serverTerminalAuthority)
+				throw new Error('embedded server is unavailable');
+			const cwd =
+				typeof payload?.cwd === 'string' && payload.cwd.length > 0
+					? payload.cwd
+					: undefined;
+			const projectId =
+				typeof payload?.projectId === 'string' &&
+				payload.projectId.trim().length > 0
+					? payload.projectId.trim()
+					: 'desktop';
+			const session = await createServerOwnedTerminalSession(projectId, cwd);
+			attachServerTerminalRenderer(session.id, event.sender.id);
+			return { id: session.id };
+		},
+	);
+
+	ipcMain.handle(
+		'test:write-server-terminal',
+		async (event, payload?: { data?: unknown; sessionId?: unknown }) => {
+			assertTrustedAppSender(event);
+			if (!serverTerminalAuthority)
+				throw new Error('embedded server is unavailable');
+			const sessionId = payload?.sessionId;
+			const data = payload?.data;
+			if (
+				typeof sessionId !== 'string' ||
+				sessionId.length === 0 ||
+				sessionId.length > 512
+			) {
+				throw new TypeError('test terminal session id is invalid');
+			}
+			if (
+				typeof data !== 'string' ||
+				data.length === 0 ||
+				data.length > 1_048_576
+			) {
+				throw new TypeError('test terminal input is invalid');
+			}
+			if (serverTerminalAuthority.get(sessionId)?.status !== 'running') {
+				throw new Error('The requested terminal session is not available.');
+			}
+			await serverTerminalAuthority.write(sessionId, data);
+		},
+	);
+
+	ipcMain.handle(
+		'test:get-server-terminal-cwd',
+		async (event, payload?: { sessionId?: unknown }) => {
+			assertTrustedAppSender(event);
+			if (!serverTerminalAuthority)
+				throw new Error('embedded server is unavailable');
+			const sessionId = payload?.sessionId;
+			if (
+				typeof sessionId !== 'string' ||
+				sessionId.length === 0 ||
+				sessionId.length > 512
+			) {
+				throw new TypeError('test terminal session id is invalid');
+			}
+			return serverTerminalAuthority.currentCwd(sessionId);
+		},
+	);
+
+	ipcMain.handle(
+		'test:get-server-git-workspace',
+		async (event, payload?: { sessionId?: unknown }) => {
+			assertTrustedAppSender(event);
+			if (!serverTerminalAuthority)
+				throw new Error('embedded server is unavailable');
+			const sessionId = payload?.sessionId;
+			if (
+				typeof sessionId !== 'string' ||
+				sessionId.length === 0 ||
+				sessionId.length > 512
+			) {
+				throw new TypeError('test terminal session id is invalid');
+			}
+			const session = serverTerminalAuthority.get(sessionId);
+			if (session === undefined) return null;
+			const project =
+				serverTerminalAuthority.workspace.state.projects[session.projectId];
+			const binding = serverTerminalAuthority.git.getBinding(session.projectId);
+			const worktrees = await serverTerminalAuthority.git.worktrees({
+				projectId: session.projectId,
+			});
+			return {
+				projectId: session.projectId,
+				projectRoot: project?.root ?? null,
+				binding: binding
+					? {
+							projectRoot: binding.projectRoot,
+							repositoryRoot: binding.repositoryRoot,
+							state: binding.state,
+							worktreeRoot: binding.worktreeRoot,
+						}
+					: null,
+				worktrees: {
+					repositoryRoot: worktrees.repositoryRoot,
+					state: worktrees.state,
+					paths: worktrees.worktrees.map((worktree) => worktree.path),
+				},
+			};
+		},
+	);
+
+	ipcMain.handle(
+		'test:get-server-terminal-activity',
+		(event, payload?: { sessionId?: unknown }) => {
+			assertTrustedAppSender(event);
+			if (!serverTerminalAuthority)
+				throw new Error('embedded server is unavailable');
+			const sessionId = payload?.sessionId;
+			if (
+				typeof sessionId !== 'string' ||
+				sessionId.length === 0 ||
+				sessionId.length > 512
+			) {
+				throw new TypeError('test terminal session id is invalid');
+			}
+			const session = serverTerminalAuthority.get(sessionId);
+			if (session === undefined) return null;
+			const snapshot = serverTerminalAuthority.activity.get({
+				serverId: session.serverId,
+				projectId: session.projectId,
+				sessionId,
+			});
+			return snapshot === undefined
+				? null
+				: {
+						foregroundBusy: snapshot.foregroundBusy,
+						foregroundObservation: snapshot.foregroundObservation,
+						status: snapshot.status,
+						acknowledged: snapshot.acknowledged,
+						claimed: snapshot.claimed,
+						source: snapshot.source,
+					};
+		},
+	);
+
+	const appCommandStagesBySender = new Map<number, string>();
+	ipcMain.on('test:app-command-stage', (event, stage: unknown) => {
+		assertTrustedAppSender(event);
+		if (typeof stage === 'string' && stage.length <= 200) {
+			appCommandStagesBySender.set(event.sender.id, stage);
+		}
+	});
+
+	ipcMain.handle(
+		'test:send-app-command',
+		async (event, command: AppCommand) => {
+			assertTrustedAppSender(event);
+			const requestId = randomUUID();
+			const requestSenderId = event.sender.id;
+			appCommandStagesBySender.set(requestSenderId, `dispatched:${command}`);
+			await new Promise<void>((resolve, reject) => {
+				const timeout = setTimeout(() => {
+					const stage =
+						appCommandStagesBySender.get(requestSenderId) ?? 'unknown';
+					cleanup();
+					reject(
+						new Error(
+							`renderer app command completion timed out (last stage: ${stage})`,
+						),
+					);
+					// App commands acknowledge their real asynchronous completion. Large
+					// sparse saves and other bounded host operations can legitimately exceed
+					// Playwright's per-action timeout on a loaded CI runner, so this test-only
+					// transport deadline follows the enclosing 30-second scenario budget.
+				}, 20_000);
+				const onComplete = (
+					event: Electron.IpcMainEvent,
+					replyRequestId: unknown,
+					errorMessage: unknown,
+				) => {
+					assertTrustedAppSender(event);
+					if (
+						event.sender.id !== requestSenderId ||
+						replyRequestId !== requestId
+					) {
+						return;
+					}
+					cleanup();
+					if (typeof errorMessage === 'string' && errorMessage.length > 0) {
+						reject(new Error(errorMessage));
+					} else {
+						resolve();
+					}
+				};
+				const cleanup = () => {
+					clearTimeout(timeout);
+					ipcMain.removeListener('test:app-command-complete', onComplete);
+					appCommandStagesBySender.delete(requestSenderId);
+				};
+				ipcMain.on('test:app-command-complete', onComplete);
+				event.sender.send('app:command', command, requestId);
+			});
+		},
+	);
+
+	ipcMain.handle('test:reset-workspace-command-records', (event) => {
+		assertBoundServerUiEvent(event);
+		if (!serverTerminalAuthority)
+			throw new Error('embedded server is unavailable');
+		serverTerminalAuthority.resetWorkspaceCommandTestRecords();
+	});
+
+	ipcMain.handle(
+		'test:refuse-project-creations',
+		(event, count: unknown) => {
+			assertBoundServerUiEvent(event);
+			if (!serverTerminalAuthority)
+				throw new Error('embedded server is unavailable');
+			if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0)
+				throw new TypeError('refusal count is invalid');
+			serverTerminalAuthority.refuseProjectCreationsForTest(count);
+		},
+	);
+
+	ipcMain.handle('test:close-renderer-connections', async (event) => {
+		assertBoundServerUiEvent(event);
+		if (!serverTerminalAuthority)
+			throw new Error('embedded server is unavailable');
+		return await serverTerminalAuthority.closeRendererConnectionsForTest();
+	});
+
+	ipcMain.handle('test:get-workspace-command-records', (event) => {
+		assertBoundServerUiEvent(event);
+		if (!serverTerminalAuthority)
+			throw new Error('embedded server is unavailable');
+		return serverTerminalAuthority.getWorkspaceCommandTestRecords();
+	});
+
+	ipcMain.handle(
+		'test:set-ai-tab-metadata-mock',
+		(
+			event,
+			mock: {
+				error?: string | null;
+				models?: AiTabMetadataModel[];
+				hold?: boolean;
+				noteResult?: string;
+				titleResult?: string;
+			},
+		) => {
+			assertBoundServerUiEvent(event);
+			aiTabMetadataService.setTestMock(mock);
+		},
+	);
+
+	// Test-only session source: e2e publishes snapshots through the same bridge
+	// the extension host uses, so binding, scoping, and mapping are real.
+	ipcMain.handle(
+		'test:publish-agent-sessions',
+		async (
+			event,
+			payload?: {
+				sourceId?: unknown;
+				harnesses?: unknown;
+				publication?: unknown;
+			},
+		) => {
+			assertBoundServerUiEvent(event);
+			const bridge = serverTerminalAuthority?.agentBridge;
+			if (bridge === undefined)
+				throw new Error('The server agent bridge is not available.');
+			const sourceId =
+				typeof payload?.sourceId === 'string'
+					? payload.sourceId
+					: 'com.terminay.e2e/agents';
+			const extensionId = sourceId.slice(0, sourceId.indexOf('/'));
+			const harnesses = Array.isArray(payload?.harnesses)
+				? (payload.harnesses as { id: string; displayName: string }[])
+				: [{ id: 'fixture', displayName: 'Fixture Agent' }];
+			if (!bridge.hasSource(sourceId))
+				bridge.registerSource(
+					{ id: sourceId, extensionId, harnesses },
+					harnesses.map((harness) => harness.id),
+				);
+			const result = await bridge.publish({
+				extensionId,
+				sourceId,
+				publication: (payload?.publication ?? {}) as Record<string, unknown[]>,
+			});
+			await bridge.settled();
+			return result.ok;
+		},
+	);
+	ipcMain.handle(
+		'test:agent-terminal-shell-pid',
+		(event, terminalSessionId?: unknown) => {
+			assertBoundServerUiEvent(event);
+			if (typeof terminalSessionId !== 'string') return null;
+			return (
+				serverTerminalAuthority?.agents.terminal(terminalSessionId)?.shellPid ??
+				null
+			);
+		},
+	);
+}
+
+app.on('browser-window-created', (_event, window) => {
+	// Windows are menu-less by default; createWindow opts project hosts back in.
+	applyWindowMenu(window, {
+		isProjectHost: false,
+		menu: null,
+		platform: process.platform,
+	});
+	void desktopDiagnostics.record(
+		{
+			component: 'main',
+			event: 'main.window.created',
+			fields: { windowId: window.id },
+			severity: 'info',
+			source: 'window-lifecycle',
+		},
+		{ channel: 'lifecycle' },
+	);
+});
+
+app.on('web-contents-created', (_event, contents) => {
+	const webContentsId = contents.id;
+	bindWebContentsDiagnostics({
+		app,
+		contents,
+		diagnostics: desktopDiagnostics,
+	});
+	bindAppShortcuts(contents);
+
+	contents.once('destroyed', () => {
+		if (webContentsId === projectDragSourceWebContentsId) {
+			stopProjectDragTracking();
+		}
+		detachSessionsForWebContents(webContentsId);
+		fileWatchService.disposeSubscriber(webContentsId);
+	});
+});
+
+const handleBeforeQuit = createGracefulQuitHandler({
+	app: {
+		// After shutdown settles, a requested restart to update hands the final
+		// quit to the updater so it installs and relaunches.
+		quit: () =>
+			appUpdater === null
+				? app.quit()
+				: appUpdater.finishQuit(() => app.quit()),
+	},
+	shutdown: async () => {
+		let clean = false;
+		try {
+			await desktopDiagnostics.record(
+				{
+					component: 'local-server',
+					event: 'local-server.stopping',
+					severity: 'info',
+					source: 'local-server',
+				},
+				{ channel: 'lifecycle' },
+			);
+			// Stopping the endpoint revokes every capability. Terminals that are
+			// being kept must still hold theirs when the next process starts, so
+			// the saved copy stops following before that happens.
+			removeMcpCapabilityPersistence?.();
+			removeMcpCapabilityPersistence = undefined;
+			if (mcpCapabilityPruneTimer !== undefined) {
+				clearInterval(mcpCapabilityPruneTimer);
+				mcpCapabilityPruneTimer = undefined;
+			}
+			if (endTerminalsOnQuit) {
+				await serverTerminalAuthority?.endAllTerminalSessions();
+				rmSync(getMcpCapabilityFilePath(), { force: true });
+			}
+			await Promise.all([
+				stopMcpControlEndpoint(),
+				desktopRemoteExposure?.shutdown(),
+				serverTerminalAuthority?.shutdown(),
+			]);
+			await desktopDiagnostics.record(
+				{
+					component: 'local-server',
+					event: 'local-server.stopped',
+					severity: 'info',
+					source: 'local-server',
+				},
+				{ channel: 'lifecycle' },
+			);
+			clean = true;
+		} catch (error) {
+			await desktopDiagnostics.record(
+				{
+					component: 'local-server',
+					event: 'local-server.failed',
+					message: error,
+					severity: 'error',
+					source: 'local-server',
+				},
+				{ channel: 'lifecycle' },
+			);
+			throw error;
+		} finally {
+			unbindFatalProcessDiagnostics();
+			unbindAppChildDiagnostics();
+			await desktopPerformanceLogging.close();
+			await desktopDiagnostics.close({ clean });
+		}
+	},
+	onShutdownError: (error) => {
+		console.error('[shutdown] graceful cleanup failed', error);
+	},
+});
+
+app.on('before-quit', (event) => {
+	const runningTerminalCount = getRunningTerminalCount();
+	const keepsTerminals =
+		serverTerminalAuthority?.keepsTerminalsAcrossRestart === true;
+	const plan = isQuitConfirmed
+		? 'quit'
+		: planAppQuit({
+				keepsTerminals,
+				restartToUpdate: appUpdater?.isRestartToUpdateRequested() === true,
+				runningTerminalCount,
+			});
+	if (plan === 'ask-keep-or-end' || plan === 'ask-before-ending') {
+		event.preventDefault();
+		if (quitConfirmationPending) return;
+		quitConfirmationPending = true;
+		const target = BrowserWindow.getFocusedWindow() ?? getFirstAppWindow();
+		const dialogOptions =
+			plan === 'ask-keep-or-end'
+				? createAppQuitConfirmationDialog(
+						runningTerminalCount,
+						backgroundTerminalLimitMs(
+							embeddedServerSettings.settings.keepTerminalsAfterQuit,
+						),
+					)
+				: createCloseConfirmationDialog('app', runningTerminalCount);
+		const confirmation = target
+			? dialog.showMessageBox(target, dialogOptions)
+			: dialog.showMessageBox(dialogOptions);
+		void confirmation
+			.then(({ response }) => {
+				if (plan === 'ask-keep-or-end') {
+					const choice = appQuitChoice(response);
+					if (choice === 'cancel') {
+						appUpdater?.cancelRestartToUpdate();
+						return;
+					}
+					endTerminalsOnQuit = choice === 'end';
+				} else if (response !== 0) {
+					appUpdater?.cancelRestartToUpdate();
+					return;
+				}
+				isQuitConfirmed = true;
+				isQuitting = true;
+				app.quit();
+			})
+			.catch((error) => console.error('[app] quit confirmation failed', error))
+			.finally(() => {
+				quitConfirmationPending = false;
+			});
+		return;
+	}
+	isQuitConfirmed = true;
+	isQuitting = true;
+	parakeetRuntime.stop();
+	handleBeforeQuit(event);
+});
+
+registerFileViewerIpcHandlers({
+	assertTrustedSender: assertTrustedAppSender,
+	fileBufferService,
+	fileWatchService,
+	gitDiffService,
+	ipcMain,
+});
+
+app.on('window-all-closed', () => {
+	if (process.platform !== 'darwin') {
+		app.quit();
+	}
+});
+
+app.on('activate', () => {
+	if (!isQuitting && BrowserWindow.getAllWindows().length === 0) {
+		createWindow();
+	}
+});
+
+async function completeDesktopStartup(): Promise<void> {
+	const embeddedStartupWindow = await embeddedRuntimeReady;
+	app.setName('Terminay');
+	// Electron safeStorage can report unavailable before app readiness even when
+	// the OS-backed protector is available immediately afterwards. Keep the
+	// server vault locked during module composition, then unlock it inside the
+	// readiness gate before admitting any renderer or reporting the Local server
+	// ready. safeStorage owns the OS interaction; no reusable passphrase or key
+	// material is supplied by Terminay in embedded mode.
+	beginStartupPhase('vault-unlock');
+	if (embeddedVault.status().state === 'locked') {
+		await embeddedVault.unlock({ secret: new Uint8Array() });
+	}
+	endStartupPhase('vault-unlock');
+	powerMonitor.on('resume', () => {
+		void desktopDiagnostics.cleanup();
+		// The scheduler arms one timer and never polls, so a machine that slept
+		// through a due time is told here rather than waiting for that timer.
+		void serverTerminalAuthority?.composition.automationScheduler?.wake();
+	});
+	await desktopDiagnostics.record(
+		{
+			component: 'main',
+			event: 'main.ready',
+			severity: 'info',
+			source: 'main-lifecycle',
+		},
+		{ channel: 'lifecycle' },
+	);
+	beginStartupPhase('native-menu');
+	ensureNodePtySpawnHelperIsExecutable();
+	setDockIcon();
+	await desktopPerformanceLogging.restore();
+	createAppMenu();
+	endStartupPhase('native-menu');
+	beginStartupPhase('agent-integration');
+	try {
+		await applyAgentIntegrationSetting(readTerminalSettings());
+		await desktopDiagnostics.record(
+			{
+				component: 'local-server',
+				event: 'local-server.ready',
+				severity: 'info',
+				source: 'local-server',
+			},
+			{ channel: 'lifecycle' },
+		);
+	} catch (error) {
+		await desktopDiagnostics.record(
+			{
+				component: 'local-server',
+				event: 'local-server.failed',
+				message: error,
+				severity: 'error',
+				source: 'local-server',
+			},
+			{ channel: 'lifecycle' },
+		);
+		throw error;
+	}
+	endStartupPhase('agent-integration');
+	desktopStartupTimeline.begin('ui-handoff');
+	await openStartupWindow(embeddedStartupWindow);
+	desktopStartupTimeline.end('ui-handoff');
+	// Hosted signaling is a network round-trip, so it never delays the window.
+	void exposeOnStartup(
+		readEmbeddedRemoteAccessSettings().exposeOnStartup,
+		desktopRemoteExposure,
+	).catch((error: unknown) => {
+		console.error('[main] Automatic remote exposure failed', error);
+	});
+}
+
+async function recoverFailedDesktopBootstrap(error: unknown): Promise<void> {
+	console.error('[main] Desktop bootstrap failed', error);
+	// Close the phase that was running so the timeline identifies where startup
+	// failed, and stop repainting before the recovery document takes the window.
+	desktopStartupTimeline.fail('startup failed');
+	stopStartupPhasePainting();
+	const window = embeddedStartupWindowForRecovery;
+	if (window === null || window.isDestroyed()) {
+		// There is no native surface on which a recovery state could be rendered.
+		// Contain the rejected readiness chain rather than allowing Electron to
+		// produce its own uncaught-error dialog.
+		void recordCanonicalRecoveryDiagnostic(error);
+		return;
+	}
+	const windowWebContentsId = window.webContents.id;
+	// A cause the user can act on is said in full. It names paths, so it is
+	// given more room than the general message.
+	const placementFailure =
+		error instanceof ControlSocketPlacementError ? error : undefined;
+	// The recovery state records the message it shows, which for this cause
+	// carries the paths, the lengths, and the reason.
+	await showCanonicalLaunchRecovery({
+		window,
+		error:
+			placementFailure ??
+			new Error(
+				'Terminay could not finish starting. Relaunch to retry. Technical details were recorded in Terminay diagnostics.',
+			),
+		...(placementFailure === undefined ? {} : { messageLimit: 2_000 }),
+		retry: async () => {
+			// A failed main-process composition may have partially initialized native
+			// services. Relaunching is the bounded recovery boundary; it avoids
+			// reusing those services or presenting a blank native shell.
+			app.relaunch();
+			app.exit(0);
+		},
+		onDiagnostic: recordCanonicalRecoveryDiagnostic,
+		onRecoveryState: (active) => {
+			if (active) launchRecoveryWebContents.add(windowWebContentsId);
+			else launchRecoveryWebContents.delete(windowWebContentsId);
+		},
+	});
+}
+
+void app
+	.whenReady()
+	.then(completeDesktopStartup)
+	.catch((error) => recoverFailedDesktopBootstrap(error));

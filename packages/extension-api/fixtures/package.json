@@ -1,0 +1,37 @@
+{
+  "name": "@terminay/extension-conformance-fixture",
+  "version": "1.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./dist/extension.js"
+  },
+  "terminay": {
+    "manifestVersion": 1,
+    "id": "dev.terminay.fixture",
+    "displayName": "Fixture Agent Extension",
+    "description": "A portable extension host fixture.",
+    "api": "^3.0.0",
+    "engines": {
+      "terminay": ">=1.0.0",
+      "node": ">=22"
+    },
+    "entrypoint": "dist/extension.js",
+    "permissions": [
+      "agent-observation"
+    ],
+    "contributes": {
+      "agentSessionSources": [
+        {
+          "id": "dev.terminay.fixture/agents",
+          "displayName": "Fixture Agents",
+          "harnesses": [
+            {
+              "id": "fixture-agent",
+              "displayName": "Fixture Agent"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

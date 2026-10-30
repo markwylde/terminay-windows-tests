@@ -1,0 +1,1773 @@
+import type { JsonValue } from './errors.js';
+import { assertJsonValue } from './json.js';
+
+export const TERMINAY_HOST_CONTEXT_SCHEMA_VERSION = 1 as const;
+export const TERMINAY_HOST_BOOTSTRAP_VERSION = 1 as const;
+export const TERMINAY_HOST_BRIDGE_VERSION = 1 as const;
+export const TERMINAY_HOST_BYTE_ENDPOINT_VERSION = 1 as const;
+export const TERMINAY_UI_BUNDLE_FORMAT_VERSION = 1 as const;
+
+export const TERMINAY_HOST_CAPABILITY_NAMES = [
+	'nativeWindows',
+	'nativeMenus',
+	'filePicker',
+	'clipboardWrite',
+	'notifications',
+	'updater',
+	'osIntegration',
+	/** Many server connections per window: list, attach, detach, and a
+	 * host-persisted composition. Bytes for an attached connection travel on
+	 * the host's byte bridge keyed by connection id. */
+	'connections',
+] as const;
+
+export type TerminayHostKind = 'browser' | 'desktop';
+export type TerminayHostCapability =
+	(typeof TERMINAY_HOST_CAPABILITY_NAMES)[number];
+export type TerminayHostCapabilityVersions = Readonly<
+	Partial<Record<TerminayHostCapability, number>>
+>;
+
+export interface TerminayVersionRange {
+	readonly minimum: number;
+	readonly maximum: number;
+}
+
+export interface TerminayHostCompatibilityRequirements {
+	readonly bootstrap: TerminayVersionRange;
+	readonly bundleFormat: TerminayVersionRange;
+	readonly hostBridge: TerminayVersionRange;
+	readonly byteEndpoint: TerminayVersionRange;
+	readonly requiredCapabilities: Readonly<
+		Partial<Record<TerminayHostCapability, TerminayVersionRange>>
+	>;
+	readonly optionalCapabilities: Readonly<
+		Partial<Record<TerminayHostCapability, TerminayVersionRange>>
+	>;
+}
+
+export interface TerminayHostRuntimeSupport {
+	readonly bootstrapVersion: number;
+	readonly bundleFormatVersion: number;
+	readonly hostBridgeVersion: number;
+	readonly byteEndpointVersion: number;
+	readonly capabilities: TerminayHostCapabilityVersions;
+}
+
+export interface TerminayHostContext {
+	readonly schemaVersion: typeof TERMINAY_HOST_CONTEXT_SCHEMA_VERSION;
+	readonly bootstrapVersion: typeof TERMINAY_HOST_BOOTSTRAP_VERSION;
+	readonly sourceId: string;
+	readonly windowId: string;
+	readonly serverId: string;
+	readonly profileId: string;
+	readonly bundleId: string;
+	readonly applicationProtocolVersion: string;
+	readonly hostKind: TerminayHostKind;
+	readonly hostBridgeVersion: number;
+	readonly byteEndpointVersion: number;
+	readonly capabilities: TerminayHostCapabilityVersions;
+	/** Sanitized Desktop connection-menu metadata. It deliberately excludes
+	 * origins, credentials, pairing fragments, and all workspace data. */
+	readonly profile?: TerminayHostConnectionProfile;
+	readonly profiles?: readonly TerminayHostConnectionProfile[];
+	/** Present when the host supports the `connections` capability. */
+	readonly composition?: TerminayWorkspaceComposition;
+}
+
+export type TerminayHostConnectionStatus =
+	| 'connected'
+	| 'connecting'
+	| 'offline'
+	| 'unavailable'
+	| 'unauthenticated'
+	| 'incompatible';
+
+export interface TerminayHostConnectionProfile {
+	readonly id: string;
+	readonly isLocal: boolean;
+	readonly label: string;
+	readonly status: TerminayHostConnectionStatus;
+	/** Stable server identity when the host knows it; absent before first pairing completes. */
+	readonly serverId?: string;
+	/** True while this window holds a live or pending connection to the profile. */
+	readonly attached?: boolean;
+}
+
+/** One window's client-owned composition: the primary connection whose bundle
+ * runs, the attached connections with the workspace view each shows, and the
+ * interleaved project tab order. Persisted by the host like window geometry;
+ * never sent to a server. */
+export interface TerminayWorkspaceComposition {
+	readonly version: 1;
+	readonly primaryProfileId: string;
+	readonly attached: readonly Readonly<{
+		profileId: string;
+		viewId?: string;
+	}>[];
+	readonly tabOrder: readonly Readonly<{
+		serverId: string;
+		projectId: string;
+	}>[];
+}
+
+export type TerminayHostCompatibilityFailure = Readonly<{
+	compatible: false;
+	component:
+		| 'bootstrap'
+		| 'bundle-format'
+		| 'host-bridge'
+		| 'byte-endpoint'
+		| 'host-capability';
+	code: 'below-minimum' | 'above-maximum' | 'missing-capability';
+	capability?: TerminayHostCapability;
+	required: TerminayVersionRange;
+	actual?: number;
+}>;
+
+export type TerminayHostCompatibilityResult =
+	| Readonly<{
+			compatible: true;
+			unavailableOptionalCapabilities: readonly TerminayHostCapability[];
+	  }>
+	| TerminayHostCompatibilityFailure;
+
+export interface TerminayUiBundleCompatibilityManifest {
+	readonly schemaVersion: 1;
+	readonly bundleId: string;
+	readonly protocolVersion: string;
+	readonly bundleFormatVersion: typeof TERMINAY_UI_BUNDLE_FORMAT_VERSION;
+	readonly hostCompatibility: TerminayHostCompatibilityRequirements;
+}
+
+export type TerminayBundleCompatibilityResult =
+	| TerminayHostCompatibilityResult
+	| Readonly<{
+			compatible: false;
+			component: 'bundle-manifest' | 'bundle-binding' | 'application-protocol';
+			code: 'invalid-manifest' | 'identity-mismatch' | 'version-mismatch';
+			message: string;
+	  }>;
+
+export interface TerminayHostBytePacket {
+	readonly type: 'terminay.host-byte';
+	readonly version: typeof TERMINAY_HOST_BYTE_ENDPOINT_VERSION;
+	readonly serverId: string;
+	readonly frame: Uint8Array;
+}
+
+export type TerminayHostRouteDisposition =
+	| 'in-page'
+	| 'native-window'
+	| 'browser-tab';
+
+export const TERMINAY_HOST_MENU_COMMANDS = [
+	'clear-terminal',
+	'close-active',
+	'edit-active-project',
+	'edit-active-tab',
+	'new-project',
+	'new-terminal',
+	'open-command-bar',
+	'open-extensions',
+	'open-macros',
+	'open-performance-log',
+	'open-recordings',
+	'open-remote-control',
+	'open-settings',
+	'popout-active',
+	'save-active',
+	'set-project-root-folder-to-working-directory',
+	'show-dashboard',
+	'split-horizontal',
+	'split-vertical',
+	'start-dictation',
+	'toggle-file-explorer-sidebar',
+	'toggle-status-bar',
+] as const;
+
+export type TerminayHostMenuCommand =
+	(typeof TERMINAY_HOST_MENU_COMMANDS)[number];
+
+export type TerminayHostMenuAccelerator = Readonly<{
+	command: TerminayHostMenuCommand;
+	accelerator: string;
+}>;
+
+export type TerminayHostEvent = Readonly<{
+	schemaVersion: typeof TERMINAY_HOST_CONTEXT_SCHEMA_VERSION;
+	bridgeVersion: typeof TERMINAY_HOST_BRIDGE_VERSION;
+	sourceId: string;
+	windowId: string;
+	profileId: string;
+	serverId: string;
+	event:
+		| Readonly<{
+				type: 'menu.command';
+				command: TerminayHostMenuCommand;
+		  }>
+		| Readonly<{
+				type: 'terminal.zoom';
+				zoomLevel: number;
+		  }>
+		| Readonly<{
+				type: 'workspace.drag-state';
+				active: boolean;
+		  }>
+		| Readonly<{
+				/** A project tab torn off another window is over this window's
+				 * project bar (`hover`), has left it (`leave`), or was released on
+				 * it (`drop`). `x` is the pointer's distance from the window's left
+				 * edge. Presentation only: the project moves through `project.move`. */
+				type: 'workspace.drop-target';
+				phase: TerminayWorkspaceDropPhase;
+				x: number;
+				serverId: string;
+				projectId: string;
+				title: string;
+				emoji: string;
+				color: string;
+		  }>
+		| Readonly<{
+				/** The native window entered or left fullscreen, where macOS hides
+				 * the traffic lights the tab bar otherwise makes room for. */
+				type: 'window.fullscreen-state';
+				fullScreen: boolean;
+		  }>
+		| Readonly<{
+				type: 'device.settings.changed';
+				settings: JsonValue;
+		  }>
+		| Readonly<{
+				type: 'diagnostics.performance-logging.changed';
+				enabled: boolean;
+		  }>
+		| Readonly<{
+				/** The updater's status changed outside the renderer's own polling;
+				 * the renderer re-reads it with `updater.check`. */
+				type: 'updater.status.changed';
+		  }>
+		| Readonly<{
+				/** A bounded, main-computed projection of the startup timeline,
+				 * lightweight samples, and per-terminal outcomes. The window receives
+				 * values only; it never receives a way to read diagnostics. */
+				type: 'diagnostics.performance-snapshot.changed';
+				snapshot: JsonValue;
+		  }>
+		| Readonly<{
+				/** Desktop pairing is waiting for the exposing host to approve the
+				 * match code shown here. The code is displayed on both devices. */
+				type: 'connection.pairing-approval';
+				attemptId: string;
+				deviceName: string;
+				matchCode: string;
+				expiresAt: string;
+		  }>
+		| Readonly<{
+				/** The host's remembered profiles or their status changed. */
+				type: 'connections.changed';
+				profiles: readonly TerminayHostConnectionProfile[];
+		  }>
+		| Readonly<{
+				type: 'connection.pairing-progress';
+				attemptId: string;
+				state: TerminayPairingProgressState;
+		  }>;
+}>;
+
+/**
+ * What a Desktop pairing attempt reports after its match code is shown.
+ * `connection-recovered` only ends a `connection-degraded` notice raised
+ * before enrollment finished; later phases report their own state instead.
+ */
+export const TERMINAY_PAIRING_PROGRESS_STATES = Object.freeze([
+	'connecting',
+	'connected',
+	'connection-degraded',
+	'connection-recovered',
+	'connection-lost',
+] as const);
+export type TerminayPairingProgressState =
+	(typeof TERMINAY_PAIRING_PROGRESS_STATES)[number];
+
+export type TerminayHostAction =
+	| Readonly<{
+			/** Desktop consumes the one-time pairing fragment in the privileged
+			 * host. No pairing secret or durable credential returns to the
+			 * renderer. */
+			type: 'connection.pair';
+			attemptId: string;
+			pairingUrl: string;
+	  }>
+	| Readonly<{
+			/** Abandon the named pairing attempt. An attempt that already finished,
+			 * or was never started by this window, is left alone. */
+			type: 'connection.pair-cancel';
+			attemptId: string;
+	  }>
+	| Readonly<{
+			type: 'route.present';
+			route: string;
+			disposition: TerminayHostRouteDisposition;
+			logicalViewId?: string;
+	  }>
+	| Readonly<{ type: 'route.focus'; presentationId: string }>
+	| Readonly<{ type: 'route.close'; presentationId?: string }>
+	| Readonly<{ type: 'menu.invoke'; command: TerminayHostMenuCommand }>
+	| Readonly<{
+			type: 'menu.accelerators.update';
+			accelerators: readonly TerminayHostMenuAccelerator[];
+	  }>
+	| Readonly<{ type: 'device.settings.update'; settings: JsonValue }>
+	| Readonly<{
+			type: 'file.choose';
+			multiple?: boolean;
+			accept?: readonly string[];
+	  }>
+	| Readonly<{ type: 'clipboard.write'; text: string }>
+	| Readonly<{ type: 'notification.show'; title: string; body?: string }>
+	/** This window's notification count for the application icon badge. The
+	 * host sums its windows; the count names no terminal, project, or server. */
+	| Readonly<{ type: 'badge.count.set'; count: number }>
+	| Readonly<{ type: 'updater.check' }>
+	/** Restart into an update the host has already downloaded and verified. */
+	| Readonly<{ type: 'updater.install' }>
+	| Readonly<{
+			/** A bounded preview payload. The host alone chooses its destination. */
+			type: 'preview.download';
+			filename: string;
+			mimeType: string;
+			bytesBase64: string;
+	  }>
+	| Readonly<{ type: 'os.open-external'; url: string }>
+	| Readonly<{ type: 'os.reveal'; token: string }>
+	| Readonly<{
+			type: 'workspace.drag.start';
+			viewId: string;
+			/** The project being dragged, so a window it is held over can show it. */
+			projectId: string;
+			preview: Readonly<{
+				title: string;
+				emoji: string;
+				color: string;
+				width: number;
+			}>;
+	  }>
+	| Readonly<{ type: 'workspace.drag.end' }>
+	| Readonly<{
+			type: 'diagnostics.performance-logging.set';
+			enabled: boolean;
+	  }>
+	| Readonly<{ type: 'diagnostics.performance-snapshot.read' }>
+	| Readonly<{ type: 'connections.list' }>
+	| Readonly<{
+			/** Open a transport to a remembered profile for this window. The host
+			 * answers with a connection id whose bytes flow on the byte bridge. */
+			type: 'connections.attach';
+			profileId: string;
+	  }>
+	| Readonly<{ type: 'connections.detach'; profileId: string }>
+	| Readonly<{
+			/** Change a remembered remote profile's display label. */
+			type: 'connections.rename';
+			profileId: string;
+			label: string;
+	  }>
+	| Readonly<{
+			/** Remove a remembered remote profile and this device's credential
+			 * for it. Server-side access is untouched: that is revocation. */
+			type: 'connections.forget';
+			profileId: string;
+	  }>
+	| Readonly<{
+			/** Show a remembered server, or Local, in the requesting window. */
+			type: 'connections.select';
+			profileId: string;
+	  }>
+	| Readonly<{
+			/** Open a new window on a remembered server, or on Local. */
+			type: 'connections.open-window';
+			profileId: string;
+	  }>
+	| Readonly<{
+			type: 'connections.composition.write';
+			composition: TerminayWorkspaceComposition;
+	  }>;
+
+/** Result of `connections.attach`. */
+export interface TerminayHostConnectionAttachment {
+	readonly connectionId: string;
+	readonly profileId: string;
+	readonly serverId?: string;
+}
+
+export interface TerminayHostActionRequest {
+	readonly schemaVersion: typeof TERMINAY_HOST_CONTEXT_SCHEMA_VERSION;
+	readonly bridgeVersion: typeof TERMINAY_HOST_BRIDGE_VERSION;
+	readonly sourceId: string;
+	readonly windowId: string;
+	readonly profileId: string;
+	readonly serverId: string;
+	readonly userGesture: true;
+	readonly action: TerminayHostAction;
+}
+
+const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+export type TerminayWorkspaceDropPhase = 'hover' | 'leave' | 'drop';
+const WORKSPACE_DROP_PHASES = new Set<TerminayWorkspaceDropPhase>([
+	'hover',
+	'leave',
+	'drop',
+]);
+const BUNDLE_ID = /^[A-Za-z0-9_-]{8,128}$/u;
+const MAX_VERSION = 65_535;
+const MAX_FRAME_BYTES = 16 * 1024 * 1024;
+/** Largest per-window count `badge.count.set` accepts. */
+export const TERMINAY_HOST_MAX_BADGE_COUNT = 9_999;
+const CAPABILITY_NAMES = new Set<string>(TERMINAY_HOST_CAPABILITY_NAMES);
+const MENU_COMMANDS = new Set<string>(TERMINAY_HOST_MENU_COMMANDS);
+
+export function parseTerminayHostMenuCommand(
+	value: unknown,
+): TerminayHostMenuCommand {
+	if (typeof value !== 'string' || !MENU_COMMANDS.has(value))
+		throw new TypeError('host menu command is invalid');
+	return value as TerminayHostMenuCommand;
+}
+
+export function parseTerminayHostEvent(
+	value: unknown,
+	contextValue: unknown,
+): TerminayHostEvent {
+	const context = parseTerminayHostContext(contextValue);
+	const input = record(value, 'host event');
+	exactKeys(
+		input,
+		[
+			'schemaVersion',
+			'bridgeVersion',
+			'sourceId',
+			'windowId',
+			'profileId',
+			'serverId',
+			'event',
+		],
+		'host event',
+	);
+	if (
+		input.schemaVersion !== TERMINAY_HOST_CONTEXT_SCHEMA_VERSION ||
+		input.bridgeVersion !== TERMINAY_HOST_BRIDGE_VERSION
+	)
+		throw new TypeError('host event version is unsupported');
+	for (const [field, expected] of [
+		['sourceId', context.sourceId],
+		['windowId', context.windowId],
+		['profileId', context.profileId],
+		['serverId', context.serverId],
+	] as const) {
+		if (input[field] !== expected)
+			throw new TypeError(`host event ${field} is outside its binding`);
+	}
+	const event = record(input.event, 'host event payload');
+	let parsedEvent: TerminayHostEvent['event'];
+	if (event.type === 'menu.command') {
+		exactKeys(event, ['type', 'command'], 'host menu event');
+		parsedEvent = Object.freeze({
+			type: 'menu.command',
+			command: parseTerminayHostMenuCommand(event.command),
+		});
+	} else if (event.type === 'terminal.zoom') {
+		exactKeys(event, ['type', 'zoomLevel'], 'host terminal zoom event');
+		if (
+			typeof event.zoomLevel !== 'number' ||
+			!Number.isSafeInteger(event.zoomLevel) ||
+			event.zoomLevel < -5 ||
+			event.zoomLevel > 10
+		)
+			throw new TypeError('host terminal zoom level is invalid');
+		parsedEvent = Object.freeze({
+			type: 'terminal.zoom',
+			zoomLevel: event.zoomLevel,
+		});
+	} else if (event.type === 'workspace.drag-state') {
+		exactKeys(event, ['type', 'active'], 'host workspace drag event');
+		if (typeof event.active !== 'boolean')
+			throw new TypeError('host workspace drag state is invalid');
+		parsedEvent = Object.freeze({
+			type: 'workspace.drag-state',
+			active: event.active,
+		});
+	} else if (event.type === 'workspace.drop-target') {
+		exactKeys(
+			event,
+			[
+				'type',
+				'phase',
+				'x',
+				'serverId',
+				'projectId',
+				'title',
+				'emoji',
+				'color',
+			],
+			'host workspace drop target event',
+		);
+		if (
+			!WORKSPACE_DROP_PHASES.has(event.phase as TerminayWorkspaceDropPhase) ||
+			typeof event.x !== 'number' ||
+			!Number.isSafeInteger(event.x) ||
+			event.x < 0 ||
+			event.x > 100_000 ||
+			typeof event.color !== 'string' ||
+			!/^#[0-9a-fA-F]{3,8}$/u.test(event.color)
+		)
+			throw new TypeError('host workspace drop target is invalid');
+		parsedEvent = Object.freeze({
+			type: 'workspace.drop-target',
+			phase: event.phase as TerminayWorkspaceDropPhase,
+			x: event.x,
+			serverId: identifier(event.serverId, 'drop target server id', ID),
+			projectId: identifier(event.projectId, 'drop target project id', ID),
+			title: boundedText(event.title, 'drop target title', 512, true),
+			emoji: boundedText(event.emoji, 'drop target emoji', 64, true),
+			color: event.color,
+		});
+	} else if (event.type === 'window.fullscreen-state') {
+		exactKeys(event, ['type', 'fullScreen'], 'host window fullscreen event');
+		if (typeof event.fullScreen !== 'boolean')
+			throw new TypeError('host window fullscreen state is invalid');
+		parsedEvent = Object.freeze({
+			type: 'window.fullscreen-state',
+			fullScreen: event.fullScreen,
+		});
+	} else if (event.type === 'device.settings.changed') {
+		exactKeys(event, ['type', 'settings'], 'host device settings event');
+		assertJsonValue(event.settings);
+		parsedEvent = Object.freeze({
+			type: 'device.settings.changed',
+			settings: event.settings,
+		});
+	} else if (event.type === 'diagnostics.performance-logging.changed') {
+		exactKeys(event, ['type', 'enabled'], 'host performance logging event');
+		if (typeof event.enabled !== 'boolean')
+			throw new TypeError('host performance logging state is invalid');
+		parsedEvent = Object.freeze({
+			type: 'diagnostics.performance-logging.changed',
+			enabled: event.enabled,
+		});
+	} else if (event.type === 'updater.status.changed') {
+		exactKeys(event, ['type'], 'host updater status event');
+		parsedEvent = Object.freeze({ type: 'updater.status.changed' });
+	} else if (event.type === 'diagnostics.performance-snapshot.changed') {
+		exactKeys(event, ['type', 'snapshot'], 'host performance snapshot event');
+		assertJsonValue(event.snapshot);
+		parsedEvent = Object.freeze({
+			type: 'diagnostics.performance-snapshot.changed',
+			snapshot: event.snapshot,
+		});
+	} else if (event.type === 'connection.pairing-approval') {
+		exactKeys(
+			event,
+			['type', 'attemptId', 'deviceName', 'matchCode', 'expiresAt'],
+			'host pairing approval event',
+		);
+		if (
+			typeof event.deviceName !== 'string' ||
+			event.deviceName.length === 0 ||
+			event.deviceName.length > 128 ||
+			typeof event.matchCode !== 'string' ||
+			!/^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{5}$/u.test(event.matchCode) ||
+			typeof event.expiresAt !== 'string' ||
+			!Number.isFinite(Date.parse(event.expiresAt))
+		)
+			throw new TypeError('host pairing approval event is invalid');
+		parsedEvent = Object.freeze({
+			type: 'connection.pairing-approval',
+			attemptId: identifier(event.attemptId, 'pairing attempt id', ID),
+			deviceName: event.deviceName,
+			matchCode: event.matchCode,
+			expiresAt: event.expiresAt,
+		});
+	} else if (event.type === 'connection.pairing-progress') {
+		exactKeys(
+			event,
+			['type', 'attemptId', 'state'],
+			'host pairing progress event',
+		);
+		if (
+			typeof event.state !== 'string' ||
+			!(TERMINAY_PAIRING_PROGRESS_STATES as readonly string[]).includes(
+				event.state,
+			)
+		)
+			throw new TypeError('host pairing progress event is invalid');
+		parsedEvent = Object.freeze({
+			type: 'connection.pairing-progress',
+			attemptId: identifier(event.attemptId, 'pairing attempt id', ID),
+			state: event.state as TerminayPairingProgressState,
+		});
+	} else if (event.type === 'connections.changed') {
+		exactKeys(event, ['type', 'profiles'], 'host connections event');
+		parsedEvent = Object.freeze({
+			type: 'connections.changed',
+			profiles: parseTerminayHostConnectionProfiles(event.profiles),
+		});
+	} else {
+		throw new TypeError('host event type is invalid');
+	}
+	return Object.freeze({
+		schemaVersion: TERMINAY_HOST_CONTEXT_SCHEMA_VERSION,
+		bridgeVersion: TERMINAY_HOST_BRIDGE_VERSION,
+		sourceId: context.sourceId,
+		windowId: context.windowId,
+		profileId: context.profileId,
+		serverId: context.serverId,
+		event: parsedEvent,
+	});
+}
+
+export function parseTerminayHostContext(value: unknown): TerminayHostContext {
+	const input = record(value, 'host context');
+	exactOptionalKeys(
+		input,
+		[
+			'schemaVersion',
+			'bootstrapVersion',
+			'sourceId',
+			'windowId',
+			'serverId',
+			'profileId',
+			'bundleId',
+			'applicationProtocolVersion',
+			'hostKind',
+			'hostBridgeVersion',
+			'byteEndpointVersion',
+			'capabilities',
+		],
+		['profile', 'profiles', 'composition'],
+		'host context',
+	);
+	if (input.schemaVersion !== TERMINAY_HOST_CONTEXT_SCHEMA_VERSION)
+		throw new TypeError('host context schema is unsupported');
+	if (input.bootstrapVersion !== TERMINAY_HOST_BOOTSTRAP_VERSION)
+		throw new TypeError('host bootstrap version is unsupported');
+	const sourceId = identifier(input.sourceId, 'source id', ID);
+	const windowId = identifier(input.windowId, 'window id', ID);
+	const serverId = identifier(input.serverId, 'server id', ID);
+	const profileId = identifier(input.profileId, 'profile id', ID);
+	const bundleId = identifier(input.bundleId, 'bundle id', BUNDLE_ID);
+	const applicationProtocolVersion = identifier(
+		input.applicationProtocolVersion,
+		'application protocol version',
+		ID,
+	);
+	if (input.hostKind !== 'browser' && input.hostKind !== 'desktop')
+		throw new TypeError('host kind is invalid');
+	const hostBridgeVersion = version(
+		input.hostBridgeVersion,
+		'host bridge version',
+	);
+	const byteEndpointVersion = version(
+		input.byteEndpointVersion,
+		'host byte endpoint version',
+	);
+	const capabilities = parseCapabilityVersions(
+		input.capabilities,
+		'host capabilities',
+	);
+	const profile =
+		input.profile === undefined
+			? undefined
+			: parseTerminayHostConnectionProfile(input.profile, 'host profile');
+	const profiles =
+		input.profiles === undefined
+			? undefined
+			: parseTerminayHostConnectionProfiles(input.profiles);
+	const composition =
+		input.composition === undefined
+			? undefined
+			: parseTerminayWorkspaceComposition(input.composition);
+	return Object.freeze({
+		schemaVersion: TERMINAY_HOST_CONTEXT_SCHEMA_VERSION,
+		bootstrapVersion: TERMINAY_HOST_BOOTSTRAP_VERSION,
+		sourceId,
+		windowId,
+		serverId,
+		profileId,
+		bundleId,
+		applicationProtocolVersion,
+		hostKind: input.hostKind,
+		hostBridgeVersion,
+		byteEndpointVersion,
+		capabilities,
+		...(profile === undefined ? {} : { profile }),
+		...(profiles === undefined ? {} : { profiles }),
+		...(composition === undefined ? {} : { composition }),
+	});
+}
+
+function parseTerminayHostConnectionProfiles(
+	value: unknown,
+): readonly TerminayHostConnectionProfile[] {
+	if (!Array.isArray(value) || value.length > 256)
+		throw new TypeError('host profiles are invalid');
+	const profiles = value.map((profile) =>
+		parseTerminayHostConnectionProfile(profile, 'host profile'),
+	);
+	if (new Set(profiles.map((profile) => profile.id)).size !== profiles.length)
+		throw new TypeError('host profiles contain duplicate ids');
+	return Object.freeze(profiles);
+}
+
+function parseTerminayHostConnectionProfile(
+	value: unknown,
+	name: string,
+): TerminayHostConnectionProfile {
+	const profile = record(value, name);
+	exactOptionalKeys(
+		profile,
+		['id', 'isLocal', 'label', 'status'],
+		['serverId', 'attached'],
+		name,
+	);
+	const id = identifier(profile.id, `${name} id`, ID);
+	const serverId =
+		profile.serverId === undefined
+			? undefined
+			: identifier(profile.serverId, `${name} server id`, ID);
+	if (profile.attached !== undefined && typeof profile.attached !== 'boolean')
+		throw new TypeError(`${name} attached flag is invalid`);
+	if (
+		typeof profile.label !== 'string' ||
+		profile.label.trim().length === 0 ||
+		profile.label.length > 256 ||
+		/[\r\n\0]/u.test(profile.label)
+	)
+		throw new TypeError(`${name} label is invalid`);
+	if (typeof profile.isLocal !== 'boolean')
+		throw new TypeError(`${name} local flag is invalid`);
+	if (
+		typeof profile.status !== 'string' ||
+		!CONNECTION_STATUSES.has(profile.status)
+	)
+		throw new TypeError(`${name} status is invalid`);
+	return Object.freeze({
+		id,
+		isLocal: profile.isLocal,
+		label: profile.label,
+		status: profile.status as TerminayHostConnectionStatus,
+		...(serverId === undefined ? {} : { serverId }),
+		...(profile.attached === undefined ? {} : { attached: profile.attached }),
+	});
+}
+
+const CONNECTION_STATUSES = new Set<string>([
+	'connected',
+	'connecting',
+	'offline',
+	'unavailable',
+	'unauthenticated',
+	'incompatible',
+]);
+
+export function parseTerminayWorkspaceComposition(
+	value: unknown,
+): TerminayWorkspaceComposition {
+	const input = record(value, 'workspace composition');
+	exactKeys(
+		input,
+		['version', 'primaryProfileId', 'attached', 'tabOrder'],
+		'workspace composition',
+	);
+	if (input.version !== 1)
+		throw new TypeError('workspace composition version is unsupported');
+	const primaryProfileId = identifier(
+		input.primaryProfileId,
+		'primary profile id',
+		ID,
+	);
+	if (!Array.isArray(input.attached) || input.attached.length > 64)
+		throw new TypeError('workspace composition attachments are invalid');
+	const attached = input.attached.map((entry) => {
+		const attachment = record(entry, 'workspace composition attachment');
+		exactOptionalKeys(
+			attachment,
+			['profileId'],
+			['viewId'],
+			'workspace composition attachment',
+		);
+		const profileId = identifier(
+			attachment.profileId,
+			'attached profile id',
+			ID,
+		);
+		const viewId =
+			attachment.viewId === undefined
+				? undefined
+				: identifier(attachment.viewId, 'attached view id', ID);
+		return Object.freeze({
+			profileId,
+			...(viewId === undefined ? {} : { viewId }),
+		});
+	});
+	if (
+		new Set(attached.map((entry) => entry.profileId)).size !== attached.length
+	)
+		throw new TypeError('workspace composition attaches a profile twice');
+	if (!Array.isArray(input.tabOrder) || input.tabOrder.length > 4_096)
+		throw new TypeError('workspace composition tab order is invalid');
+	const tabOrder = input.tabOrder.map((entry) => {
+		const tab = record(entry, 'workspace composition tab');
+		exactKeys(tab, ['serverId', 'projectId'], 'workspace composition tab');
+		return Object.freeze({
+			serverId: identifier(tab.serverId, 'tab server id', ID),
+			projectId: identifier(tab.projectId, 'tab project id', ID),
+		});
+	});
+	return Object.freeze({
+		version: 1,
+		primaryProfileId,
+		attached: Object.freeze(attached),
+		tabOrder: Object.freeze(tabOrder),
+	});
+}
+
+export function parseTerminayHostCompatibilityRequirements(
+	value: unknown,
+): TerminayHostCompatibilityRequirements {
+	const input = record(value, 'host compatibility requirements');
+	exactKeys(
+		input,
+		[
+			'bootstrap',
+			'bundleFormat',
+			'hostBridge',
+			'byteEndpoint',
+			'requiredCapabilities',
+			'optionalCapabilities',
+		],
+		'host compatibility requirements',
+	);
+	const requiredCapabilities = parseCapabilityRanges(
+		input.requiredCapabilities,
+		'required host capabilities',
+	);
+	const optionalCapabilities = parseCapabilityRanges(
+		input.optionalCapabilities,
+		'optional host capabilities',
+	);
+	for (const capability of TERMINAY_HOST_CAPABILITY_NAMES) {
+		if (
+			requiredCapabilities[capability] !== undefined &&
+			optionalCapabilities[capability] !== undefined
+		) {
+			throw new TypeError(
+				`host capability cannot be both required and optional: ${capability}`,
+			);
+		}
+	}
+	return Object.freeze({
+		bootstrap: parseVersionRange(input.bootstrap, 'host bootstrap range'),
+		bundleFormat: parseVersionRange(
+			input.bundleFormat,
+			'UI bundle format range',
+		),
+		hostBridge: parseVersionRange(input.hostBridge, 'host bridge range'),
+		byteEndpoint: parseVersionRange(
+			input.byteEndpoint,
+			'host byte endpoint range',
+		),
+		requiredCapabilities,
+		optionalCapabilities,
+	});
+}
+
+export function evaluateTerminayHostCompatibility(
+	requirementsValue: unknown,
+	supportValue: TerminayHostRuntimeSupport,
+): TerminayHostCompatibilityResult {
+	const requirements =
+		parseTerminayHostCompatibilityRequirements(requirementsValue);
+	const support = parseHostRuntimeSupport(supportValue);
+	const versionChecks = [
+		['bootstrap', requirements.bootstrap, support.bootstrapVersion],
+		['bundle-format', requirements.bundleFormat, support.bundleFormatVersion],
+		['host-bridge', requirements.hostBridge, support.hostBridgeVersion],
+		['byte-endpoint', requirements.byteEndpoint, support.byteEndpointVersion],
+	] as const;
+	for (const [component, range, actual] of versionChecks) {
+		const failure = compareVersion(component, range, actual);
+		if (failure !== undefined) return failure;
+	}
+	for (const capability of TERMINAY_HOST_CAPABILITY_NAMES) {
+		const required = requirements.requiredCapabilities[capability];
+		if (required === undefined) continue;
+		const actual = support.capabilities[capability];
+		if (actual === undefined) {
+			return Object.freeze({
+				compatible: false,
+				component: 'host-capability',
+				code: 'missing-capability',
+				capability,
+				required,
+			});
+		}
+		const failure = compareVersion(
+			'host-capability',
+			required,
+			actual,
+			capability,
+		);
+		if (failure !== undefined) return failure;
+	}
+	const unavailableOptionalCapabilities = TERMINAY_HOST_CAPABILITY_NAMES.filter(
+		(capability) => {
+			const optional = requirements.optionalCapabilities[capability];
+			if (optional === undefined) return false;
+			const actual = support.capabilities[capability];
+			return (
+				actual === undefined ||
+				actual < optional.minimum ||
+				actual > optional.maximum
+			);
+		},
+	);
+	return Object.freeze({
+		compatible: true,
+		unavailableOptionalCapabilities: Object.freeze(
+			unavailableOptionalCapabilities,
+		),
+	});
+}
+
+/** Browser-safe parser for the compatibility-bearing portion of the canonical
+ * server-core UI manifest. Asset hashes remain the installer/verifier's job. */
+export function parseTerminayUiBundleCompatibilityManifest(
+	value: unknown,
+): TerminayUiBundleCompatibilityManifest {
+	const input = record(value, 'UI bundle manifest');
+	exactKeys(
+		input,
+		[
+			'schemaVersion',
+			'bundleId',
+			'entryPath',
+			'protocolVersion',
+			'serverVersion',
+			'contentSecurityPolicy',
+			'bundleFormatVersion',
+			'hostCompatibility',
+			'assets',
+		],
+		'UI bundle manifest',
+	);
+	if (
+		input.schemaVersion !== 1 ||
+		input.bundleFormatVersion !== TERMINAY_UI_BUNDLE_FORMAT_VERSION
+	)
+		throw new TypeError('UI bundle manifest version is unsupported');
+	if (!Array.isArray(input.assets) || input.assets.length === 0)
+		throw new TypeError('UI bundle manifest assets are invalid');
+	return Object.freeze({
+		schemaVersion: 1,
+		bundleId: identifier(input.bundleId, 'bundle id', BUNDLE_ID),
+		protocolVersion: identifier(
+			input.protocolVersion,
+			'application protocol version',
+			ID,
+		),
+		bundleFormatVersion: TERMINAY_UI_BUNDLE_FORMAT_VERSION,
+		hostCompatibility: parseTerminayHostCompatibilityRequirements(
+			input.hostCompatibility,
+		),
+	});
+}
+
+export function evaluateTerminayBundleCompatibility(
+	manifestValue: unknown,
+	bootstrapValue: unknown,
+	supportValue: TerminayHostRuntimeSupport,
+): TerminayBundleCompatibilityResult {
+	let manifest: TerminayUiBundleCompatibilityManifest;
+	try {
+		manifest = parseTerminayUiBundleCompatibilityManifest(manifestValue);
+	} catch (error) {
+		return Object.freeze({
+			compatible: false,
+			component: 'bundle-manifest',
+			code: 'invalid-manifest',
+			message:
+				error instanceof Error
+					? error.message
+					: 'UI bundle manifest is invalid',
+		});
+	}
+	// One workspace bundle serves many servers, so the bundle is never bound to
+	// the identity or application-protocol version of whichever server the host
+	// happens to have connected. Server compatibility is the bundle client's
+	// own per-connection hello check (see `evaluateServerCompatibility`); this
+	// evaluation keeps only bundle-to-host checks.
+	try {
+		parseTerminayHostContext(bootstrapValue);
+	} catch (error) {
+		return Object.freeze({
+			compatible: false,
+			component: 'bundle-binding',
+			code: 'identity-mismatch',
+			message:
+				error instanceof Error ? error.message : 'host bootstrap is invalid',
+		});
+	}
+	return evaluateTerminayHostCompatibility(
+		manifest.hostCompatibility,
+		supportValue,
+	);
+}
+
+export function createTerminayHostBytePacket(
+	serverIdValue: unknown,
+	frameValue: unknown,
+): TerminayHostBytePacket {
+	const serverId = identifier(serverIdValue, 'server id', ID);
+	const frame = copyByteArray(frameValue);
+	if (
+		frame === undefined ||
+		frame.byteLength === 0 ||
+		frame.byteLength > MAX_FRAME_BYTES
+	) {
+		throw new TypeError('host byte frame is invalid');
+	}
+	return Object.freeze({
+		type: 'terminay.host-byte',
+		version: TERMINAY_HOST_BYTE_ENDPOINT_VERSION,
+		serverId,
+		frame,
+	});
+}
+
+export function parseTerminayHostAction(value: unknown): TerminayHostAction {
+	const action = record(value, 'host action');
+	switch (action.type) {
+		case 'connection.pair':
+			exactKeys(
+				action,
+				['type', 'pairingUrl', 'attemptId'],
+				'connection pairing action',
+			);
+			if (
+				typeof action.pairingUrl !== 'string' ||
+				action.pairingUrl.length === 0 ||
+				action.pairingUrl.length > 16_384
+			)
+				throw new TypeError('connection pairing URL is invalid');
+			return Object.freeze({
+				type: 'connection.pair',
+				attemptId: identifier(action.attemptId, 'pairing attempt id', ID),
+				pairingUrl: action.pairingUrl,
+			});
+		case 'connection.pair-cancel':
+			exactKeys(
+				action,
+				['type', 'attemptId'],
+				'connection pairing cancellation',
+			);
+			return Object.freeze({
+				type: 'connection.pair-cancel',
+				attemptId: identifier(action.attemptId, 'pairing attempt id', ID),
+			});
+		case 'route.present': {
+			exactOptionalKeys(
+				action,
+				['type', 'route', 'disposition'],
+				['logicalViewId'],
+				'route presentation action',
+			);
+			const route = routePath(action.route);
+			if (
+				action.disposition !== 'in-page' &&
+				action.disposition !== 'native-window' &&
+				action.disposition !== 'browser-tab'
+			)
+				throw new TypeError('route disposition is invalid');
+			const logicalViewId =
+				action.logicalViewId === undefined
+					? undefined
+					: identifier(action.logicalViewId, 'logical view id', ID);
+			return Object.freeze({
+				type: 'route.present',
+				route,
+				disposition: action.disposition,
+				...(logicalViewId === undefined ? {} : { logicalViewId }),
+			});
+		}
+		case 'route.focus':
+			exactKeys(action, ['type', 'presentationId'], 'route focus action');
+			return Object.freeze({
+				type: 'route.focus',
+				presentationId: identifier(
+					action.presentationId,
+					'presentation id',
+					ID,
+				),
+			});
+		case 'route.close': {
+			exactOptionalKeys(
+				action,
+				['type'],
+				['presentationId'],
+				'route close action',
+			);
+			const presentationId =
+				action.presentationId === undefined
+					? undefined
+					: identifier(action.presentationId, 'presentation id', ID);
+			return Object.freeze({
+				type: 'route.close',
+				...(presentationId === undefined ? {} : { presentationId }),
+			});
+		}
+		case 'menu.invoke':
+			exactKeys(action, ['type', 'command'], 'menu action');
+			return Object.freeze({
+				type: 'menu.invoke',
+				command: parseTerminayHostMenuCommand(action.command),
+			});
+		case 'menu.accelerators.update': {
+			exactKeys(action, ['type', 'accelerators'], 'menu accelerators action');
+			if (
+				!Array.isArray(action.accelerators) ||
+				action.accelerators.length > 64
+			)
+				throw new TypeError('menu accelerators are invalid');
+			const commands = new Set<TerminayHostMenuCommand>();
+			const accelerators = action.accelerators.map((value) => {
+				const entry = record(value, 'menu accelerator');
+				exactKeys(entry, ['command', 'accelerator'], 'menu accelerator');
+				const command = parseTerminayHostMenuCommand(entry.command);
+				if (commands.has(command))
+					throw new TypeError('menu accelerator commands must be unique');
+				commands.add(command);
+				if (
+					typeof entry.accelerator !== 'string' ||
+					entry.accelerator.length > 128 ||
+					[...entry.accelerator].some((character) => {
+						const code = character.codePointAt(0) ?? 0;
+						return code < 0x20 || code === 0x7f;
+					})
+				)
+					throw new TypeError('menu accelerator is invalid');
+				return Object.freeze({ command, accelerator: entry.accelerator });
+			});
+			return Object.freeze({
+				type: 'menu.accelerators.update',
+				accelerators: Object.freeze(accelerators),
+			});
+		}
+		case 'device.settings.update':
+			exactKeys(action, ['type', 'settings'], 'device settings action');
+			record(action.settings, 'device settings');
+			assertJsonValue(action.settings);
+			return Object.freeze({
+				type: 'device.settings.update',
+				settings: action.settings,
+			});
+		case 'file.choose': {
+			exactOptionalKeys(
+				action,
+				['type'],
+				['multiple', 'accept'],
+				'file selection action',
+			);
+			if (action.multiple !== undefined && typeof action.multiple !== 'boolean')
+				throw new TypeError('file selection multiple flag is invalid');
+			const accept =
+				action.accept === undefined
+					? undefined
+					: stringList(action.accept, 'file selection accept list', 32, 128);
+			return Object.freeze({
+				type: 'file.choose',
+				...(action.multiple === undefined ? {} : { multiple: action.multiple }),
+				...(accept === undefined ? {} : { accept }),
+			});
+		}
+		case 'clipboard.write':
+			exactKeys(action, ['type', 'text'], 'clipboard action');
+			return Object.freeze({
+				type: 'clipboard.write',
+				text: boundedText(action.text, 'clipboard text', 1024 * 1024, true),
+			});
+		case 'notification.show': {
+			exactOptionalKeys(
+				action,
+				['type', 'title'],
+				['body'],
+				'notification action',
+			);
+			const title = boundedText(action.title, 'notification title', 200);
+			const body =
+				action.body === undefined
+					? undefined
+					: boundedText(action.body, 'notification body', 4_096, true);
+			return Object.freeze({
+				type: 'notification.show',
+				title,
+				...(body === undefined ? {} : { body }),
+			});
+		}
+		case 'badge.count.set':
+			exactKeys(action, ['type', 'count'], 'badge count action');
+			if (
+				typeof action.count !== 'number' ||
+				!Number.isInteger(action.count) ||
+				action.count < 0 ||
+				action.count > TERMINAY_HOST_MAX_BADGE_COUNT
+			)
+				throw new TypeError('badge count is invalid');
+			return Object.freeze({ type: 'badge.count.set', count: action.count });
+		case 'updater.check':
+			exactKeys(action, ['type'], 'updater action');
+			return Object.freeze({ type: 'updater.check' });
+		case 'updater.install':
+			exactKeys(action, ['type'], 'updater action');
+			return Object.freeze({ type: 'updater.install' });
+		case 'preview.download': {
+			exactKeys(
+				action,
+				['type', 'filename', 'mimeType', 'bytesBase64'],
+				'preview download action',
+			);
+			const filename = boundedText(action.filename, 'preview filename', 128);
+			const mimeType = boundedText(action.mimeType, 'preview MIME type', 128);
+			if (
+				!/^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\/[A-Za-z0-9!#$&^_.+-]+$/u.test(
+					mimeType,
+				)
+			)
+				throw new TypeError('preview MIME type is invalid');
+			if (
+				typeof action.bytesBase64 !== 'string' ||
+				action.bytesBase64.length === 0 ||
+				action.bytesBase64.length > 22_369_624 ||
+				action.bytesBase64.length % 4 !== 0 ||
+				!/^[A-Za-z0-9+/]*={0,2}$/u.test(action.bytesBase64)
+			)
+				throw new TypeError('preview download payload is invalid');
+			return Object.freeze({
+				type: 'preview.download',
+				filename,
+				mimeType,
+				bytesBase64: action.bytesBase64,
+			});
+		}
+		case 'os.open-external':
+			exactKeys(action, ['type', 'url'], 'external URL action');
+			return Object.freeze({
+				type: 'os.open-external',
+				url: safeExternalUrl(action.url),
+			});
+		case 'os.reveal':
+			exactKeys(action, ['type', 'token'], 'reveal action');
+			return Object.freeze({
+				type: 'os.reveal',
+				token: identifier(action.token, 'server-owned reveal token', ID),
+			});
+		case 'workspace.drag.start': {
+			exactKeys(
+				action,
+				['type', 'viewId', 'projectId', 'preview'],
+				'workspace drag action',
+			);
+			const preview = record(action.preview, 'workspace drag preview');
+			exactKeys(
+				preview,
+				['title', 'emoji', 'color', 'width'],
+				'workspace drag preview',
+			);
+			if (
+				typeof preview.color !== 'string' ||
+				!/^#[0-9a-fA-F]{3,8}$/u.test(preview.color) ||
+				typeof preview.width !== 'number' ||
+				!Number.isSafeInteger(preview.width) ||
+				preview.width < 80 ||
+				preview.width > 2_000
+			)
+				throw new TypeError('workspace drag preview is invalid');
+			return Object.freeze({
+				type: 'workspace.drag.start',
+				viewId: identifier(action.viewId, 'workspace view id', ID),
+				projectId: identifier(action.projectId, 'workspace project id', ID),
+				preview: Object.freeze({
+					title: boundedText(preview.title, 'workspace drag title', 512, true),
+					emoji: boundedText(preview.emoji, 'workspace drag emoji', 64, true),
+					color: preview.color,
+					width: preview.width,
+				}),
+			});
+		}
+		case 'workspace.drag.end':
+			exactKeys(action, ['type'], 'workspace drag action');
+			return Object.freeze({ type: 'workspace.drag.end' });
+		case 'diagnostics.performance-logging.set':
+			exactKeys(action, ['type', 'enabled'], 'performance logging action');
+			if (typeof action.enabled !== 'boolean')
+				throw new TypeError('performance logging enabled flag is invalid');
+			return Object.freeze({
+				type: 'diagnostics.performance-logging.set',
+				enabled: action.enabled,
+			});
+		case 'diagnostics.performance-snapshot.read':
+			exactKeys(action, ['type'], 'performance snapshot action');
+			return Object.freeze({ type: 'diagnostics.performance-snapshot.read' });
+		case 'connections.list':
+			exactKeys(action, ['type'], 'connections list action');
+			return Object.freeze({ type: 'connections.list' });
+		case 'connections.attach':
+			exactKeys(action, ['type', 'profileId'], 'connections attach action');
+			return Object.freeze({
+				type: 'connections.attach',
+				profileId: identifier(action.profileId, 'connection profile id', ID),
+			});
+		case 'connections.detach':
+			exactKeys(action, ['type', 'profileId'], 'connections detach action');
+			return Object.freeze({
+				type: 'connections.detach',
+				profileId: identifier(action.profileId, 'connection profile id', ID),
+			});
+		case 'connections.rename': {
+			exactKeys(
+				action,
+				['type', 'profileId', 'label'],
+				'connections rename action',
+			);
+			const label = boundedText(action.label, 'connection label', 256).trim();
+			// A label is one line: it is a row in a menu and a list.
+			if (/[\t\r\n]/u.test(label))
+				throw new TypeError('connection label is invalid');
+			return Object.freeze({
+				type: 'connections.rename',
+				profileId: identifier(action.profileId, 'connection profile id', ID),
+				label,
+			});
+		}
+		case 'connections.forget':
+			exactKeys(action, ['type', 'profileId'], 'connections forget action');
+			return Object.freeze({
+				type: 'connections.forget',
+				profileId: identifier(action.profileId, 'connection profile id', ID),
+			});
+		case 'connections.select':
+			exactKeys(action, ['type', 'profileId'], 'connections select action');
+			return Object.freeze({
+				type: 'connections.select',
+				profileId: identifier(action.profileId, 'connection profile id', ID),
+			});
+		case 'connections.open-window':
+			exactKeys(
+				action,
+				['type', 'profileId'],
+				'connections open window action',
+			);
+			return Object.freeze({
+				type: 'connections.open-window',
+				profileId: identifier(action.profileId, 'connection profile id', ID),
+			});
+		case 'connections.composition.write':
+			exactKeys(
+				action,
+				['type', 'composition'],
+				'workspace composition action',
+			);
+			return Object.freeze({
+				type: 'connections.composition.write',
+				composition: parseTerminayWorkspaceComposition(action.composition),
+			});
+		default:
+			throw new TypeError('host action is not allowed');
+	}
+}
+
+export function parseTerminayHostActionRequest(
+	value: unknown,
+	contextValue: unknown,
+): TerminayHostActionRequest {
+	const context = parseTerminayHostContext(contextValue);
+	const request = record(value, 'host action request');
+	exactKeys(
+		request,
+		[
+			'schemaVersion',
+			'bridgeVersion',
+			'sourceId',
+			'windowId',
+			'profileId',
+			'serverId',
+			'userGesture',
+			'action',
+		],
+		'host action request',
+	);
+	if (
+		request.schemaVersion !== TERMINAY_HOST_CONTEXT_SCHEMA_VERSION ||
+		request.bridgeVersion !== TERMINAY_HOST_BRIDGE_VERSION
+	)
+		throw new TypeError('host action request version is unsupported');
+	if (request.userGesture !== true)
+		throw new TypeError('host action requires a user gesture');
+	for (const [field, expected] of [
+		['sourceId', context.sourceId],
+		['windowId', context.windowId],
+		['profileId', context.profileId],
+		['serverId', context.serverId],
+	] as const) {
+		if (request[field] !== expected)
+			throw new TypeError(
+				`host action request ${field} is outside its binding`,
+			);
+	}
+	return Object.freeze({
+		schemaVersion: TERMINAY_HOST_CONTEXT_SCHEMA_VERSION,
+		bridgeVersion: TERMINAY_HOST_BRIDGE_VERSION,
+		sourceId: context.sourceId,
+		windowId: context.windowId,
+		profileId: context.profileId,
+		serverId: context.serverId,
+		userGesture: true,
+		action: parseTerminayHostAction(request.action),
+	});
+}
+
+export function requiredTerminayHostCapability(
+	action: TerminayHostAction,
+): TerminayHostCapability | undefined {
+	switch (action.type) {
+		case 'connection.pair':
+		case 'connection.pair-cancel':
+			return 'nativeWindows';
+		case 'route.present':
+			return action.disposition === 'native-window'
+				? 'nativeWindows'
+				: undefined;
+		case 'route.focus':
+		case 'route.close':
+			return 'nativeWindows';
+		case 'menu.invoke':
+		case 'menu.accelerators.update':
+		case 'device.settings.update':
+			return 'nativeMenus';
+		case 'file.choose':
+			return 'filePicker';
+		case 'clipboard.write':
+			return 'clipboardWrite';
+		case 'notification.show':
+		case 'badge.count.set':
+			return 'notifications';
+		case 'updater.check':
+		case 'updater.install':
+			return 'updater';
+		case 'preview.download':
+			return 'osIntegration';
+		case 'os.open-external':
+		case 'os.reveal':
+			return 'osIntegration';
+		case 'workspace.drag.start':
+		case 'workspace.drag.end':
+			return 'nativeWindows';
+		case 'diagnostics.performance-logging.set':
+		case 'diagnostics.performance-snapshot.read':
+			return 'nativeMenus';
+		case 'connections.list':
+		case 'connections.attach':
+		case 'connections.detach':
+		case 'connections.rename':
+		case 'connections.forget':
+		case 'connections.select':
+		case 'connections.open-window':
+		case 'connections.composition.write':
+			return 'connections';
+	}
+}
+
+/**
+ * Validate a semantic action, its immutable source binding, gesture proof, and
+ * the capability injected by the trusted host. The renderer can request an
+ * action but cannot manufacture the authority needed to perform it.
+ */
+export function authorizeTerminayHostActionRequest(
+	value: unknown,
+	contextValue: unknown,
+): TerminayHostActionRequest {
+	const context = parseTerminayHostContext(contextValue);
+	const request = parseTerminayHostActionRequest(value, context);
+	const capability = requiredTerminayHostCapability(request.action);
+	if (
+		capability !== undefined &&
+		context.capabilities[capability] === undefined
+	)
+		throw new TypeError(`host capability is unavailable: ${capability}`);
+	return request;
+}
+
+export function parseTerminayHostBytePacket(
+	value: unknown,
+	expectedServerIdValue: unknown,
+): TerminayHostBytePacket {
+	const expectedServerId = identifier(
+		expectedServerIdValue,
+		'expected server id',
+		ID,
+	);
+	const input = record(value, 'host byte packet');
+	exactKeys(
+		input,
+		['type', 'version', 'serverId', 'frame'],
+		'host byte packet',
+	);
+	if (
+		input.type !== 'terminay.host-byte' ||
+		input.version !== TERMINAY_HOST_BYTE_ENDPOINT_VERSION
+	) {
+		throw new TypeError('host byte packet version is unsupported');
+	}
+	const packet = createTerminayHostBytePacket(input.serverId, input.frame);
+	if (packet.serverId !== expectedServerId)
+		throw new TypeError('host byte packet belongs to another server');
+	return packet;
+}
+
+function parseHostRuntimeSupport(
+	value: TerminayHostRuntimeSupport,
+): TerminayHostRuntimeSupport {
+	const input = record(value, 'host runtime support');
+	exactKeys(
+		input,
+		[
+			'bootstrapVersion',
+			'bundleFormatVersion',
+			'hostBridgeVersion',
+			'byteEndpointVersion',
+			'capabilities',
+		],
+		'host runtime support',
+	);
+	return Object.freeze({
+		bootstrapVersion: version(input.bootstrapVersion, 'host bootstrap version'),
+		bundleFormatVersion: version(
+			input.bundleFormatVersion,
+			'UI bundle format version',
+		),
+		hostBridgeVersion: version(input.hostBridgeVersion, 'host bridge version'),
+		byteEndpointVersion: version(
+			input.byteEndpointVersion,
+			'host byte endpoint version',
+		),
+		capabilities: parseCapabilityVersions(
+			input.capabilities,
+			'host capabilities',
+		),
+	});
+}
+
+function parseCapabilityVersions(
+	value: unknown,
+	name: string,
+): TerminayHostCapabilityVersions {
+	const input = record(value, name);
+	const output: Partial<Record<TerminayHostCapability, number>> = {};
+	for (const [key, raw] of Object.entries(input)) {
+		if (!CAPABILITY_NAMES.has(key))
+			throw new TypeError(`${name} contains an unknown capability`);
+		output[key as TerminayHostCapability] = version(
+			raw,
+			`${key} capability version`,
+		);
+	}
+	return Object.freeze(output);
+}
+
+function parseCapabilityRanges(
+	value: unknown,
+	name: string,
+): Readonly<Partial<Record<TerminayHostCapability, TerminayVersionRange>>> {
+	const input = record(value, name);
+	const output: Partial<Record<TerminayHostCapability, TerminayVersionRange>> =
+		{};
+	for (const [key, raw] of Object.entries(input)) {
+		if (!CAPABILITY_NAMES.has(key))
+			throw new TypeError(`${name} contains an unknown capability`);
+		output[key as TerminayHostCapability] = parseVersionRange(
+			raw,
+			`${key} capability range`,
+		);
+	}
+	return Object.freeze(output);
+}
+
+function parseVersionRange(value: unknown, name: string): TerminayVersionRange {
+	const input = record(value, name);
+	exactKeys(input, ['minimum', 'maximum'], name);
+	const minimum = version(input.minimum, `${name} minimum`);
+	const maximum = version(input.maximum, `${name} maximum`);
+	if (maximum < minimum) throw new TypeError(`${name} is inverted`);
+	return Object.freeze({ minimum, maximum });
+}
+
+function compareVersion(
+	component: TerminayHostCompatibilityFailure['component'],
+	required: TerminayVersionRange,
+	actual: number,
+	capability?: TerminayHostCapability,
+): TerminayHostCompatibilityFailure | undefined {
+	if (actual >= required.minimum && actual <= required.maximum)
+		return undefined;
+	return Object.freeze({
+		compatible: false,
+		component,
+		code: actual < required.minimum ? 'below-minimum' : 'above-maximum',
+		...(capability === undefined ? {} : { capability }),
+		required,
+		actual,
+	});
+}
+
+function version(value: unknown, name: string): number {
+	if (
+		!Number.isSafeInteger(value) ||
+		(value as number) < 1 ||
+		(value as number) > MAX_VERSION
+	)
+		throw new TypeError(`${name} is invalid`);
+	return value as number;
+}
+
+function identifier(value: unknown, name: string, pattern: RegExp): string {
+	if (typeof value !== 'string' || !pattern.test(value))
+		throw new TypeError(`${name} is invalid`);
+	return value;
+}
+
+function record(value: unknown, name: string): Record<string, unknown> {
+	if (typeof value !== 'object' || value === null || Array.isArray(value))
+		throw new TypeError(`${name} must be an object`);
+	return value as Record<string, unknown>;
+}
+
+function exactKeys(
+	value: Record<string, unknown>,
+	expected: readonly string[],
+	name: string,
+): void {
+	const keys = Object.keys(value);
+	if (
+		keys.length !== expected.length ||
+		keys.some((key) => !expected.includes(key))
+	)
+		throw new TypeError(`${name} fields are invalid`);
+}
+
+function exactOptionalKeys(
+	value: Record<string, unknown>,
+	required: readonly string[],
+	optional: readonly string[],
+	name: string,
+): void {
+	const keys = Object.keys(value);
+	if (
+		required.some((key) => !keys.includes(key)) ||
+		keys.some((key) => !required.includes(key) && !optional.includes(key))
+	)
+		throw new TypeError(`${name} fields are invalid`);
+}
+
+function boundedText(
+	value: unknown,
+	name: string,
+	maximum: number,
+	allowEmpty = false,
+): string {
+	if (
+		typeof value !== 'string' ||
+		(!allowEmpty && value.trim().length === 0) ||
+		value.length > maximum ||
+		hasControlCharacter(value)
+	)
+		throw new TypeError(`${name} is invalid`);
+	return value;
+}
+
+function hasControlCharacter(value: string): boolean {
+	return [...value].some((character) => {
+		const code = character.codePointAt(0) ?? 0;
+		return (
+			(code < 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) ||
+			code === 0x7f
+		);
+	});
+}
+
+function routePath(value: unknown): string {
+	const route = boundedText(value, 'route', 2_048);
+	if (
+		!route.startsWith('/') ||
+		route.startsWith('//') ||
+		route.includes('\\') ||
+		route.includes('\0') ||
+		/^[a-z][a-z0-9+.-]*:/iu.test(route)
+	)
+		throw new TypeError('route is invalid');
+	const parsed = new URL(route, 'https://terminay.invalid');
+	if (
+		parsed.origin !== 'https://terminay.invalid' ||
+		parsed.username ||
+		parsed.password
+	)
+		throw new TypeError('route is invalid');
+	return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+}
+
+function safeExternalUrl(value: unknown): string {
+	const raw = boundedText(value, 'external URL', 16_384);
+	let parsed: URL;
+	try {
+		parsed = new URL(raw);
+	} catch {
+		throw new TypeError('external URL is invalid');
+	}
+	if (
+		(parsed.protocol !== 'http:' && parsed.protocol !== 'https:') ||
+		parsed.username ||
+		parsed.password ||
+		parsed.hostname.length === 0
+	)
+		throw new TypeError('external URL is invalid');
+	return parsed.toString();
+}
+
+function stringList(
+	value: unknown,
+	name: string,
+	maximumItems: number,
+	maximumLength: number,
+): readonly string[] {
+	if (
+		!Array.isArray(value) ||
+		value.length === 0 ||
+		value.length > maximumItems
+	)
+		throw new TypeError(`${name} is invalid`);
+	const output = value.map((item) => boundedText(item, name, maximumLength));
+	if (new Set(output).size !== output.length)
+		throw new TypeError(`${name} contains duplicates`);
+	return Object.freeze(output);
+}
+
+function copyByteArray(value: unknown): Uint8Array | undefined {
+	if (value instanceof Uint8Array) return value.slice();
+	if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
+	if (!ArrayBuffer.isView(value) || value.buffer instanceof SharedArrayBuffer)
+		return undefined;
+	return new Uint8Array(
+		value.buffer,
+		value.byteOffset,
+		value.byteLength,
+	).slice();
+}

@@ -1,0 +1,25 @@
+{
+	"schemaVersion": 1,
+	"extensions": [
+		{
+			"directory": "builtin-agents",
+			"extensionId": "com.terminay.builtin-agents",
+			"packageName": "terminay-builtin-agents"
+		},
+		{
+			"directory": "language-typescript",
+			"extensionId": "com.terminay.language.typescript",
+			"packageName": "terminay-language-typescript"
+		},
+		{
+			"directory": "gitea",
+			"extensionId": "com.terminay.gitea",
+			"packageName": "terminay-gitea"
+		},
+		{
+			"directory": "github",
+			"extensionId": "com.terminay.github",
+			"packageName": "terminay-github"
+		}
+	]
+}

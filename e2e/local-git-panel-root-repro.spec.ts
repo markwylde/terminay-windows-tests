@@ -1,0 +1,74 @@
+import { access, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+import type { Page } from '@playwright/test'
+import { expect, test } from './fixtures'
+import { changesPane, folderRow } from './support/folders'
+import { submitTerminalCommand } from './support/terminal'
+import { fileExplorerItem, setProjectRoot } from './support/ui'
+
+const TARGET_REPO = '/Users/mark/Documents/Projects/terminay/terminay'
+
+async function targetRepoAvailable(): Promise<boolean> {
+  try {
+    await access(join(TARGET_REPO, '.git'))
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function getActiveSessionId(page: Page): Promise<string> {
+  const sessionId = await page.locator('.terminal-panel').first().getAttribute('data-terminay-terminal-session-id')
+
+  if (!sessionId) {
+    throw new Error('Active terminal session id is unavailable')
+  }
+
+  return sessionId
+}
+
+async function writeToActiveTerminal(page: Page, data: string): Promise<void> {
+  await submitTerminalCommand(page, data)
+}
+
+test('local repro: git panel refreshes after Cmd+O then Cmd+R into the terminay main repo', async ({ mainWindow }) => {
+  test.skip(!(await targetRepoAvailable()), `${TARGET_REPO} is not available on this machine`)
+
+  const nonRepo = await mkdtemp(join(tmpdir(), 'terminay-local-git-panel-non-repo-'))
+  try {
+    await writeFile(join(nonRepo, 'plain.txt'), 'not a git repository\n', 'utf8')
+    const expectedRoot = await realpath(TARGET_REPO)
+    const sessionId = await getActiveSessionId(mainWindow)
+    const modifier = process.platform === 'darwin' ? 'Meta' : 'Control'
+
+    await setProjectRoot(mainWindow, nonRepo)
+
+    await mainWindow.locator('.terminal-panel').first().click()
+    const cwdReady = `cwd-ready-${sessionId}`
+    await writeToActiveTerminal(
+      mainWindow,
+      `cd ${JSON.stringify(TARGET_REPO)} && printf ${JSON.stringify(cwdReady)}\r`,
+    )
+    await expect(mainWindow.locator('.terminal-panel').filter({ hasText: cwdReady })).toBeVisible()
+
+    await mainWindow.keyboard.press(`${modifier}+O`)
+
+    const changes = changesPane(mainWindow)
+    const notARepository = changes
+      .locator('.git-panel__message')
+      .filter({ hasText: 'This folder is not in a Git repository' })
+    await expect(notARepository).toBeVisible({ timeout: 6000 })
+
+    await mainWindow.keyboard.press(`${modifier}+R`)
+
+    await expect(mainWindow.locator('.project-workspace--active')).toHaveAttribute('data-terminay-project-root', expectedRoot)
+    await expect(fileExplorerItem(mainWindow, 'src')).toBeVisible()
+    // Changes reports the root checkout, and General names its branch.
+    await expect(changes.locator('.changes-pane__branch-name')).toBeVisible({ timeout: 6000 })
+    await expect(notARepository).toHaveCount(0)
+    await expect(folderRow(mainWindow, 'General').locator('.folders-tree__branch')).toBeVisible()
+  } finally {
+    await rm(nonRepo, { recursive: true, force: true })
+  }
+})

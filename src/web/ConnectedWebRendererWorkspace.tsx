@@ -1,0 +1,1204 @@
+import { Menu as MenuIcon } from 'lucide-react';
+import {
+	RecordingsClient,
+	SettingsClient,
+	ShellProfilesClient,
+	TerminayAiClient,
+	TerminayClientFacade,
+	TerminayTerminalPanelClient,
+} from '@terminay/client-core';
+import {
+	FEATURE_CAPABILITIES,
+	type TerminayHostContext,
+} from '@terminay/protocol';
+import type { AppCommand } from '../types/terminay';
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import 'dockview/dist/styles/dockview.css';
+import '@xterm/xterm/css/xterm.css';
+import '../index.css';
+import { PerformanceLogWindow } from '../components/PerformanceLogWindow';
+import { RecordingsWindow } from '../components/RecordingsWindow';
+import { SettingsWindow } from '../components/SettingsWindow';
+import type { TerminalPanelClientContextValue } from '../components/TerminalPanel';
+import {
+	createServerTerminalSettingsClient,
+	TerminalSettingsClientProvider,
+} from '../hooks/useTerminalSettings';
+import type { RemoteAccessStatusClient } from '../services/remoteAccessStatusClient';
+import { createServerRemoteAccessClients } from '../services/serverApplicationFeatureClients';
+import { aboutWindowDocumentHtml } from '../shared/aboutWindowDocument';
+import type { WindowSize } from '../shared/inPageWindow/geometry';
+import {
+	InPageWindow,
+	type InPageWindowKind,
+} from '../shared/inPageWindow/InPageWindow';
+import {
+	type AuxiliaryRouteRequest,
+	type AuxiliaryRouteRequestHandler,
+	createAuxiliaryRouteController,
+} from '../shared/auxiliaryRoutes';
+import { ConnectedRendererWorkspace } from '../shared/ConnectedRendererWorkspace';
+import {
+	ServerSelector,
+	useSelectedServerConnection,
+} from '../shared/ServerSelector';
+import {
+	ResponsiveWorkspaceEntry,
+	sharedRouteForView,
+} from '../shared/ResponsiveWorkspaceEntry';
+import { SharedAgentRouteBody } from '../shared/SharedAgentRouteBody';
+import {
+	type ConnectionsSettingsPresentation,
+	type SharedConnectionsRouteBodyProps,
+} from '../shared/SharedConnectionsRouteBody';
+import {
+	type SharedEditTabResult,
+	SharedEditTabRouteBody,
+} from '../shared/SharedEditTabRouteBody';
+import { SharedFolderRouteBody } from '../shared/SharedFolderRouteBody';
+import { SharedGitRouteBody } from '../shared/SharedGitRouteBody';
+import { RemoteAccessCategory } from '../shared/RemoteAccessCategory';
+import {
+	createSettingsLeaveGuardRegistry,
+	SettingsLeaveGuardProvider,
+} from '../shared/settingsLeaveGuard';
+import { RemoteExposurePanel } from '../shared/RemoteExposurePanel';
+import { SharedTerminalRouteBody } from '../shared/SharedTerminalRouteBody';
+import type { RemoteAccessStatus } from '../types/terminay';
+import { createBrowserMacroSettingsClient } from './browserRendererHostAdapters';
+import './connectedRendererWorkspace.css';
+import {
+	isTouchTextSelectionEnabled,
+	setTouchTextSelectionEnabled,
+	subscribeTouchTextSelectionEnabled,
+} from '../shared/touchTextSelectionPreference';
+import {
+	currentStatusBarVisibility,
+	subscribeStatusBarVisibility,
+} from '../shared/statusBarVisibility';
+import { isProjectEditCommitted } from './projectEditSettlement';
+import { canLeaveManagerSession } from './sessionTransportHost';
+import { subscribeWindowFullScreenState } from '../host/nativeEvents';
+
+export type ConnectedWebRendererWorkspaceProps = Readonly<{
+	terminalClientContext: Omit<TerminalPanelClientContextValue, 'projectId'>;
+	connectionRoute: Omit<SharedConnectionsRouteBodyProps, 'state'>;
+	onBack: () => void;
+	hostContext?: TerminayHostContext;
+	subscribeAppCommands?: (
+		listener: (command: AppCommand) => Promise<void> | void,
+	) => () => void;
+}>;
+
+type BrowserAuxiliaryRoute = 'settings' | 'about';
+
+/** Which native title bar a Desktop auxiliary window draws over its content. */
+function nativeTitlebarKind(): 'mac' | 'overlay' | undefined {
+	if (!window.terminayHost) return undefined;
+	const platform = navigator.platform.toLowerCase();
+	if (platform.includes('mac')) return 'mac';
+	if (platform.includes('win')) return 'overlay';
+	return undefined;
+}
+
+function initialAuxiliaryRoute(): AuxiliaryRouteRequest | null {
+	const params = new URLSearchParams(window.location.search);
+	switch (params.get('auxiliary')) {
+		case 'settings': {
+			const sectionId = params.get('section');
+			const itemId = params.get('item');
+			return {
+				kind: 'settings',
+				...(sectionId === null ? {} : { sectionId }),
+				...(itemId === null ? {} : { itemId }),
+			};
+		}
+		case 'performance-log':
+			return { kind: 'performance-log' };
+		default:
+			return null;
+	}
+}
+
+function nativeAuxiliaryRoute(request: AuxiliaryRouteRequest): string | null {
+	const params = new URLSearchParams();
+	switch (request.kind) {
+		case 'settings':
+			params.set('auxiliary', 'settings');
+			if (request.sectionId !== undefined)
+				params.set('section', request.sectionId);
+			if (request.itemId !== undefined) params.set('item', request.itemId);
+			break;
+		case 'performance-log':
+			params.set('auxiliary', request.kind);
+			break;
+		case 'edit-tab':
+			return null;
+	}
+	return `/?${params.toString()}`;
+}
+
+type BrowserMenuId = 'terminay' | 'edit' | 'view' | 'help';
+
+type BrowserMenuItem = Readonly<{
+	id: string;
+	label: string;
+	onSelect: () => void;
+	startsGroup?: boolean;
+	/** Present only on items that toggle; renders and announces as a check. */
+	checked?: boolean;
+}>;
+
+const menuOrder: readonly BrowserMenuId[] = [
+	'terminay',
+	'edit',
+	'view',
+	'help',
+];
+
+const menuLabels: Readonly<Record<BrowserMenuId, string>> = Object.freeze({
+	edit: 'Edit',
+	help: 'Help',
+	terminay: 'Terminay',
+	view: 'View',
+});
+
+/** Browser composition for the real connected renderer feature tree.
+ * Native Desktop capabilities are omitted rather than emulated on `window`. */
+export function ConnectedWebRendererWorkspace({
+	connectionRoute,
+	hostContext,
+	subscribeAppCommands,
+	onBack,
+	terminalClientContext,
+}: ConnectedWebRendererWorkspaceProps) {
+	const hasNativeMenus = hostContext?.capabilities.nativeMenus !== undefined;
+	const hasNativeWindowControls =
+		hostContext?.capabilities.nativeWindows !== undefined;
+	const nativeAuxiliaryDocument = useMemo(initialAuxiliaryRoute, []);
+	const nativeTitlebarKindValue = useMemo(nativeTitlebarKind, []);
+	// macOS hides the traffic lights in full screen, so the band they need goes.
+	const [isWindowFullScreen, setIsWindowFullScreen] = useState(false);
+	useEffect(
+		() =>
+			nativeTitlebarKindValue === 'mac'
+				? subscribeWindowFullScreenState(setIsWindowFullScreen)
+				: undefined,
+		[nativeTitlebarKindValue],
+	);
+	const nativeTitlebar =
+		nativeTitlebarKindValue === 'mac' && isWindowFullScreen
+			? undefined
+			: nativeTitlebarKindValue;
+	const requestedView = useMemo(() => {
+		// Canonical route presentations use the query form.  Retain fragment
+		// compatibility for documents opened by older Desktop versions rather
+		// than rendering those child windows as the unscoped default workspace.
+		const query = new URLSearchParams(window.location.search);
+		return (
+			query.get('view') ??
+			new URLSearchParams(window.location.hash.slice(1)).get('view')
+		);
+	}, []);
+	const sharedRoute = useMemo(
+		() => sharedRouteForView(requestedView),
+		[requestedView],
+	);
+	const responsiveCapabilities = useMemo(() => {
+		if (hostContext === undefined) return undefined;
+		return Object.freeze({
+			clipboard: hostContext.capabilities.clipboardWrite !== undefined,
+			filePicker: hostContext.capabilities.filePicker !== undefined,
+			nativeWindows: hostContext.capabilities.nativeWindows !== undefined,
+			notifications: hostContext.capabilities.notifications !== undefined,
+			osIntegration: hostContext.capabilities.osIntegration !== undefined,
+			updater: hostContext.capabilities.updater !== undefined,
+		});
+	}, [hostContext]);
+	const [auxiliaryRoute, setAuxiliaryRoute] =
+		useState<AuxiliaryRouteRequest | null>(nativeAuxiliaryDocument);
+	const [aboutOpen, setAboutOpen] = useState(false);
+	const pendingEditRef = useRef<{
+		request: Extract<AuxiliaryRouteRequest, { kind: 'edit-tab' }>;
+		resolve: (result: SharedEditTabResult | null) => void;
+	} | null>(null);
+	const auxiliaryFocusReturnRef = useRef<HTMLElement | null>(null);
+	// Settings, Macros, Recordings, Shell profiles, and Extensions each belong
+	// to one server. They select a connection — defaulting to the active tab's
+	// — and show only that server's state; they never merge two servers' rows.
+	const selectedServer = useSelectedServerConnection();
+	// Settings asks before the selector moves, so pending macro edits are
+	// never carried to another server.
+	const renderServerSelector = (beforeSelect: () => Promise<boolean>) =>
+		selectedServer.showsSelector ? (
+			<ServerSelector
+				label="Server"
+				connections={selectedServer.connections}
+				onSelect={(serverId) => {
+					void beforeSelect().then((proceed) => {
+						if (proceed) selectedServer.select(serverId);
+					});
+				}}
+				{...(selectedServer.connection?.serverId === undefined
+					? {}
+					: { selectedServerId: selectedServer.connection.serverId })}
+			/>
+		) : null;
+	const applicationClient =
+		selectedServer.connection?.context?.applicationClient ??
+		terminalClientContext.applicationClient;
+	// Macros act on the selected server only; with no client for it, Settings
+	// leaves the category out rather than reaching another server's macros.
+	const macroSettingsClient = useMemo(
+		() =>
+			applicationClient === undefined
+				? undefined
+				: createBrowserMacroSettingsClient(applicationClient),
+		[applicationClient],
+	);
+	const recordingsClient = useMemo(() => {
+		if (applicationClient === undefined) {
+			throw new Error(
+				'Connected browser workspace requires its canonical application client',
+			);
+		}
+		return new RecordingsClient(new TerminayClientFacade(applicationClient));
+	}, [applicationClient]);
+	const aiMetadataClient = useMemo(() => {
+		if (applicationClient === undefined) {
+			throw new Error(
+				'Connected browser workspace requires its canonical application client',
+			);
+		}
+		const client = new TerminayAiClient(
+			new TerminayClientFacade(applicationClient),
+		);
+		return Object.freeze({
+			async listModels(provider: 'codex' | 'claudeCode') {
+				return client.listModels(
+					provider === 'claudeCode' ? 'claude-code' : provider,
+				);
+			},
+		});
+	}, [applicationClient]);
+	const serverSettingsClient = useMemo(() => {
+		if (applicationClient === undefined) {
+			throw new Error(
+				'Connected browser workspace requires its canonical application client',
+			);
+		}
+		return createServerTerminalSettingsClient(
+			new SettingsClient(new TerminayClientFacade(applicationClient)),
+		);
+	}, [applicationClient]);
+	const sharedTerminalPanelClient = useMemo(
+		() => new TerminayTerminalPanelClient(terminalClientContext.client),
+		[terminalClientContext.client],
+	);
+	const shellProfilesClient = useMemo(() => {
+		if (applicationClient === undefined)
+			throw new Error(
+				'Connected browser workspace requires its canonical application client',
+			);
+		return new ShellProfilesClient(new TerminayClientFacade(applicationClient));
+	}, [applicationClient]);
+	const remoteAccessClients = useMemo(
+		() =>
+			applicationClient === undefined
+				? undefined
+				: createServerRemoteAccessClients(applicationClient),
+		[applicationClient],
+	);
+	const remoteAccessStatusClient =
+		remoteAccessClients?.status ?? createUnavailableRemoteAccessClient();
+	// Settings may hold pending macro edits; it is asked before anything
+	// replaces or closes it.
+	const settingsLeaveGuard = useMemo(createSettingsLeaveGuardRegistry, []);
+	const auxiliaryRouteRef = useRef(auxiliaryRoute);
+	auxiliaryRouteRef.current = auxiliaryRoute;
+	const handleAuxiliaryRouteRequest = useCallback<AuxiliaryRouteRequestHandler>(
+		async (request) => {
+			if (
+				auxiliaryRouteRef.current?.kind === 'settings' &&
+				request.kind !== 'settings' &&
+				!(await settingsLeaveGuard.confirm())
+			) {
+				return request.kind === 'edit-tab' ? null : undefined;
+			}
+			pendingEditRef.current?.resolve(null);
+			pendingEditRef.current = null;
+			auxiliaryFocusReturnRef.current =
+				document.activeElement instanceof HTMLElement
+					? document.activeElement
+					: null;
+			setAuxiliaryRoute(request);
+			if (request.kind !== 'edit-tab') return undefined;
+			return new Promise((resolve) => {
+				pendingEditRef.current = { request, resolve };
+			});
+		},
+		[settingsLeaveGuard],
+	);
+	const auxiliaryRoutes = useMemo(
+		() =>
+			createAuxiliaryRouteController({
+				onRequest: async (request) => {
+					const route = nativeAuxiliaryRoute(request);
+					if (
+						hasNativeWindowControls &&
+						route !== null &&
+						hostContext !== undefined &&
+						window.terminayHost !== undefined
+					) {
+						await window.terminayHost.requestAction({
+							bridgeVersion: hostContext.hostBridgeVersion,
+							profileId: hostContext.profileId,
+							schemaVersion: hostContext.schemaVersion,
+							serverId: hostContext.serverId,
+							sourceId: hostContext.sourceId,
+							userGesture: true,
+							windowId: hostContext.windowId,
+							action: {
+								disposition: 'native-window',
+								logicalViewId: request.kind,
+								route,
+								type: 'route.present',
+							},
+						});
+						return undefined;
+					}
+					return handleAuxiliaryRouteRequest(request);
+				},
+			}),
+		[handleAuxiliaryRouteRequest, hasNativeWindowControls, hostContext],
+	);
+	const exposurePanel = useMemo(
+		() =>
+			remoteAccessClients === undefined ? undefined : (
+				<RemoteExposurePanel
+					openSettings={auxiliaryRoutes.openSettings}
+					statusClient={remoteAccessClients.status}
+				/>
+			),
+		[auxiliaryRoutes.openSettings, remoteAccessClients],
+	);
+	const renderRemoteAccess = useCallback(
+		(settings: ConnectionsSettingsPresentation) => (
+			<RemoteAccessCategory
+				{...connectionRoute}
+				{...(exposurePanel === undefined ? {} : { exposurePanel })}
+				settings={settings}
+			/>
+		),
+		[connectionRoute, exposurePanel],
+	);
+	const restoreAuxiliaryFocus = useCallback(() => {
+		const target = auxiliaryFocusReturnRef.current;
+		auxiliaryFocusReturnRef.current = null;
+		window.requestAnimationFrame(() => {
+			if (target?.isConnected) target.focus();
+		});
+	}, []);
+	const requestBrowserAuxiliaryRoute = useCallback(
+		(route: BrowserAuxiliaryRoute) => {
+			switch (route) {
+				case 'settings':
+					void auxiliaryRoutes.openSettings();
+					break;
+				case 'about':
+					setAboutOpen(true);
+					break;
+			}
+		},
+		[auxiliaryRoutes],
+	);
+	const cancelAuxiliaryRoute = useCallback(() => {
+		pendingEditRef.current?.resolve(null);
+		pendingEditRef.current = null;
+		setAuxiliaryRoute(null);
+		restoreAuxiliaryFocus();
+	}, [restoreAuxiliaryFocus]);
+	const closeAuxiliaryWindow = useCallback(async () => {
+		if (
+			auxiliaryRouteRef.current?.kind === 'settings' &&
+			!(await settingsLeaveGuard.confirm())
+		)
+			return;
+		cancelAuxiliaryRoute();
+	}, [cancelAuxiliaryRoute, settingsLeaveGuard]);
+	const submitEditTabRoute = useCallback(
+		async (result: SharedEditTabResult) => {
+			const pending = pendingEditRef.current;
+			if (pending === null) return;
+			pendingEditRef.current = null;
+			pending.resolve(result);
+			const editState = pending.request.state;
+			if (editState.kind === 'project' && 'defaultShellProfileId' in result) {
+				await terminalClientContext.workspaceSnapshotStore?.waitForSnapshot(
+					(snapshot) =>
+						isProjectEditCommitted(
+							snapshot.projects[editState.projectId],
+							result,
+						),
+					{ timeoutMs: 5_000 },
+				);
+			}
+			setAuxiliaryRoute(null);
+			restoreAuxiliaryFocus();
+		},
+		[restoreAuxiliaryFocus, terminalClientContext.workspaceSnapshotStore],
+	);
+	const auxiliaryContent = (route: AuxiliaryRouteRequest) =>
+		route.kind === 'edit-tab' ? (
+			<SharedEditTabRouteBody
+				state={route.state}
+				onCancel={cancelAuxiliaryRoute}
+				onSubmit={submitEditTabRoute}
+			/>
+		) : (
+			<TerminalSettingsClientProvider client={serverSettingsClient}>
+				{route.kind === 'settings' ? (
+					<SettingsWindow
+						applicationClient={applicationClient}
+						aiTabMetadataClient={aiMetadataClient}
+						initialSectionId={route.sectionId}
+						initialItemId={route.itemId}
+						renderServerSelector={renderServerSelector}
+						macroSettingsClient={macroSettingsClient}
+						renderRemoteAccess={renderRemoteAccess}
+						remoteAccessStatusClient={remoteAccessStatusClient}
+						settingsClient={serverSettingsClient}
+						shellProfilesClient={shellProfilesClient}
+						serverIdentity={
+							selectedServer.connection?.label ??
+							terminalClientContext.connectionLabel ??
+							terminalClientContext.serverId
+						}
+					/>
+				) : (
+					<PerformanceLogWindow />
+				)}
+			</TerminalSettingsClientProvider>
+		);
+	const sharedProjectId = useMemo(() => {
+		const snapshot = terminalClientContext.workspaceSnapshotStore?.snapshot;
+		if (snapshot === null || snapshot === undefined) return undefined;
+		const viewId = snapshot.viewOrder[0];
+		const view = viewId === undefined ? undefined : snapshot.views[viewId];
+		return view?.projectIds[0];
+	}, [terminalClientContext.workspaceSnapshotStore?.snapshot]);
+	const sharedRouteContent = (() => {
+		switch (requestedView) {
+			case 'connections':
+				return auxiliaryContent({ kind: 'settings', sectionId: 'remote' });
+			case 'git':
+				return (
+					<SharedGitRouteBody
+						capabilityAvailable={
+							terminalClientContext.serverCapabilities?.includes(
+								FEATURE_CAPABILITIES.git,
+							) === true
+						}
+						gitClient={terminalClientContext.gitClient}
+						projectId={sharedProjectId}
+					/>
+				);
+			case 'agents':
+				return (
+					<SharedAgentRouteBody
+						client={terminalClientContext.agentStatusClient}
+					/>
+				);
+			case 'folder':
+				return (
+					<SharedFolderRouteBody
+						client={terminalClientContext.fileViewerClient}
+						projectId={sharedProjectId}
+					/>
+				);
+			case 'terminal':
+				return (
+					<SharedTerminalRouteBody
+						clientId={terminalClientContext.clientId}
+						panelClient={sharedTerminalPanelClient}
+						projectId={sharedProjectId}
+						serverId={terminalClientContext.serverId}
+						terminalClient={terminalClientContext.client}
+					/>
+				);
+			case 'settings':
+				return auxiliaryContent({ kind: 'settings' });
+			case 'macros':
+				return auxiliaryContent({ kind: 'settings', sectionId: 'macros' });
+			case 'recordings':
+				return <RecordingsWindow client={recordingsClient} />;
+			case 'performance-log':
+				return auxiliaryContent({ kind: 'performance-log' });
+			case 'edit-tab':
+				return <main role="status">Select a terminal tab to edit.</main>;
+			default:
+				return (
+					<ConnectedRendererWorkspace
+						host={Object.freeze({
+							auxiliaryRoutes,
+							onDisconnect: onBack,
+							onOpenConnectionManager: () => {
+								void auxiliaryRoutes.openSettings('remote');
+							},
+							onSwitchConnections:
+								hostContext === undefined && canLeaveManagerSession()
+									? onBack
+									: undefined,
+							presentation: Object.freeze({
+								nativeMenus: hasNativeMenus,
+								nativeWindowControls: hasNativeWindowControls,
+								...(hasNativeMenus
+									? {}
+									: {
+											renderCompactApplicationMenu: () => (
+												<ConnectedBrowserMenuBar
+													onBack={onBack}
+													onOpenAuxiliaryRoute={requestBrowserAuxiliaryRoute}
+													variant="compact"
+												/>
+											),
+										}),
+							}),
+							subscribeAppCommands,
+						})}
+						terminalClientContext={terminalClientContext}
+					/>
+				);
+		}
+	})();
+
+	if (nativeAuxiliaryDocument !== null) {
+		return (
+			<main
+				className="connected-web-native-auxiliary"
+				data-connected-native-auxiliary-route={nativeAuxiliaryDocument.kind}
+				{...(nativeTitlebar === undefined
+					? {}
+					: { 'data-native-titlebar': nativeTitlebar })}
+			>
+				<SettingsLeaveGuardProvider value={settingsLeaveGuard}>
+					{auxiliaryContent(nativeAuxiliaryDocument)}
+				</SettingsLeaveGuardProvider>
+			</main>
+		);
+	}
+
+	const workspaceContent = (
+		<ResponsiveWorkspaceEntry
+			route={sharedRoute}
+			capabilities={responsiveCapabilities}
+		>
+			{sharedRouteContent}
+		</ResponsiveWorkspaceEntry>
+	);
+
+	return (
+		<SettingsLeaveGuardProvider value={settingsLeaveGuard}>
+		<div className="connected-web-renderer-workspace">
+			<TerminalSettingsClientProvider client={serverSettingsClient}>
+				
+					{hasNativeMenus ? null : (
+						<ConnectedBrowserMenuBar
+							onBack={onBack}
+							onOpenAuxiliaryRoute={requestBrowserAuxiliaryRoute}
+						/>
+					)}
+					{workspaceContent}
+				
+			</TerminalSettingsClientProvider>
+			{auxiliaryRoute === null ? null : (
+				<ConnectedBrowserAuxiliaryWindow
+					key={auxiliaryRoute.kind}
+					route={auxiliaryRoute}
+					onClose={() => void closeAuxiliaryWindow()}
+				>
+					{auxiliaryContent(auxiliaryRoute)}
+				</ConnectedBrowserAuxiliaryWindow>
+			)}
+			{aboutOpen ? (
+				<ConnectedBrowserAboutWindow onClose={() => setAboutOpen(false)} />
+			) : null}
+		</div>
+		</SettingsLeaveGuardProvider>
+	);
+}
+
+function ConnectedBrowserMenuBar({
+	onBack,
+	onOpenAuxiliaryRoute,
+	variant = 'bar',
+}: Readonly<{
+	onBack: () => void;
+	onOpenAuxiliaryRoute: (route: BrowserAuxiliaryRoute) => void;
+	/** `compact` folds the four menus into one control for the chrome row. */
+	variant?: 'bar' | 'compact';
+}>) {
+	const [openMenu, setOpenMenu] = useState<BrowserMenuId | null>(null);
+	const menuButtonRefs = useRef(new Map<BrowserMenuId, HTMLButtonElement>());
+	const itemRefs = useRef(new Map<string, HTMLButtonElement>());
+	const isMac = useMemo(() => navigator.userAgent.includes('Mac'), []);
+	const [touchTextSelection, setTouchTextSelection] = useState(
+		isTouchTextSelectionEnabled,
+	);
+	useEffect(
+		() => subscribeTouchTextSelectionEnabled(setTouchTextSelection),
+		[],
+	);
+	const [statusBarVisible, setStatusBarVisible] = useState(
+		currentStatusBarVisibility,
+	);
+	useEffect(() => subscribeStatusBarVisibility(setStatusBarVisible), []);
+
+	const dispatchShortcut = useCallback(
+		(key: string, options: KeyboardEventInit = {}) => {
+			window.dispatchEvent(
+				new KeyboardEvent('keydown', {
+					bubbles: true,
+					cancelable: true,
+					ctrlKey: !isMac,
+					key,
+					metaKey: isMac,
+					...options,
+				}),
+			);
+		},
+		[isMac],
+	);
+
+	// Commands that ship unbound cannot be reached by synthesising a keystroke,
+	// so the menu names the command itself. Both routes end at the same
+	// dispatch the Desktop native menu uses.
+	const dispatchCommand = useCallback((command: AppCommand) => {
+		window.dispatchEvent(
+			new CustomEvent('terminay-app-command', { detail: { command } }),
+		);
+	}, []);
+
+	const menuItems = useMemo<
+		Readonly<Record<BrowserMenuId, readonly BrowserMenuItem[]>>
+	>(
+		() => ({
+			edit: [
+				{
+					id: 'undo',
+					label: 'Undo',
+					onSelect: () => document.execCommand('undo'),
+				},
+				{
+					id: 'redo',
+					label: 'Redo',
+					onSelect: () => document.execCommand('redo'),
+				},
+				{
+					id: 'cut',
+					label: 'Cut',
+					onSelect: () => document.execCommand('cut'),
+				},
+				{
+					id: 'copy',
+					label: 'Copy',
+					onSelect: () => document.execCommand('copy'),
+				},
+				{
+					id: 'paste',
+					label: 'Paste',
+					onSelect: () => document.execCommand('paste'),
+				},
+				{
+					id: 'select-all',
+					label: 'Select All',
+					onSelect: () => document.execCommand('selectAll'),
+				},
+				{
+					id: 'touch-text-selection',
+					label: 'Enable Text Selection',
+					startsGroup: true,
+					checked: touchTextSelection,
+					onSelect: () => setTouchTextSelectionEnabled(!touchTextSelection),
+				},
+			],
+			terminay: [
+				{
+					id: 'new-terminal',
+					label: 'New Terminal Tab',
+					onSelect: () => dispatchShortcut('t'),
+				},
+				{
+					id: 'new-project',
+					label: 'New Project',
+					onSelect: () => dispatchShortcut('p'),
+				},
+				{
+					id: 'settings',
+					label: 'Settings…',
+					startsGroup: true,
+					onSelect: () => onOpenAuxiliaryRoute('settings'),
+				},
+				// Only a session that can go back to the connection manager has
+				// somewhere to disconnect to.
+				...(canLeaveManagerSession()
+					? [{ id: 'disconnect', label: 'Disconnect', startsGroup: true, onSelect: onBack }]
+					: []),
+			],
+			help: [
+				{
+					id: 'documentation',
+					label: 'Documentation',
+					onSelect: () =>
+						window.open('https://github.com', '_blank', 'noopener,noreferrer'),
+				},
+				{
+					id: 'about',
+					label: 'About Terminay',
+					onSelect: () => onOpenAuxiliaryRoute('about'),
+				},
+			],
+			view: [
+				{
+					id: 'show-dashboard',
+					label: 'Show Dashboard',
+					onSelect: () => dispatchShortcut('0'),
+				},
+				{
+					id: 'toggle-status-bar',
+					label: 'Show Status Bar',
+					checked: statusBarVisible,
+					onSelect: () => dispatchCommand('toggle-status-bar'),
+				},
+				{
+					id: 'open-command-bar',
+					label: 'Open Command Bar',
+					startsGroup: true,
+					onSelect: () => dispatchCommand('open-command-bar'),
+				},
+				{
+					id: 'edit-active-tab',
+					label: 'Edit Active Tab…',
+					onSelect: () => dispatchCommand('edit-active-tab'),
+				},
+				{
+					id: 'edit-active-project',
+					label: 'Edit Active Project…',
+					onSelect: () => dispatchCommand('edit-active-project'),
+				},
+				{
+					id: 'set-project-root',
+					startsGroup: true,
+					label: 'Set Project Root to Working Directory',
+					onSelect: () => dispatchShortcut('r'),
+				},
+				{
+					id: 'toggle-file-explorer',
+					label: 'Toggle File Explorer Sidebar',
+					onSelect: () => dispatchShortcut('o'),
+				},
+			],
+		}),
+		[
+			dispatchCommand,
+			dispatchShortcut,
+			onBack,
+			onOpenAuxiliaryRoute,
+			statusBarVisible,
+			touchTextSelection,
+		],
+	);
+
+	const focusMenuButton = useCallback((menuId: BrowserMenuId) => {
+		menuButtonRefs.current.get(menuId)?.focus();
+	}, []);
+
+	const focusFirstMenuItem = useCallback(
+		(menuId: BrowserMenuId) => {
+			const first = menuItems[menuId][0];
+			if (first) itemRefs.current.get(`${menuId}:${first.id}`)?.focus();
+		},
+		[menuItems],
+	);
+
+	const moveMenuFocus = useCallback(
+		(current: BrowserMenuId, delta: number) => {
+			const index = menuOrder.indexOf(current);
+			const next =
+				menuOrder[(index + delta + menuOrder.length) % menuOrder.length];
+			setOpenMenu(next);
+			focusMenuButton(next);
+			return next;
+		},
+		[focusMenuButton],
+	);
+
+	const activateItem = useCallback(
+		(menuId: BrowserMenuId, item: BrowserMenuItem) => {
+			setOpenMenu(null);
+			menuButtonRefs.current.get(menuId)?.focus();
+			item.onSelect();
+		},
+		[],
+	);
+
+	const onMenuButtonKeyDown = useCallback(
+		(event: ReactKeyboardEvent<HTMLButtonElement>, menuId: BrowserMenuId) => {
+			switch (event.key) {
+				case 'ArrowDown':
+				case 'Enter':
+				case ' ':
+					event.preventDefault();
+					setOpenMenu(menuId);
+					window.requestAnimationFrame(() => focusFirstMenuItem(menuId));
+					break;
+				case 'ArrowLeft':
+					event.preventDefault();
+					moveMenuFocus(menuId, -1);
+					break;
+				case 'ArrowRight':
+					event.preventDefault();
+					moveMenuFocus(menuId, 1);
+					break;
+				case 'Home':
+					event.preventDefault();
+					focusMenuButton(menuOrder[0]);
+					break;
+				case 'End':
+					event.preventDefault();
+					focusMenuButton(menuOrder[menuOrder.length - 1]);
+					break;
+				case 'Escape':
+					setOpenMenu(null);
+					break;
+				default:
+					break;
+			}
+		},
+		[focusFirstMenuItem, focusMenuButton, moveMenuFocus],
+	);
+
+	const onMenuItemKeyDown = useCallback(
+		(
+			event: ReactKeyboardEvent<HTMLButtonElement>,
+			menuId: BrowserMenuId,
+			itemIndex: number,
+		) => {
+			const items = menuItems[menuId];
+			const focusItem = (index: number) => {
+				const next = items[index];
+				if (next) itemRefs.current.get(`${menuId}:${next.id}`)?.focus();
+			};
+			switch (event.key) {
+				case 'ArrowDown':
+					event.preventDefault();
+					focusItem((itemIndex + 1) % items.length);
+					break;
+				case 'ArrowUp':
+					event.preventDefault();
+					focusItem((itemIndex - 1 + items.length) % items.length);
+					break;
+				case 'ArrowLeft':
+					event.preventDefault();
+					window.requestAnimationFrame(() =>
+						focusFirstMenuItem(moveMenuFocus(menuId, -1)),
+					);
+					break;
+				case 'ArrowRight':
+					event.preventDefault();
+					window.requestAnimationFrame(() =>
+						focusFirstMenuItem(moveMenuFocus(menuId, 1)),
+					);
+					break;
+				case 'Home':
+					event.preventDefault();
+					focusItem(0);
+					break;
+				case 'End':
+					event.preventDefault();
+					focusItem(items.length - 1);
+					break;
+				case 'Escape':
+					event.preventDefault();
+					setOpenMenu(null);
+					menuButtonRefs.current.get(menuId)?.focus();
+					break;
+				default:
+					break;
+			}
+		},
+		[focusFirstMenuItem, menuItems, moveMenuFocus],
+	);
+
+	useEffect(() => {
+		if (openMenu === null) return;
+		const onPointerDown = (event: PointerEvent) => {
+			const target = event.target;
+			if (
+				target instanceof Element &&
+				target.closest('.connected-web-menubar, .connected-web-compact-menu')
+			)
+				return;
+			setOpenMenu(null);
+		};
+		window.addEventListener('pointerdown', onPointerDown);
+		return () => window.removeEventListener('pointerdown', onPointerDown);
+	}, [openMenu]);
+
+	if (variant === 'compact') {
+		return (
+			<div className="connected-web-compact-menu">
+				<button
+					type="button"
+					className="compact-chrome__icon connected-web-compact-menu__button"
+					aria-haspopup="menu"
+					aria-expanded={openMenu !== null}
+					aria-label="Application menu"
+					title="Application menu"
+					onClick={() =>
+						setOpenMenu((current) => (current === null ? 'terminay' : null))
+					}
+				>
+					<MenuIcon size={17} aria-hidden="true" />
+				</button>
+				{openMenu === null ? null : (
+					<div
+						className="connected-web-compact-menu__popup"
+						role="menu"
+						aria-label="Application menu"
+					>
+						{menuOrder.map((menuId) => (
+							<div className="connected-web-compact-menu__group" key={menuId}>
+								{/* The four menus keep their names, so one control still
+								    reads as File, Edit, View, and Help. */}
+								<div className="connected-web-compact-menu__label">
+									{menuLabels[menuId]}
+								</div>
+								{menuItems[menuId].map((item) => (
+									<button
+										key={item.id}
+										type="button"
+										className="connected-web-menu__item"
+										role={
+											item.checked === undefined
+												? 'menuitem'
+												: 'menuitemcheckbox'
+										}
+										{...(item.checked === undefined
+											? {}
+											: { 'aria-checked': item.checked })}
+										onClick={() => {
+											setOpenMenu(null);
+											item.onSelect();
+										}}
+									>
+										{item.checked === undefined ? null : (
+											<span
+												className="connected-web-menu__check"
+												aria-hidden="true"
+											>
+												{item.checked ? '✓' : ''}
+											</span>
+										)}
+										{item.label}
+									</button>
+								))}
+							</div>
+						))}
+					</div>
+				)}
+			</div>
+		);
+	}
+
+	return (
+		<nav className="connected-web-menubar" aria-label="Application menu">
+			<div className="connected-web-menubar__menus" role="menubar">
+				{menuOrder.map((menuId) => (
+					<div className="connected-web-menu" key={menuId}>
+						<button
+							ref={(node) => {
+								if (node) menuButtonRefs.current.set(menuId, node);
+								else menuButtonRefs.current.delete(menuId);
+							}}
+							type="button"
+							className="connected-web-menu__button"
+							role="menuitem"
+							aria-haspopup="menu"
+							aria-expanded={openMenu === menuId}
+							onClick={() =>
+								setOpenMenu((current) => (current === menuId ? null : menuId))
+							}
+							onKeyDown={(event) => onMenuButtonKeyDown(event, menuId)}
+						>
+							{menuLabels[menuId]}
+						</button>
+						{openMenu === menuId ? (
+							<div
+								className="connected-web-menu__popup"
+								role="menu"
+								aria-label={menuLabels[menuId]}
+							>
+								{menuItems[menuId].map((item, index) => (
+									<button
+										ref={(node) => {
+											const key = `${menuId}:${item.id}`;
+											if (node) itemRefs.current.set(key, node);
+											else itemRefs.current.delete(key);
+										}}
+										key={item.id}
+										type="button"
+										className={`connected-web-menu__item${item.startsGroup === true ? ' connected-web-menu__item--group' : ''}${item.checked === undefined ? '' : ' connected-web-menu__item--checkable'}`}
+										role={
+											item.checked === undefined
+												? 'menuitem'
+												: 'menuitemcheckbox'
+										}
+										{...(item.checked === undefined
+											? {}
+											: { 'aria-checked': item.checked })}
+										onClick={() => activateItem(menuId, item)}
+										onKeyDown={(event) =>
+											onMenuItemKeyDown(event, menuId, index)
+										}
+									>
+										{item.checked === undefined ? null : (
+											<span
+												className="connected-web-menu__check"
+												aria-hidden="true"
+											>
+												{item.checked ? '✓' : ''}
+											</span>
+										)}
+										{item.label}
+									</button>
+								))}
+							</div>
+						) : null}
+					</div>
+				))}
+			</div>
+		</nav>
+	);
+}
+
+/** Default sizes for the resizable management windows. */
+const auxiliaryWindowSizes: Readonly<
+	Record<Exclude<AuxiliaryRouteRequest['kind'], 'edit-tab'>, WindowSize>
+> = Object.freeze({
+	settings: { width: 1480, height: 820 },
+	'performance-log': { width: 1180, height: 820 },
+});
+
+function auxiliaryWindowKind(route: AuxiliaryRouteRequest): InPageWindowKind {
+	return route.kind === 'edit-tab'
+		? { resizable: false, width: 680 }
+		: {
+				resizable: true,
+				id: route.kind,
+				defaultSize: auxiliaryWindowSizes[route.kind],
+			};
+}
+
+function ConnectedBrowserAuxiliaryWindow({
+	children,
+	onClose,
+	route,
+}: Readonly<{
+	children: ReactNode;
+	onClose: () => void;
+	route: AuxiliaryRouteRequest;
+}>) {
+	return (
+		<InPageWindow
+			kind={auxiliaryWindowKind(route)}
+			name={route.kind}
+			title={getAuxiliaryRouteTitle(route)}
+			onClose={onClose}
+		>
+			{children}
+		</InPageWindow>
+	);
+}
+
+/** The Desktop About document, framed. The frame runs no script and may only
+ * open its links in a new tab; it can never navigate this page. */
+function ConnectedBrowserAboutWindow({
+	onClose,
+}: Readonly<{ onClose: () => void }>) {
+	const aboutDocument = useMemo(
+		() =>
+			aboutWindowDocumentHtml({
+				version:
+					typeof __TERMINAY_VERSION__ === 'string'
+						? __TERMINAY_VERSION__
+						: 'unknown',
+				links: 'new-tab',
+			}),
+		[],
+	);
+
+	return (
+		<InPageWindow
+			kind={{ resizable: false, width: 440 }}
+			name="about"
+			title="About Terminay"
+			onClose={onClose}
+		>
+			<iframe
+				className="connected-web-about-frame"
+				sandbox="allow-popups allow-popups-to-escape-sandbox"
+				srcDoc={aboutDocument}
+				title="About Terminay"
+			/>
+		</InPageWindow>
+	);
+}
+
+function getAuxiliaryRouteTitle(route: AuxiliaryRouteRequest): string {
+	switch (route.kind) {
+		case 'settings':
+			return 'Settings';
+		case 'performance-log':
+			return 'Performance Log';
+		case 'edit-tab':
+			return route.state.kind === 'project'
+				? 'Edit Project Tab'
+				: 'Edit Terminal Tab';
+	}
+}
+
+function createUnavailableRemoteAccessClient(): RemoteAccessStatusClient {
+	const status: RemoteAccessStatus = {
+		activeConnectionCount: 0,
+		pendingApprovals: [],
+		pendingWebRtcConnectionCount: 0,
+		auditEvents: [],
+		connections: [],
+		configurationIssue: 'Remote Access is managed by Terminay Desktop.',
+		configurationPath: '',
+		errorMessage: 'Remote Access is unavailable in the browser host.',
+		isRunning: false,
+		pairedDeviceCount: 0,
+		pairedDevices: [],
+		webRtcPairingExpiresAt: null,
+		webRtcPairingQrCodeDataUrl: null,
+		webRtcPairingUrl: null,
+		webRtcRoomId: null,
+		webRtcStatus: 'not-configured',
+		webRtcStatusMessage: 'Remote Access is unavailable in the browser host.',
+	};
+	const getStatus = async () => status;
+	return Object.freeze({
+		approveDevice: getStatus,
+		closeConnection: getStatus,
+		createPairingLink: getStatus,
+		denyDevice: getStatus,
+		getStatus,
+		resetIdentity: getStatus,
+		revokeDevice: getStatus,
+		subscribe: () => () => undefined,
+		toggleServer: getStatus,
+	});
+}

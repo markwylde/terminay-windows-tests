@@ -1,0 +1,124 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import test from 'node:test';
+
+const main = await readFile(
+	new URL('../electron/main.ts', import.meta.url),
+	'utf8',
+);
+const preload = await readFile(
+	new URL('../electron/serverUiPreload.ts', import.meta.url),
+	'utf8',
+);
+const terminalAuthority = await readFile(
+	new URL('../electron/serverTerminalAuthority.ts', import.meta.url),
+	'utf8',
+);
+
+test('application features have no renderer-owned Electron IPC backdoors', () => {
+	const obsoleteChannels = [
+		'desktop:connection-host:',
+		'remote:get-status',
+		'remote:toggle-server',
+		'remote:revoke-device',
+		'remote:close-connection',
+		'remote:set-pairing-pin',
+		'remote:get-pairing-pin-status',
+		'remote:status-changed',
+	];
+
+	for (const channel of obsoleteChannels) {
+		assert.doesNotMatch(
+			main,
+			new RegExp(channel.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'u'),
+			channel,
+		);
+		assert.doesNotMatch(
+			preload,
+			new RegExp(channel.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'u'),
+			channel,
+		);
+	}
+});
+
+test('obsolete renderer-owned profile and broadcast helpers stay deleted', () => {
+	// `rememberRemoteConnection` is intentionally not listed here. It is a
+	// main-process-only, atomic persistence helper for the sanitized Desktop
+	// profile projection; it neither exposes renderer IPC nor retains pairing
+	// credentials.
+	for (const helper of [
+		'connectRemoteServer',
+		'openCanonicalRemoteServerWindow',
+		'openCanonicalHttpRemoteServerWindow',
+		'reconnectRememberedRemoteProfile',
+		'saveRememberedRemoteConnections',
+		'requireMutableDesktopConnectionProfile',
+		'broadcastRemoteAccessStatus',
+		'pendingRemoteConnectionWindowsByProfile',
+	]) {
+		assert.doesNotMatch(main, new RegExp(`\\b${helper}\\b`, 'u'), helper);
+	}
+});
+
+test('Desktop pairing runs through the tested attempt sequence with the durable profile store', () => {
+	// The ordering itself — profile saved before the first reconnect, kept when
+	// that reconnect fails — is exercised in desktop-pairing-attempt.test.mjs.
+	// This guards the wiring: main must hand that sequence its real persistence
+	// helper rather than keep a private copy of the flow.
+	const start = main.indexOf(
+		'switchToPairedDesktopServer = async (pairingUrl, attemptId) =>',
+	);
+	const pairingFlow = main.slice(
+		start,
+		main.indexOf('const launchCanonical = async (): Promise<void> =>', start),
+	);
+	assert.match(pairingFlow, /await runDesktopPairingAttempt\(\{/u);
+	assert.match(pairingFlow, /rememberProfile: rememberRemoteConnection,/u);
+	assert.doesNotMatch(pairingFlow, /rememberedRemoteConnections\.(?:set|delete)\(/u);
+	assert.match(main, /case 'connection\.pair-cancel':/u);
+});
+
+test('canonical host routes retain server-owned application operations', () => {
+	assert.match(main, /applicationFeatures:\s*\{/u);
+	assert.match(main, /mcpInstall:\s*\{\s*serverCommand:/u);
+	assert.match(terminalAuthority, /new McpInstallRouter\(/u);
+	assert.match(terminalAuthority, /'mcp-install\.status':/u);
+	assert.match(terminalAuthority, /'mcp-install\.install':/u);
+	assert.match(terminalAuthority, /'mcp-install\.uninstall':/u);
+	assert.match(main, /remoteAccess:\s*\{/u);
+	assert.match(
+		main,
+		/case 'route\.present':\s*await presentCanonicalAuxiliaryRoute/u,
+	);
+	assert.match(main, /presentCanonicalAuxiliaryRoute/u);
+	assert.match(main, /prepareCanonicalRemoteLaunch/u);
+	assert.match(main, /loadRememberedRemoteConnections\(\)/u);
+});
+
+test('MCP install commands name an extension install target, not a hardcoded client', () => {
+	assert.match(
+		terminalAuthority,
+		/const mcpTarget = \(request: CommandRequest\): string =>/u,
+	);
+	for (const agent of [
+		'claudeCode',
+		'codex',
+		'cursor',
+		'gemini',
+		'grok',
+		'openCode',
+	])
+		assert.doesNotMatch(
+			terminalAuthority,
+			new RegExp(`agent !== '${agent}'`, 'u'),
+			agent,
+		);
+});
+
+test('Desktop MCP terminal listing tolerates restored sessions without live activity records', () => {
+	assert.match(
+		main,
+		/const activityBySession = authority\.activity\.snapshot\(\)\.sessions;/u,
+	);
+	assert.match(main, /const activity = activityBySession\[entry\.id\];/u);
+});

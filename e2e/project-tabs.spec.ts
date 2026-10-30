@@ -1,0 +1,1352 @@
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import type { ElectronApplication, Locator, Page } from '@playwright/test';
+import { expect, test } from './fixtures';
+import { openMacroLauncher, sendAppCommand } from './support/app';
+import {
+	activeStartChooser,
+	chooseProjectStart,
+	createStartedProject,
+} from './support/project-start';
+import {
+	holdTornOffProjectTab,
+	setCursorScreenPoint,
+	tabBarScreenPoints,
+	tearOffProjectTab,
+} from './support/project-tab-drag';
+import {
+	commandArrived,
+	commandGate,
+	endSettlePeriod,
+	HELD_SERVER_CLOCK,
+	INPUT_WINDOW_MS,
+	serverClock,
+} from './support/server-clock';
+import { submitTerminalCommand } from './support/terminal';
+import { typeInVisibleTerminal } from './support/terminal-input';
+import {
+	activeTerminalPanel,
+	settledTerminalSessionId,
+	terminalPanelForSession,
+} from './support/terminal-session';
+import {
+	cancelEditWindow,
+	longPress,
+	openProjectEditWindow,
+	submitEditWindow,
+} from './support/ui';
+
+async function readCssVariableFromStyle(
+	locator: Locator,
+	variableName: string,
+): Promise<string> {
+	const style = await locator.getAttribute('style');
+	const match = style?.match(new RegExp(`${variableName}:\\s*([^;]+)`));
+
+	if (!match?.[1]) {
+		throw new Error(
+			`Missing ${variableName} in style attribute: ${style ?? '(none)'}`,
+		);
+	}
+
+	return match[1].trim();
+}
+
+async function expectTerminalInputFocused(page: Page): Promise<void> {
+	await expect
+		.poll(async () =>
+			page.evaluate(
+				() =>
+					document.activeElement?.classList.contains('xterm-helper-textarea') ??
+					false,
+			),
+		)
+		.toBe(true);
+}
+
+async function waitForWorkspacePopout(
+	electronApp: ElectronApplication,
+	mainWindow: Page,
+): Promise<Page> {
+	let popout: Page | undefined;
+	await expect
+		.poll(
+			async () => {
+				popout = electronApp
+					.windows()
+					.find(
+						(page) =>
+							page !== mainWindow &&
+							!page.isClosed() &&
+							!page.url().startsWith('about:blank') &&
+							!page.url().startsWith('data:'),
+					);
+				return popout === undefined
+					? false
+					: (await popout.locator('[data-terminay-app-component]').count()) > 0;
+			},
+			{ timeout: 20_000 },
+		)
+		.toBe(true);
+	if (popout === undefined)
+		throw new Error('Expected the project popout window');
+	await expect(popout.locator('[data-terminay-app-component]')).toBeVisible({
+		timeout: 20_000,
+	});
+	return popout;
+}
+
+async function closeNativePageWindow(
+	electronApp: ElectronApplication,
+	page: Page,
+): Promise<void> {
+	const nativeWindow = await electronApp.browserWindow(page);
+	await nativeWindow.evaluate((window) => {
+		window.close();
+	});
+}
+
+type BusyWindowTestMain = typeof globalThis & {
+	closeDialog?: Electron.MessageBoxOptions;
+	__terminayTestRunningTerminalCountForWindow?: (
+		webContentsId: number,
+	) => Promise<number>;
+};
+
+/** Wait until close-protection would treat this native window as busy. */
+async function waitUntilNativeWindowHasBusyTerminal(
+	electronApp: ElectronApplication,
+	page: Page,
+): Promise<void> {
+	const nativeWindow = await electronApp.browserWindow(page);
+	const webContentsId = await nativeWindow.evaluate(
+		(window) => window.webContents.id,
+	);
+	await expect
+		.poll(
+			() =>
+				electronApp.evaluate(async (_electron, id) => {
+					const count = await (
+						globalThis as BusyWindowTestMain
+					).__terminayTestRunningTerminalCountForWindow?.(id);
+					return count ?? 0;
+				}, webContentsId),
+			{ timeout: 15_000 },
+		)
+		.toBeGreaterThan(0);
+}
+
+test.describe('project tabs', () => {
+	test('dragging a project into a new window preserves its canonical project and terminal', async ({
+		electronApp,
+		mainWindow,
+	}) => {
+		await createStartedProject(mainWindow);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(2);
+		await expect(mainWindow.locator('[data-pending-project-id]')).toHaveCount(
+			0,
+		);
+
+		const editWindow = await openProjectEditWindow(mainWindow);
+		await editWindow
+			.getByPlaceholder('Project name')
+			.fill('react-massive-table');
+		await submitEditWindow(editWindow);
+
+		const draggedProject = mainWindow
+			.locator('.project-tab', { hasText: 'react-massive-table' })
+			.first();
+		await expect(draggedProject).toBeVisible();
+		const projectId = await draggedProject.getAttribute('data-project-id');
+		if (!projectId) throw new Error('Expected the moved project identity');
+		const activeWorkspace = mainWindow.locator('.project-workspace--active');
+		await expect(activeWorkspace.locator('.terminal-panel')).toHaveCount(1);
+		const sessionId = await settledTerminalSessionId(
+			mainWindow.locator('.project-workspace--active .terminal-panel').first(),
+		);
+
+		const projectBox = await draggedProject.boundingBox();
+		if (!projectBox)
+			throw new Error('Expected the project tab to have a layout box');
+		const revisionBeforeMove = Number(
+			await mainWindow
+				.locator('.app-shell')
+				.getAttribute('data-terminay-workspace-revision'),
+		);
+
+		const centerX = projectBox.x + projectBox.width / 2;
+		const centerY = projectBox.y + projectBox.height / 2;
+		await mainWindow.mouse.move(centerX, centerY);
+		await mainWindow.mouse.down();
+		await mainWindow.mouse.move(centerX, centerY + 180, { steps: 12 });
+		await mainWindow.mouse.up();
+		const popoutWindow = await waitForWorkspacePopout(electronApp, mainWindow);
+
+		await expect(mainWindow.locator('.project-tab-title')).toHaveText([
+			'Project',
+		]);
+		await expect
+			.poll(async () =>
+				Number(
+					await popoutWindow
+						.locator('.app-shell')
+						.getAttribute('data-terminay-workspace-revision'),
+				),
+			)
+			.toBeGreaterThan(revisionBeforeMove);
+
+		await expect(popoutWindow.locator('.project-tab-title')).toHaveText([
+			'react-massive-table',
+		]);
+		await expect(popoutWindow.locator('.project-tab')).toHaveAttribute(
+			'data-project-id',
+			projectId,
+		);
+		await expect(
+			popoutWindow.locator(
+				`.terminal-panel[data-terminay-terminal-session-id="${sessionId}"]`,
+			),
+		).toBeVisible();
+		await popoutWindow.reload();
+		await expect(popoutWindow.locator('.project-tab-title')).toHaveText([
+			'react-massive-table',
+		]);
+		await expect(popoutWindow.locator('.project-tab')).toHaveAttribute(
+			'data-project-id',
+			projectId,
+		);
+		await expect(
+			popoutWindow.locator('.project-workspace--active .terminal-tab-title'),
+		).toHaveText(['Terminal 1']);
+		await expect(
+			popoutWindow.locator(
+				`.terminal-panel[data-terminay-terminal-session-id="${sessionId}"]`,
+			),
+		).toBeVisible();
+	});
+
+	test('a project dragged out and back in can be dragged out again', async ({
+		electronApp,
+		mainWindow,
+	}) => {
+		await createStartedProject(mainWindow);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(2);
+		await expect(mainWindow.locator('[data-pending-project-id]')).toHaveCount(
+			0,
+		);
+		const movedProject = mainWindow.locator('.project-tab', {
+			hasText: 'Project 2',
+		});
+		const projectId = await movedProject.getAttribute('data-project-id');
+		if (!projectId) throw new Error('Expected the moved project identity');
+		const main = await tabBarScreenPoints(electronApp, mainWindow);
+		// The project's terminal is the same live session wherever it goes.
+		const sessionId = await settledTerminalSessionId(
+			mainWindow.locator('.project-workspace--active .terminal-panel').first(),
+		);
+		const expectLiveTerminal = async (page: Page) => {
+			await expect(
+				page.locator(
+					`.terminal-panel[data-terminay-terminal-session-id="${sessionId}"]`,
+				),
+			).toBeVisible();
+			await expect(page.getByText('This session has ended')).toHaveCount(0);
+		};
+
+		// Out: released over no tab bar, the project opens in its own window.
+		await tearOffProjectTab(
+			electronApp,
+			mainWindow,
+			movedProject,
+			main.clearOfBar,
+		);
+		const popoutWindow = await waitForWorkspacePopout(electronApp, mainWindow);
+		await expect(mainWindow.locator('.project-tab-title')).toHaveText([
+			'Project',
+		]);
+		await expect(popoutWindow.locator('.project-tab')).toHaveAttribute(
+			'data-project-id',
+			projectId,
+		);
+
+		// Keep the two tab bars apart so each release point names one window.
+		const popoutNativeWindow = await electronApp.browserWindow(popoutWindow);
+		await popoutNativeWindow.evaluate(
+			(window, position) => window.setPosition(position.x, position.y),
+			{ x: main.onBar.x - 200, y: main.onBar.y + 200 },
+		);
+
+		// Back in: released over the main window's tab bar to the right of
+		// every tab, the project becomes its last and active tab and the
+		// emptied window closes.
+		await tearOffProjectTab(
+			electronApp,
+			popoutWindow,
+			popoutWindow.locator('.project-tab'),
+			main.onBar,
+		);
+		await expect(
+			mainWindow.locator(`.project-tab[data-project-id="${projectId}"]`),
+		).toHaveCount(1);
+		await expect(mainWindow.locator('.project-tab-title')).toHaveText([
+			'Project',
+			'Project 2',
+		]);
+		await expect(mainWindow.locator('.project-tab--active')).toHaveAttribute(
+			'data-project-id',
+			projectId,
+		);
+		await expect.poll(() => popoutWindow.isClosed()).toBe(true);
+		await expectLiveTerminal(mainWindow);
+
+		// Out again: the returned project still tears off into a new window.
+		await tearOffProjectTab(
+			electronApp,
+			mainWindow,
+			mainWindow.locator(`.project-tab[data-project-id="${projectId}"]`),
+			main.clearOfBar,
+		);
+		const secondPopoutWindow = await waitForWorkspacePopout(
+			electronApp,
+			mainWindow,
+		);
+		await expect(secondPopoutWindow.locator('.project-tab')).toHaveAttribute(
+			'data-project-id',
+			projectId,
+		);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(1);
+		await expectLiveTerminal(secondPopoutWindow);
+	});
+
+	test('a project held over another window lands where it is dropped and becomes active', async ({
+		electronApp,
+		mainWindow,
+	}) => {
+		await createStartedProject(mainWindow);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(2);
+		await expect(mainWindow.locator('[data-pending-project-id]')).toHaveCount(
+			0,
+		);
+		const movedProject = mainWindow.locator('.project-tab', {
+			hasText: 'Project 2',
+		});
+		const projectId = await movedProject.getAttribute('data-project-id');
+		if (!projectId) throw new Error('Expected the moved project identity');
+		const main = await tabBarScreenPoints(electronApp, mainWindow);
+		await tearOffProjectTab(
+			electronApp,
+			mainWindow,
+			movedProject,
+			main.clearOfBar,
+		);
+		const popoutWindow = await waitForWorkspacePopout(electronApp, mainWindow);
+		await expect(mainWindow.locator('.project-tab-title')).toHaveText([
+			'Project',
+		]);
+		await expect(mainWindow.locator('.project-tab--active')).toHaveText(
+			'Project',
+		);
+		const popoutNativeWindow = await electronApp.browserWindow(popoutWindow);
+		await popoutNativeWindow.evaluate(
+			(window, position) => window.setPosition(position.x, position.y),
+			{ x: main.onBar.x - 200, y: main.onBar.y + 200 },
+		);
+		const firstTab = await mainWindow.locator('.project-tab').boundingBox();
+		if (!firstTab) throw new Error('Expected the remaining tab layout box');
+		const mainContent = await (
+			await electronApp.browserWindow(mainWindow)
+		).evaluate((window) => window.getContentBounds());
+		const beforeFirstTab = {
+			x: Math.round(mainContent.x + firstTab.x + 4),
+			y: main.onBar.y,
+		};
+		const placeholder = mainWindow.locator('.project-tab--drop-placeholder');
+		const tabFill = (tab: Locator) =>
+			tab.evaluate(
+				(element) => getComputedStyle(element, '::before').backgroundColor,
+			);
+		const draggedTabFill = await tabFill(
+			popoutWindow.locator('.project-tab--active'),
+		);
+		expect(draggedTabFill).not.toBe(
+			await tabFill(mainWindow.locator('.project-tab--active')),
+		);
+
+		await holdTornOffProjectTab(
+			electronApp,
+			popoutWindow,
+			popoutWindow.locator('.project-tab'),
+		);
+		await expect(placeholder).toHaveCount(0);
+
+		// Held over the main window's bar: the strip shows it at the pointer.
+		await setCursorScreenPoint(electronApp, beforeFirstTab);
+		await expect(placeholder).toHaveText('Project 2');
+		// It keeps the dragged project's colour, not this window's.
+		await expect.poll(() => tabFill(placeholder)).toBe(draggedTabFill);
+		await expect(mainWindow.locator('.project-tab').first()).toHaveClass(
+			/project-tab--drop-placeholder/,
+		);
+		await setCursorScreenPoint(electronApp, main.onBar);
+		await expect(mainWindow.locator('.project-tab').last()).toHaveClass(
+			/project-tab--drop-placeholder/,
+		);
+
+		// Off the bar again: the strip gives it back.
+		await setCursorScreenPoint(electronApp, main.clearOfBar);
+		await expect(placeholder).toHaveCount(0);
+
+		// Released before the first tab: it is first, and active.
+		await setCursorScreenPoint(electronApp, beforeFirstTab);
+		await expect(placeholder).toHaveCount(1);
+		await popoutWindow.mouse.up();
+		await expect(placeholder).toHaveCount(0);
+		await expect(mainWindow.locator('.project-tab-title')).toHaveText([
+			'Project 2',
+			'Project',
+		]);
+		await expect(mainWindow.locator('.project-tab--active')).toHaveAttribute(
+			'data-project-id',
+			projectId,
+		);
+		await expect.poll(() => popoutWindow.isClosed()).toBe(true);
+		// The order is the window's own: it survives a reload.
+		await mainWindow.reload();
+		await expect(mainWindow.locator('.project-tab-title')).toHaveText([
+			'Project 2',
+			'Project',
+		]);
+	});
+
+	test('a second project can be dragged out after the first', async ({
+		electronApp,
+		mainWindow,
+	}) => {
+		await createStartedProject(mainWindow);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(2);
+		await createStartedProject(mainWindow);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(3);
+		await expect(mainWindow.locator('[data-pending-project-id]')).toHaveCount(
+			0,
+		);
+		const main = await tabBarScreenPoints(electronApp, mainWindow);
+
+		await tearOffProjectTab(
+			electronApp,
+			mainWindow,
+			mainWindow.locator('.project-tab', { hasText: 'Project 3' }),
+			main.clearOfBar,
+		);
+		const firstPopout = await waitForWorkspacePopout(electronApp, mainWindow);
+		await expect(firstPopout.locator('.project-tab-title')).toHaveText([
+			'Project 3',
+		]);
+		await expect(mainWindow.locator('.project-tab-title')).toHaveText([
+			'Project',
+			'Project 2',
+		]);
+
+		await tearOffProjectTab(
+			electronApp,
+			mainWindow,
+			mainWindow.locator('.project-tab', { hasText: 'Project 2' }),
+			main.clearOfBar,
+		);
+		await expect(mainWindow.locator('.project-tab-title')).toHaveText([
+			'Project',
+		]);
+		await expect
+			.poll(
+				async () => {
+					const titles: string[] = [];
+					for (const page of electronApp.windows()) {
+						if (page === mainWindow || page.isClosed()) continue;
+						titles.push(
+							...(await page.locator('.project-tab-title').allTextContents()),
+						);
+					}
+					return titles.sort();
+				},
+				{ timeout: 20_000 },
+			)
+			.toEqual(['Project 2', 'Project 3']);
+	});
+
+	test('reordering after a tear-off keeps the dragged tab in the strip', async ({
+		electronApp,
+		mainWindow,
+	}) => {
+		await createStartedProject(mainWindow);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(2);
+		await createStartedProject(mainWindow);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(3);
+		await expect(mainWindow.locator('[data-pending-project-id]')).toHaveCount(
+			0,
+		);
+		const main = await tabBarScreenPoints(electronApp, mainWindow);
+		await tearOffProjectTab(
+			electronApp,
+			mainWindow,
+			mainWindow.locator('.project-tab', { hasText: 'Project 3' }),
+			main.clearOfBar,
+		);
+		await waitForWorkspacePopout(electronApp, mainWindow);
+		const tabs = mainWindow.locator('.project-tab');
+		await expect(mainWindow.locator('.project-tab-title')).toHaveText([
+			'Project',
+			'Project 2',
+		]);
+
+		const firstBox = await tabs.first().boundingBox();
+		const secondBox = await tabs.nth(1).boundingBox();
+		if (!firstBox || !secondBox) {
+			throw new Error('Project tab drag geometry is unavailable');
+		}
+		await mainWindow.mouse.move(
+			secondBox.x + secondBox.width / 2,
+			secondBox.y + secondBox.height / 2,
+		);
+		await mainWindow.mouse.down();
+		await mainWindow.mouse.move(
+			firstBox.x + 8,
+			firstBox.y + firstBox.height / 2,
+			{ steps: 10 },
+		);
+		const dragged = mainWindow.locator('.project-tab--dragging');
+		await expect(dragged).toHaveCount(1);
+		await expect(dragged).not.toHaveClass(/project-tab--torn-off/);
+		expect((await dragged.boundingBox())?.width).toBeGreaterThanOrEqual(
+			secondBox.width - 1,
+		);
+		await mainWindow.mouse.up();
+		await expect(mainWindow.locator('.project-tab-title')).toHaveText([
+			'Project 2',
+			'Project',
+		]);
+	});
+
+	test('closing a torn-off window takes its notifications off the application icon', {
+		tag: HELD_SERVER_CLOCK,
+	}, async ({ electronApp, mainWindow, userDataDir }) => {
+		// The bell is judged, and its notification held, on the server's clock.
+		const clock = serverClock(electronApp);
+		const bell = await commandGate(userDataDir);
+		const badgeTotal = () =>
+			electronApp.evaluate(
+				() =>
+					(
+						globalThis as typeof globalThis & {
+							__terminayTestAppBadgeTotal?: () => number;
+						}
+					).__terminayTestAppBadgeTotal?.() ?? -1,
+			);
+		await createStartedProject(mainWindow);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(2);
+		await expect(mainWindow.locator('[data-pending-project-id]')).toHaveCount(
+			0,
+		);
+		const draggedProject = mainWindow.locator('.project-tab').last();
+		const projectBox = await draggedProject.boundingBox();
+		if (!projectBox)
+			throw new Error('Expected the project tab to have a layout box');
+		const centerX = projectBox.x + projectBox.width / 2;
+		const centerY = projectBox.y + projectBox.height / 2;
+		await mainWindow.mouse.move(centerX, centerY);
+		await mainWindow.mouse.down();
+		await mainWindow.mouse.move(centerX, centerY + 180, { steps: 12 });
+		await mainWindow.mouse.up();
+		const popoutWindow = await waitForWorkspacePopout(electronApp, mainWindow);
+		await settledTerminalSessionId(
+			popoutWindow.locator('.project-workspace--active .terminal-panel'),
+		);
+		await expect.poll(badgeTotal).toBe(0);
+
+		// Ring the bell in a terminal the popout is not looking at.
+		const tabs = popoutWindow.locator(
+			'.project-workspace--active .terminal-tab-content',
+		);
+		await sendAppCommand(popoutWindow, 'new-terminal');
+		await expect(tabs).toHaveCount(2);
+		const ringing = await settledTerminalSessionId(
+			popoutWindow.locator(
+				'.project-workspace--active .terminal-panel:visible',
+			),
+		);
+		// The bell rings once the test opens its gate: long after the typing,
+		// with the popout back on Terminal 1.
+		const command = `${bell.wait}; printf 'ding\\007\\n'`;
+		await submitTerminalCommand(popoutWindow, `${command}\r`);
+		await commandArrived(electronApp, ringing, command);
+		await tabs.filter({ hasText: 'Terminal 1' }).click();
+		await expect(
+			popoutWindow.locator(
+				'.project-workspace--active .terminal-panel:visible .xterm-helper-textarea',
+			),
+		).toBeFocused();
+		await clock.advance(INPUT_WINDOW_MS);
+		await bell.open();
+		await expect
+			.poll(async () => (await clock.notifications()).pending)
+			.toBe(1);
+		await endSettlePeriod(electronApp);
+		await expect(popoutWindow.locator('.notifications-count')).toHaveText('1');
+		await expect(mainWindow.locator('.notifications-count')).toHaveCount(0);
+		await expect.poll(badgeTotal).toBe(1);
+
+		await closeNativePageWindow(electronApp, popoutWindow);
+		await expect.poll(badgeTotal).toBe(0);
+		await expect(
+			mainWindow.locator('[data-terminay-app-component]'),
+		).toBeVisible();
+	});
+
+	test('closing a busy torn-off project window leaves its sibling window alive', async ({
+		electronApp,
+		mainWindow,
+	}) => {
+		await createStartedProject(mainWindow);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(2);
+		await expect(mainWindow.locator('[data-pending-project-id]')).toHaveCount(
+			0,
+		);
+		const draggedProject = mainWindow.locator('.project-tab').last();
+		const projectBox = await draggedProject.boundingBox();
+		if (!projectBox)
+			throw new Error('Expected the project tab to have a layout box');
+		const centerX = projectBox.x + projectBox.width / 2;
+		const centerY = projectBox.y + projectBox.height / 2;
+		await mainWindow.mouse.move(centerX, centerY);
+		await mainWindow.mouse.down();
+		await mainWindow.mouse.move(centerX, centerY + 180, { steps: 12 });
+		await mainWindow.mouse.up();
+		const popoutWindow = await waitForWorkspacePopout(electronApp, mainWindow);
+		const sessionId = await settledTerminalSessionId(
+			popoutWindow.locator('.project-workspace--active .terminal-panel'),
+		);
+		const foregroundStarted = `foreground-started-${Date.now()}`;
+
+		await electronApp.evaluate(({ dialog }) => {
+			const state = globalThis as BusyWindowTestMain;
+			state.closeDialog = undefined;
+			dialog.showMessageBox = async (...args) => {
+				state.closeDialog = args.at(-1) as Electron.MessageBoxOptions;
+				return { checkboxChecked: false, response: 0 };
+			};
+		});
+		// Drive one non-shell process that prints the marker and stays in the
+		// foreground. `sh -c "…; printf; exec sleep"` prints while `sh`/`dash`
+		// is still foreground; Debian E2E treats those names as the idle login
+		// shell, so close-protection skips the warning. Playwright retries are
+		// a new worker, so that race fails all three attempts on a fast VM.
+		await typeInVisibleTerminal(
+			popoutWindow,
+			`python3 -c "import time; print('${foregroundStarted}', flush=True); time.sleep(30)"\n`,
+			sessionId,
+		);
+		await expect(
+			popoutWindow.locator('.terminal-panel:visible .xterm-rows'),
+		).toContainText(foregroundStarted);
+		await waitUntilNativeWindowHasBusyTerminal(electronApp, popoutWindow);
+		// Close this torn-off window by identity. Linux/Xvfb does not reliably
+		// move native focus after a drag-created BrowserWindow, so
+		// getFocusedWindow() can no-op or close the idle sibling instead.
+		await closeNativePageWindow(electronApp, popoutWindow);
+		await expect
+			.poll(() =>
+				electronApp.evaluate(
+					() =>
+						(globalThis as BusyWindowTestMain).closeDialog?.buttons?.[0] ??
+						null,
+				),
+			)
+			.toBe('Close Window');
+		await expect.poll(() => popoutWindow.isClosed()).toBe(true);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(1);
+		await expect(
+			mainWindow.locator('.project-workspace--active .terminal-tab-title'),
+		).toHaveText(['Terminal 1']);
+		await expectTerminalInputFocused(mainWindow);
+	});
+
+	test('adds, edits, switches, and closes project tabs', async ({
+		createWorkspace,
+		electronApp,
+		mainWindow,
+	}) => {
+		const workspace = await createWorkspace({ name: 'project-tab-root' });
+		const initialProjectTab = mainWindow.locator('.project-tab').first();
+		await expect(initialProjectTab).toContainText('Project');
+
+		await createStartedProject(mainWindow);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(2);
+		await expect(mainWindow.locator('[data-pending-project-id]')).toHaveCount(
+			0,
+		);
+		await expect(mainWindow.locator('.project-tab--active')).toContainText(
+			'Project 2',
+		);
+
+		const editWindow = await openProjectEditWindow(mainWindow);
+		await expect(
+			editWindow.getByRole('heading', { name: 'Edit Project Tab' }),
+		).toBeVisible();
+
+		await editWindow.getByPlaceholder('Project name').fill('Workspace QA');
+		const iconInput = editWindow.getByLabel('Tab icon');
+		await iconInput.fill('QA');
+		await expect(iconInput).toHaveValue('Q');
+		await iconInput.fill('W');
+		await editWindow
+			.getByPlaceholder('Enter folder path')
+			.fill(workspace.rootDir);
+		await editWindow.locator('.hue-slider').fill('120');
+		await submitEditWindow(editWindow);
+
+		const updatedProjectTab = mainWindow.locator('.project-tab').nth(1);
+		await expect(updatedProjectTab).toContainText('Workspace QA');
+		await expect(updatedProjectTab.locator('.project-tab-emoji')).toHaveText(
+			'W',
+		);
+		await expect(updatedProjectTab).toHaveAttribute('style', /#57db57/i);
+		await expectTerminalInputFocused(mainWindow);
+
+		await initialProjectTab.click();
+		await expect(mainWindow.locator('.project-tab--active')).toContainText(
+			'Project',
+		);
+
+		await updatedProjectTab.click();
+		await expect(mainWindow.locator('.project-tab--active')).toContainText(
+			'Workspace QA',
+		);
+		await electronApp.evaluate(({ dialog }) => {
+			dialog.showMessageBox = async () => ({
+				checkboxChecked: false,
+				response: 0,
+			});
+		});
+
+		await initialProjectTab.getByLabel('Close Project').click();
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(1);
+		await expect(mainWindow.locator('.project-tab--active')).toContainText(
+			'Workspace QA',
+		);
+	});
+
+	test('new project tabs do not reuse palette colours until the palette is exhausted', async ({
+		mainWindow,
+	}) => {
+		const addProjectButton = mainWindow.getByLabel('Create project');
+
+		for (let index = 0; index < 19; index += 1) {
+			await addProjectButton.click();
+		}
+
+		const projectTabs = mainWindow.locator('.project-tab');
+		await expect(projectTabs).toHaveCount(20);
+
+		const colors = await Promise.all(
+			Array.from({ length: 20 }, (_, index) =>
+				readCssVariableFromStyle(projectTabs.nth(index), '--project-color'),
+			),
+		);
+
+		expect(new Set(colors).size, JSON.stringify(colors)).toBe(20);
+
+		await addProjectButton.click();
+		await expect(projectTabs).toHaveCount(21);
+	});
+
+	test('the Local-matching project switcher keeps trailing chrome visible and activates overflowed projects', async ({
+		mainWindow,
+		electronApp,
+	}) => {
+		const addProjectButton = mainWindow.getByLabel('Create project');
+		for (let index = 0; index < 11; index += 1) {
+			await addProjectButton.click();
+		}
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(12);
+
+		const nativeWindow = await electronApp.browserWindow(mainWindow);
+		await nativeWindow.evaluate((window) => {
+			window.setBounds({ x: 40, y: 40, width: 720, height: 700 });
+		});
+		await expect(mainWindow.locator('.project-switcher-button')).toBeVisible();
+		await expect(mainWindow.locator('.project-tabbar-projects')).toHaveClass(
+			/project-tabbar-projects--overflow/,
+		);
+		const strip = mainWindow.locator('.project-tabbar-projects');
+		const add = mainWindow.locator('.project-tab-add-box');
+		const stripBox = await strip.boundingBox();
+		const addBox = await add.boundingBox();
+		if (!stripBox || !addBox) {
+			throw new Error('Expected overflow strip geometry');
+		}
+		expect(addBox.x - (stripBox.x + stripBox.width)).toBeLessThan(8);
+		const lastVisible = mainWindow
+			.locator('.project-tab:not(.project-tab--overflowed)')
+			.last();
+		const lastBox = await lastVisible.boundingBox();
+		const switcherBox = await mainWindow
+			.locator('.project-switcher-button')
+			.boundingBox();
+		if (!lastBox || !switcherBox) {
+			throw new Error('Expected overflow switcher to meet the last tab');
+		}
+		expect(lastBox.x + lastBox.width).toBeGreaterThan(switcherBox.x + 24);
+		await nativeWindow.evaluate((window) => {
+			window.setBounds({ x: 40, y: 40, width: 1280, height: 700 });
+		});
+		await expect(mainWindow.locator('.project-switcher-button')).toBeVisible();
+		const wideStripBox = await strip.boundingBox();
+		const wideAddBox = await add.boundingBox();
+		if (!wideStripBox || !wideAddBox) {
+			throw new Error('Expected a filled overflow strip on a wide bar');
+		}
+		expect(wideAddBox.x - (wideStripBox.x + wideStripBox.width)).toBeLessThan(
+			8,
+		);
+		await expect(mainWindow.locator('.remote-access-button')).toBeVisible();
+		await expect
+			.poll(async () =>
+				Number(
+					await mainWindow
+						.locator('.project-tabbar-projects')
+						.getAttribute('data-project-tab-hidden-count'),
+				),
+			)
+			.toBeGreaterThan(0);
+
+		const overflowedTitle = (
+			await mainWindow
+				.locator('.project-tab--overflowed .project-tab-title')
+				.last()
+				.textContent()
+		)?.trim();
+		if (!overflowedTitle)
+			throw new Error('Expected an overflowed project title');
+
+		await mainWindow.locator('.project-switcher-button').click();
+		await mainWindow.getByRole('menuitem', { name: overflowedTitle }).click();
+		await expect(
+			mainWindow.locator('.project-tab--active .project-tab-title'),
+		).toHaveText(overflowedTitle);
+
+		// At phone width the strip is gone entirely: one row, and the switcher
+		// it opens.
+		await nativeWindow.evaluate((window) => {
+			window.setBounds({ x: 40, y: 40, width: 390, height: 740 });
+		});
+		const compactRow = mainWindow.locator('[data-compact-chrome="true"]');
+		await expect(compactRow).toBeVisible();
+		await expect(mainWindow.locator('.project-tabbar-projects')).toHaveCount(0);
+		await expect(mainWindow.locator('.remote-access-button')).toHaveCount(0);
+		await expect(add).toHaveCount(0);
+		await expect(
+			mainWindow.locator('[data-compact-breadcrumb-segment="project"]'),
+		).toHaveText(overflowedTitle);
+
+		await mainWindow.locator('[data-compact-breadcrumb="true"]').click();
+		const switcher = mainWindow.getByRole('dialog', {
+			name: 'Switch terminal',
+		});
+		await expect(switcher).toBeVisible();
+		await expect(
+			switcher.locator('[data-compact-switcher-project]'),
+		).toHaveCount(12);
+		await expect(
+			switcher.getByRole('button', { name: 'New project' }),
+		).toBeVisible();
+
+		// The connection glyph opens the same surface rather than a menu of its
+		// own, and never shows the server's name.
+		await mainWindow.keyboard.press('Escape');
+		await expect(switcher).toHaveCount(0);
+		const connection = mainWindow.locator('[data-compact-connection="true"]');
+		await expect(connection).not.toContainText(/\S/u);
+		await connection.click();
+		await expect(switcher).toBeVisible();
+	});
+
+	test('project tab activity badges keep the overflow strip measured and reach the switcher rows', async ({
+		mainWindow,
+		electronApp,
+	}) => {
+		const addProjectButton = mainWindow.getByLabel('Create project');
+		for (let index = 0; index < 11; index += 1) {
+			await addProjectButton.click();
+		}
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(12);
+		// Every tab must finish creating before we pick the active project, or
+		// the last one activates mid-test and moves the badge.
+		await expect(
+			mainWindow.locator('.project-tab[data-project-id]'),
+		).toHaveCount(12);
+		await expect(
+			mainWindow.locator('.project-tab--creation-loading'),
+		).toHaveCount(0);
+		// The project in front is the last one created, still awaiting its start.
+		await chooseProjectStart(mainWindow);
+
+		const nativeWindow = await electronApp.browserWindow(mainWindow);
+		await nativeWindow.evaluate((window) => {
+			window.setBounds({ x: 40, y: 40, width: 720, height: 700 });
+		});
+		const strip = mainWindow.locator('.project-tabbar-projects');
+		await expect(strip).toHaveClass(/project-tabbar-projects--overflow/);
+		const hiddenBefore = Number(
+			await strip.getAttribute('data-project-tab-hidden-count'),
+		);
+		expect(hiddenBefore).toBeGreaterThan(0);
+
+		// Finish a command in a background terminal of the active project so its
+		// tab grows a dot while the strip is already full.
+		const activeWorkspace = mainWindow.locator('.project-workspace--active');
+		const terminalTabs = activeWorkspace.locator('.terminal-tab-content');
+		await expect(terminalTabs).toHaveCount(1);
+		await expect(
+			activeWorkspace.locator('.terminal-panel:visible'),
+		).toHaveCount(1);
+		const firstSessionId = await settledTerminalSessionId(
+			activeTerminalPanel(mainWindow),
+		);
+		await sendAppCommand(mainWindow, 'new-terminal');
+		await expect(terminalTabs).toHaveCount(2);
+		await terminalTabs.filter({ hasText: 'Terminal 2' }).click();
+		// A plain shell's finish in the terminal the user is typing in is not
+		// news, so the command must finish only once focus is on Terminal 1.
+		// It blocks on a FIFO the test opens after that, not on a clock.
+		const fifoDir = mkdtempSync(path.join(tmpdir(), 'terminay-badge-'));
+		const release = path.join(fifoDir, 'release');
+		execFileSync('mkfifo', [release]);
+		try {
+			await submitTerminalCommand(
+				mainWindow,
+				`cat '${release}' >/dev/null; printf '\\033]133;C\\007'; printf '\\033]133;D;0\\007'\r`,
+			);
+			await terminalTabs.filter({ hasText: 'Terminal 1' }).click();
+			// Focusing the helper textarea and announcing the focus to the
+			// workspace happen in one frame callback, so once it is the active
+			// element the workspace treats Terminal 1 as focused.
+			await expect(
+				terminalPanelForSession(mainWindow, firstSessionId).locator(
+					'.xterm-helper-textarea',
+				),
+			).toBeFocused();
+			// Opening the FIFO for writing waits for `cat` to open it, so the
+			// command is released exactly once, wherever the shell is.
+			await writeFile(release, '\n');
+		} finally {
+			rmSync(fifoDir, { force: true, recursive: true });
+		}
+
+		const badge = mainWindow.locator(
+			'.project-tab--active .project-tab-activity-dot',
+		);
+		await expect(badge).toHaveCount(1);
+		await expect(badge).toHaveClass(/project-tab-activity-dot--unviewed/);
+		const activeTitle = (
+			await mainWindow
+				.locator('.project-tab--active .project-tab-title')
+				.textContent()
+		)?.trim();
+		if (!activeTitle) throw new Error('Expected an active project title');
+
+		// The overflow layout re-ran: trailing chrome stays visible and the strip
+		// still meets the new-project control.
+		const add = mainWindow.locator('.project-tab-add-box');
+		await expect(add).toBeVisible();
+		await expect(mainWindow.locator('.remote-access-button')).toBeVisible();
+		await expect
+			.poll(async () => {
+				const stripBox = await strip.boundingBox();
+				const addBox = await add.boundingBox();
+				if (!stripBox || !addBox) return Number.POSITIVE_INFINITY;
+				return addBox.x - (stripBox.x + stripBox.width);
+			})
+			.toBeLessThan(8);
+		const hiddenAfter = Number(
+			await strip.getAttribute('data-project-tab-hidden-count'),
+		);
+		expect(hiddenAfter).toBeGreaterThanOrEqual(hiddenBefore);
+		await expect(mainWindow.locator('.project-tab--active')).toBeVisible();
+
+		// The overflow switcher rows carry the same dot.
+		await mainWindow.locator('.project-switcher-button').click();
+		await expect(mainWindow.locator('.project-switcher-menu')).toBeVisible();
+		const activeRow = mainWindow
+			.locator('.project-switcher-menu__item')
+			.filter({ hasText: activeTitle });
+		const rowBadge = activeRow.locator('.project-tab-activity-dot');
+		try {
+			await expect(rowBadge).toHaveCount(1);
+			await expect(rowBadge).toHaveClass(/project-tab-activity-dot--unviewed/);
+			await expect(
+				mainWindow.locator(
+					'.project-switcher-menu__item .project-tab-activity-dot',
+				),
+			).toHaveCount(1);
+		} catch (error) {
+			// Gitea does not retain Playwright artifacts, so surface the DOM in
+			// the job log when the switcher rows disagree with the tab dot.
+			console.log(
+				'[badge-debug] active title:',
+				activeTitle,
+				'\n[badge-debug] tab strip:',
+				await mainWindow
+					.locator('.project-tabbar')
+					.evaluate((el) => el.outerHTML),
+				'\n[badge-debug] switcher menu:',
+				await mainWindow
+					.locator('.project-switcher-menu')
+					.evaluate((el) => el.outerHTML)
+					.catch(() => '(menu not found)'),
+			);
+			throw error;
+		}
+	});
+
+	test('reorders visible project tabs when one is dragged along the strip', async ({
+		mainWindow,
+	}) => {
+		await createStartedProject(mainWindow);
+		const tabs = mainWindow.locator(
+			'.project-tab:not(.project-tab--overflowed)',
+		);
+		await expect(tabs).toHaveCount(2);
+		await expect(mainWindow.locator('[data-pending-project-id]')).toHaveCount(
+			0,
+		);
+		await expect(mainWindow.locator('.project-tab-title')).toHaveText([
+			'Project',
+			'Project 2',
+		]);
+		const firstBox = await tabs.first().boundingBox();
+		const secondBox = await tabs.nth(1).boundingBox();
+		if (!firstBox || !secondBox) {
+			throw new Error('Project tab drag geometry is unavailable');
+		}
+		await mainWindow.mouse.move(
+			secondBox.x + secondBox.width / 2,
+			secondBox.y + secondBox.height / 2,
+		);
+		await mainWindow.mouse.down();
+		await mainWindow.mouse.move(
+			firstBox.x + 8,
+			firstBox.y + firstBox.height / 2,
+			{ steps: 10 },
+		);
+		await mainWindow.mouse.up();
+		await expect(
+			mainWindow.locator(
+				'.project-tab:not(.project-tab--overflowed) .project-tab-title',
+			),
+		).toHaveText(['Project 2', 'Project']);
+	});
+
+	test('creating a project focuses its first start, and starting it focuses the new terminal', async ({
+		mainWindow,
+	}) => {
+		await mainWindow.getByLabel('Create project').click();
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(2);
+		await expect(mainWindow.locator('[data-pending-project-id]')).toHaveCount(
+			0,
+		);
+		await expect(mainWindow.locator('.project-tab--active')).toContainText(
+			'Project 2',
+		);
+		await expect(
+			activeStartChooser(mainWindow).locator(
+				'[data-terminay-start-action="folder"]',
+			),
+		).toBeFocused();
+		await chooseProjectStart(mainWindow);
+		await expectTerminalInputFocused(mainWindow);
+	});
+
+	test('closing the only project keeps the window open on Home', async ({
+		electronApp,
+		mainWindow,
+	}) => {
+		await electronApp.evaluate(({ dialog }) => {
+			dialog.showMessageBox = async () => ({
+				checkboxChecked: false,
+				response: 0,
+			});
+		});
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(1);
+		await mainWindow
+			.locator('.project-tab')
+			.first()
+			.getByLabel('Close Project')
+			.click();
+
+		// No project left: the window stays, showing Home.
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(0);
+		expect(mainWindow.isClosed()).toBe(false);
+		await expect(mainWindow.locator('.app-shell')).toHaveAttribute(
+			'data-terminay-selected-view',
+			'home',
+		);
+		await expect(mainWindow.locator('[data-terminay-home-tabs]')).toBeVisible();
+
+		// With no project there is still a Command Bar, listing only what
+		// needs none.
+		await openMacroLauncher(mainWindow);
+		const commandBar = mainWindow.getByRole('dialog', { name: 'Command bar' });
+		await expect(
+			commandBar.getByText('New project', { exact: true }),
+		).toBeVisible();
+		await expect(
+			commandBar.getByText('New Terminal Tab', { exact: true }),
+		).toHaveCount(0);
+		await mainWindow.keyboard.press('Escape');
+		await expect(commandBar).toHaveCount(0);
+
+		// A new project from Home is shown, waiting for its start; once
+		// started, its terminal is focused.
+		await mainWindow.getByLabel('Create project').click();
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(1);
+		await expect(mainWindow.locator('.app-shell')).toHaveAttribute(
+			'data-terminay-selected-view',
+			'project',
+		);
+		await expect(mainWindow.locator('.project-tab--active')).toBeVisible();
+		await chooseProjectStart(mainWindow);
+		await expectTerminalInputFocused(mainWindow);
+	});
+
+	test('the new-project control stays after the last project tab', async ({
+		mainWindow,
+	}) => {
+		const lastTab = mainWindow
+			.locator('.project-tab:not(.project-tab--overflowed)')
+			.last();
+		const add = mainWindow.locator('.project-tab-add-box');
+		const local = mainWindow.locator('.remote-access-button');
+		await expect(lastTab).toBeVisible();
+		await expect(add).toBeVisible();
+		const tabBox = await lastTab.boundingBox();
+		const addBox = await add.boundingBox();
+		const localBox = await local.boundingBox();
+		if (!tabBox || !addBox || !localBox) {
+			throw new Error('Expected project bar geometry');
+		}
+		expect(addBox.x - (tabBox.x + tabBox.width)).toBeLessThan(20);
+		expect(localBox.x - (addBox.x + addBox.width)).toBeGreaterThan(40);
+	});
+
+	test('project switcher grips reorder projects', async ({
+		electronApp,
+		mainWindow,
+	}) => {
+		const addProjectButton = mainWindow.getByLabel('Create project');
+		for (let index = 0; index < 5; index += 1) {
+			await addProjectButton.click();
+		}
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(6);
+		const nativeWindow = await electronApp.browserWindow(mainWindow);
+		await nativeWindow.evaluate((window) => {
+			window.setBounds({ x: 40, y: 40, width: 720, height: 700 });
+		});
+		await expect(mainWindow.locator('.project-switcher-button')).toBeVisible();
+		const titlesBefore = await mainWindow
+			.locator('.project-tab-title')
+			.allTextContents();
+
+		await mainWindow.locator('.project-switcher-button').click();
+		const menu = mainWindow.locator('.project-switcher-menu');
+		await expect(menu).toBeVisible();
+		const lastTitle = titlesBefore.at(-1)?.trim();
+		const firstTitle = titlesBefore[0]?.trim();
+		if (!lastTitle || !firstTitle) {
+			throw new Error('Expected project titles for switcher reorder');
+		}
+		const sourceGrip = menu.getByLabel(`Reorder ${lastTitle}`);
+		const targetRow = menu.locator('[data-project-switcher-row]').first();
+		const gripBox = await sourceGrip.boundingBox();
+		const targetBox = await targetRow.boundingBox();
+		if (!gripBox || !targetBox) {
+			throw new Error('Expected switcher grip geometry');
+		}
+
+		await mainWindow.mouse.move(
+			gripBox.x + gripBox.width / 2,
+			gripBox.y + gripBox.height / 2,
+		);
+		await mainWindow.mouse.down();
+		await mainWindow.mouse.move(
+			targetBox.x + targetBox.width / 2,
+			targetBox.y + 4,
+			{ steps: 8 },
+		);
+		await mainWindow.mouse.up();
+
+		await expect(mainWindow.locator('.project-tab-title').first()).toHaveText(
+			lastTitle,
+		);
+		await expect(menu).toBeVisible();
+	});
+
+	test('long-pressing a compact switcher project heading opens project editing', async ({
+		electronApp,
+		mainWindow,
+	}) => {
+		const nativeWindow = await electronApp.browserWindow(mainWindow);
+		await nativeWindow.evaluate((window) => {
+			window.setBounds({ x: 40, y: 40, width: 390, height: 740 });
+		});
+		await expect(
+			mainWindow.locator('[data-compact-chrome="true"]'),
+		).toBeVisible();
+		await mainWindow.locator('[data-compact-breadcrumb="true"]').click();
+		const switcher = mainWindow.getByRole('dialog', {
+			name: 'Switch terminal',
+		});
+		await expect(switcher).toBeVisible();
+		await longPress(
+			switcher.locator('[data-compact-switcher-project]').first(),
+			mainWindow.getByRole('heading', { name: 'Edit Project Tab' }),
+		);
+		await cancelEditWindow(mainWindow);
+		// Editing closed the switcher; the breadcrumb opens it again.
+		await expect(switcher).toHaveCount(0);
+		await mainWindow.locator('[data-compact-breadcrumb="true"]').click();
+		await expect(switcher).toBeVisible();
+	});
+
+	test('long-pressing a project switcher row opens that project editor', async ({
+		electronApp,
+		mainWindow,
+	}) => {
+		await createStartedProject(mainWindow);
+		await expect(mainWindow.locator('[data-pending-project-id]')).toHaveCount(
+			0,
+		);
+		for (let index = 0; index < 5; index += 1) {
+			await createStartedProject(mainWindow);
+			await expect(mainWindow.locator('[data-pending-project-id]')).toHaveCount(
+				0,
+			);
+		}
+		const nativeWindow = await electronApp.browserWindow(mainWindow);
+		// A narrow-but-not-compact bar, filled until it overflows: the switcher
+		// menu and its rows are still the surface under test.
+		await nativeWindow.evaluate((window) => {
+			window.setBounds({ x: 40, y: 40, width: 700, height: 740 });
+		});
+		await expect(mainWindow.locator('.project-switcher-button')).toBeVisible();
+		await mainWindow.locator('.project-switcher-button').click();
+		const menu = mainWindow.locator('.project-switcher-menu');
+		await expect(menu).toBeVisible();
+		const otherItem = menu
+			.locator('[data-project-switcher-item]')
+			.filter({ hasNotText: 'New project' })
+			.last();
+		const otherTitle = (
+			await otherItem.locator('.project-switcher-menu__title').textContent()
+		)?.trim();
+		if (!otherTitle) throw new Error('Expected a project row to edit');
+		await longPress(
+			otherItem,
+			mainWindow.getByRole('heading', { name: 'Edit Project Tab' }),
+		);
+		await expect(mainWindow.getByPlaceholder('Project name')).toHaveValue(
+			otherTitle,
+		);
+	});
+});
+
+test.describe('a project creation the server refuses', () => {
+	async function refuseCreations(page: Page, count: number): Promise<void> {
+		await page.evaluate(async (refusals) => {
+			if (!window.terminayLocalConnectionFaultTest)
+				throw new Error('Local connection fault test seam is unavailable');
+			await window.terminayLocalConnectionFaultTest.refuseProjectCreations(
+				refusals,
+			);
+		}, count);
+	}
+	const failedTab = (page: Page) =>
+		page.locator('.project-tab--creation-failed');
+	const failure = (page: Page) =>
+		page.locator('.workspace-empty-state--error[role="alert"]');
+
+	test('leaves every other project selectable and usable', async ({
+		mainWindow,
+	}) => {
+		await refuseCreations(mainWindow, 1);
+		await mainWindow.getByLabel('Create project').click();
+
+		await expect(failedTab(mainWindow)).toHaveCount(1);
+		await expect(failedTab(mainWindow)).toHaveClass(/project-tab--active/u);
+		await expect(failure(mainWindow)).toBeVisible();
+
+		await mainWindow
+			.locator('.project-tab:not(.project-tab--creation-failed)')
+			.first()
+			.click();
+		await expect(failure(mainWindow)).toHaveCount(0);
+		await expect(failedTab(mainWindow)).toHaveCount(1);
+		await expect(
+			mainWindow.locator('.project-workspace--active .terminal-panel:visible'),
+		).toHaveCount(1);
+		const marker = 'terminay-usable-beside-failed-creation';
+		await typeInVisibleTerminal(mainWindow, `printf '${marker}\\n'`);
+		await mainWindow.keyboard.press('Enter');
+		await expect(
+			mainWindow.locator('.project-workspace--active .xterm-rows'),
+		).toContainText(marker);
+
+		await failedTab(mainWindow).click();
+		await expect(failure(mainWindow)).toBeVisible();
+	});
+
+	test('retry runs the creation again in place', async ({ mainWindow }) => {
+		await refuseCreations(mainWindow, 1);
+		await mainWindow.getByLabel('Create project').click();
+		await expect(failure(mainWindow)).toBeVisible();
+
+		await failure(mainWindow).getByRole('button', { name: 'Retry' }).click();
+
+		await expect(failedTab(mainWindow)).toHaveCount(0);
+		await expect(mainWindow.locator('[data-pending-project-id]')).toHaveCount(
+			0,
+		);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(2);
+		await expect(mainWindow.locator('.project-tab--active')).toContainText(
+			'Project 2',
+		);
+		await chooseProjectStart(mainWindow);
+	});
+
+	test('the + control replaces the failed tab, and dismiss removes it', async ({
+		mainWindow,
+	}) => {
+		await refuseCreations(mainWindow, 2);
+		await mainWindow.getByLabel('Create project').click();
+		await expect(failure(mainWindow)).toBeVisible();
+
+		await expect(mainWindow.getByLabel('Create project')).toBeEnabled();
+		await mainWindow.getByLabel('Create project').click();
+		await expect(failure(mainWindow)).toBeVisible();
+		await expect(failedTab(mainWindow)).toHaveCount(1);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(2);
+
+		await failure(mainWindow).getByRole('button', { name: 'Dismiss' }).click();
+		await expect(failedTab(mainWindow)).toHaveCount(0);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(1);
+		await expect(
+			mainWindow.locator('.project-workspace--active .terminal-panel:visible'),
+		).toHaveCount(1);
+
+		await createStartedProject(mainWindow);
+		await expect(mainWindow.locator('.project-tab')).toHaveCount(2);
+		await expect(mainWindow.locator('[data-pending-project-id]')).toHaveCount(
+			0,
+		);
+	});
+});

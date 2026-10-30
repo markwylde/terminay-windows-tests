@@ -1,0 +1,675 @@
+/**
+ * Transport-neutral Git service contracts.  The service deliberately accepts
+ * a runner and a small path adapter instead of importing Electron, IPC, or a
+ * network transport.  A runner is allowed to inherit the server process's
+ * Git/SSH environment; no environment values are copied into these types or
+ * returned from the service.
+ */
+
+export type GitReadOnlyOperation = 'status' | 'branch' | 'diff' | 'worktrees';
+
+export type GitRepositoryId = string;
+export type GitWorktreeId = string;
+
+export interface GitPathStat {
+	readonly isDirectory?: boolean;
+	readonly isFile?: boolean;
+}
+
+export interface GitPathAdapter {
+	readonly realpath: (path: string) => string | PromiseLike<string>;
+	readonly stat: (path: string) => GitPathStat | PromiseLike<GitPathStat>;
+}
+
+export interface GitCommandOptions {
+	readonly signal?: AbortSignal;
+	/** Combined stdout/stderr cap. The runner must stop collecting at the cap. */
+	readonly maxOutputBytes?: number;
+}
+
+export interface GitCommandResult {
+	readonly stdout: string;
+	readonly stderr: string;
+	/** null means the process was terminated before Git supplied an exit code. */
+	readonly exitCode: number | null;
+	readonly signal?: string;
+	/** True when the runner stopped collecting at maxOutputBytes. */
+	readonly truncated: boolean;
+}
+
+export interface GitCommandRunner {
+	run(
+		args: readonly string[],
+		cwd: string,
+		options?: GitCommandOptions,
+	): Promise<GitCommandResult>;
+}
+
+export interface GitServiceLimits {
+	readonly maxOutputBytes?: number;
+	readonly maxDiffBytes?: number;
+	readonly maxDiffHunks?: number;
+	readonly maxDiffLines?: number;
+	readonly maxDiffLineBytes?: number;
+	readonly maxStatusEntries?: number;
+	readonly maxWorktrees?: number;
+	readonly maxPathBytes?: number;
+}
+
+export const DEFAULT_GIT_SERVICE_LIMITS: Required<GitServiceLimits> =
+	Object.freeze({
+		maxOutputBytes: 4 * 1024 * 1024,
+		maxDiffBytes: 4 * 1024 * 1024,
+		maxDiffHunks: 10_000,
+		maxDiffLines: 100_000,
+		maxDiffLineBytes: 64 * 1024,
+		maxStatusEntries: 10_000,
+		maxWorktrees: 256,
+		maxPathBytes: 4 * 1024,
+	});
+
+export type GitDiscoveryState =
+	| 'ready'
+	| 'not-repository'
+	| 'git-unavailable'
+	| 'missing-gitfile'
+	| 'command-error';
+
+export interface GitProjectBinding {
+	readonly projectId: string;
+	readonly projectRoot: string;
+	readonly repositoryId: GitRepositoryId | null;
+	readonly repositoryRoot: string | null;
+	readonly worktreeId: GitWorktreeId | null;
+	readonly worktreeRoot: string | null;
+	readonly state: GitDiscoveryState;
+}
+
+export interface GitErrorInfo {
+	readonly code:
+		| GitDiscoveryState
+		| 'invalid-project'
+		| 'path-escape'
+		| 'invalid-operation'
+		| 'worktree-not-found'
+		| 'repository-mismatch'
+		| 'output-too-large'
+		| 'worktree-main'
+		| 'worktree-dirty'
+		| 'worktree-locked'
+		| 'worktree-bare'
+		| 'stale-revision'
+		| 'mutation-failed'
+		| 'proposal-not-found'
+		| 'proposal-replayed'
+		| 'proposal-stale'
+		| 'invalid-proposal'
+		| 'action-failed'
+		| 'provider-timeout'
+		| 'cancelled';
+	readonly message: string;
+	readonly stderr?: string;
+	readonly operation?: string;
+}
+
+export type GitServiceErrorCode = GitErrorInfo['code'];
+
+export class GitServiceError extends Error {
+	readonly code: GitErrorInfo['code'];
+	readonly details:
+		| Readonly<Record<string, string | number | boolean | null>>
+		| undefined;
+
+	constructor(
+		code: GitErrorInfo['code'],
+		message: string,
+		details?: Readonly<Record<string, string | number | boolean | null>>,
+	) {
+		super(message);
+		this.name = 'GitServiceError';
+		this.code = code;
+		this.details = details;
+	}
+}
+
+export interface GitBranchStatus {
+	readonly name: string | null;
+	readonly detached: boolean;
+	readonly head: string | null;
+	readonly upstream: string | null;
+	/** Whether the branch has no upstream, a live upstream, or a gone one. */
+	readonly upstreamState: 'none' | 'configured' | 'missing';
+	readonly ahead: number | null;
+	readonly behind: number | null;
+}
+
+export type GitChangeKind =
+	| 'added'
+	| 'copied'
+	| 'deleted'
+	| 'modified'
+	| 'renamed'
+	| 'unmerged'
+	| 'untracked'
+	| 'unknown';
+
+export interface GitStatusEntry {
+	readonly path: string;
+	/** True when the entry is a directory, including a symlink to one. Git
+	 * reports both as plain paths, so the UI cannot infer this from the name. */
+	readonly isDirectory: boolean;
+	readonly previousPath: string | null;
+	readonly indexStatus: string;
+	readonly worktreeStatus: string;
+	readonly kind: GitChangeKind;
+	readonly staged: boolean;
+	readonly unstaged: boolean;
+	readonly unmerged: boolean;
+}
+
+export interface GitStatusResult {
+	readonly projectId: string;
+	readonly repositoryId: GitRepositoryId | null;
+	readonly repositoryRoot: string | null;
+	readonly worktreeId: GitWorktreeId | null;
+	readonly worktreeRoot: string | null;
+	readonly state: GitDiscoveryState;
+	readonly branch: GitBranchStatus;
+	readonly entries: readonly GitStatusEntry[];
+	readonly head: string | null;
+	readonly bounded: boolean;
+	readonly error?: GitErrorInfo;
+}
+
+export interface GitBranchResult extends GitStatusResult {
+	readonly operation: 'branch';
+}
+
+export interface GitDiffLine {
+	readonly oldLineNumber: number | null;
+	readonly newLineNumber: number | null;
+	readonly type: 'add' | 'delete' | 'context';
+	readonly value: string;
+}
+
+export interface GitDiffHunk {
+	readonly header: string;
+	readonly lines: readonly GitDiffLine[];
+}
+
+export interface GitDiffFile {
+	readonly path: string;
+	readonly previousPath: string | null;
+	readonly additions: number;
+	readonly deletions: number;
+	readonly binary: boolean;
+}
+
+export interface GitDiffResult {
+	readonly projectId: string;
+	readonly repositoryId: GitRepositoryId | null;
+	readonly worktreeId: GitWorktreeId | null;
+	readonly state: GitDiscoveryState;
+	readonly compareTarget: 'HEAD';
+	readonly path: string | null;
+	readonly files: readonly GitDiffFile[];
+	readonly hunks: readonly GitDiffHunk[];
+	readonly patch: string;
+	readonly binary: boolean;
+	readonly bounded: boolean;
+	readonly error?: GitErrorInfo;
+}
+
+export type GitWorktreeState =
+	| 'clean'
+	| 'dirty'
+	| 'unmerged'
+	| 'detached'
+	| 'prunable'
+	| 'unknown';
+
+export interface GitWorktreeSummary {
+	readonly id: GitWorktreeId;
+	readonly repositoryId: GitRepositoryId;
+	readonly path: string;
+	readonly branch: string | null;
+	readonly detached: boolean;
+	readonly head: string | null;
+	readonly isMain: boolean;
+	readonly isBare: boolean;
+	readonly isPrunable: boolean;
+	readonly locked: boolean;
+	readonly state: GitWorktreeState;
+	readonly aheadOfDefaultBranchCount: number | null;
+	readonly lineAdditions: number | null;
+	readonly lineDeletions: number | null;
+	readonly hasCommittedChanges: boolean | null;
+	/** Commits that are on no remote. Null when it could not be measured. */
+	readonly hasUnpushedCommits: boolean | null;
+	/** Size of the unpushed commits and the tracked working-tree delta. */
+	readonly unpushedLineAdditions: number | null;
+	readonly unpushedLineDeletions: number | null;
+	readonly entries: readonly GitStatusEntry[];
+	readonly error?: GitErrorInfo;
+}
+
+export interface GitWorktreeListResult {
+	readonly projectId: string;
+	readonly repositoryId: GitRepositoryId | null;
+	readonly repositoryRoot: string | null;
+	readonly defaultBranch: string | null;
+	readonly state: GitDiscoveryState;
+	readonly worktrees: readonly GitWorktreeSummary[];
+	readonly bounded: boolean;
+	readonly error?: GitErrorInfo;
+}
+
+/**
+ * A server-owned worktree removal request.  The caller supplies only the
+ * opaque project/repository/worktree identities returned by this service;
+ * paths are intentionally absent so a client cannot substitute a cwd.
+ */
+export interface GitWorktreeRemoveRequest {
+	readonly projectId: string;
+	readonly repositoryId: GitRepositoryId;
+	readonly worktreeId: GitWorktreeId;
+	/** Full HEAD from a prior worktree snapshot, when the caller has one. */
+	readonly expectedHead?: string | null;
+	readonly signal?: AbortSignal;
+}
+
+/**
+ * A clean-only removal. The reviewed HEAD is mandatory because the caller
+ * reviewed a listing, not this worktree; the server recomputes cleanliness and
+ * never forces Git.
+ */
+export interface GitWorktreeRemoveCleanRequest
+	extends GitWorktreeRemoveRequest {
+	readonly expectedHead: string;
+}
+
+export interface GitWorktreeRemoveResult {
+	readonly operation: 'remove';
+	readonly projectId: string;
+	readonly repositoryId: GitRepositoryId;
+	readonly worktreeId: GitWorktreeId;
+	readonly applied: boolean;
+	readonly state: 'removed' | 'command-error';
+	readonly headBefore: string | null;
+	readonly error?: GitErrorInfo;
+}
+
+export interface GitWorktreePullRequest {
+	readonly projectId: string;
+	readonly repositoryId: GitRepositoryId;
+	readonly worktreeId: GitWorktreeId;
+	/** Full HEAD from the reviewed listing, when one was available. */
+	readonly expectedHead?: string | null;
+	readonly signal?: AbortSignal;
+}
+
+export interface GitWorktreePullResult {
+	readonly operation: 'pull';
+	readonly projectId: string;
+	readonly repositoryId: GitRepositoryId;
+	readonly worktreeId: GitWorktreeId;
+	readonly applied: boolean;
+	readonly state: 'pulled' | 'command-error';
+	readonly headBefore: string | null;
+	readonly headAfter: string | null;
+	readonly error?: GitErrorInfo;
+}
+
+export interface GitWorktreeMoveRequest {
+	readonly projectId: string;
+	readonly repositoryId: GitRepositoryId;
+	readonly worktreeId: GitWorktreeId;
+	/** One directory basename; the server derives the sibling destination. */
+	readonly name: string;
+	readonly expectedHead?: string | null;
+	readonly signal?: AbortSignal;
+}
+
+export interface GitWorktreeMoveResult {
+	readonly operation: 'move';
+	readonly projectId: string;
+	readonly repositoryId: GitRepositoryId;
+	readonly worktreeIdBefore: GitWorktreeId;
+	readonly worktreeId: GitWorktreeId;
+	readonly applied: boolean;
+	readonly state: 'moved' | 'command-error';
+	readonly headBefore: string | null;
+	readonly headAfter: string | null;
+	readonly path: string | null;
+	readonly error?: GitErrorInfo;
+}
+
+export type GitQuickPushActionKind = 'commit' | 'push' | 'pull-request';
+
+/** One exact, reviewable action; no raw command or filesystem path is exposed. */
+export interface GitQuickPushAction {
+	readonly kind: GitQuickPushActionKind;
+	readonly target: string;
+	readonly summary: string;
+	/** Commit creation can intentionally advance HEAD; push/PR normally cannot. */
+	readonly mutatesRevision: boolean;
+}
+
+export interface GitQuickPushContext {
+	readonly projectId: string;
+	readonly repositoryId: GitRepositoryId;
+	readonly worktreeId: GitWorktreeId;
+	readonly branch: string | null;
+	readonly head: string | null;
+	readonly entries: readonly GitStatusEntry[];
+	readonly patch: string;
+	readonly bounded: boolean;
+}
+
+export interface GitQuickPushPlan {
+	readonly actions: readonly GitQuickPushAction[];
+}
+
+/** Provider planning happens in the server process and returns only bounded data. */
+export interface GitQuickPushPlanner {
+	readonly plan: (
+		context: GitQuickPushContext,
+		signal?: AbortSignal,
+	) => GitQuickPushPlan | PromiseLike<GitQuickPushPlan>;
+}
+
+export interface GitQuickPushExecutionResult {
+	readonly applied: boolean;
+	readonly detail?: string;
+}
+
+/** Executor is injected by the server; credentials stay in that process. */
+export interface GitQuickPushExecutor {
+	readonly execute: (
+		action: GitQuickPushAction,
+		context: GitQuickPushContext,
+		signal?: AbortSignal,
+	) => GitQuickPushExecutionResult | PromiseLike<GitQuickPushExecutionResult>;
+}
+
+export interface GitQuickPushRevision {
+	readonly repositoryId: GitRepositoryId;
+	readonly worktreeId: GitWorktreeId;
+	readonly head: string | null;
+	readonly branch: string | null;
+	readonly statusDigest: string;
+}
+
+export interface GitQuickPushProposalRequest {
+	readonly projectId: string;
+	readonly repositoryId: GitRepositoryId;
+	readonly worktreeId: GitWorktreeId;
+	readonly provider: string;
+	readonly targetBranch: string;
+	readonly signal?: AbortSignal;
+}
+
+export interface GitQuickPushProposal {
+	readonly proposalId: string;
+	readonly provider: string;
+	readonly targetBranch: string;
+	readonly revision: GitQuickPushRevision;
+	readonly actionDigest: string;
+	readonly actions: readonly GitQuickPushAction[];
+	readonly context: GitQuickPushContext;
+	readonly expiresAt: number;
+}
+
+export interface GitQuickPushApprovalRequest {
+	readonly proposalId: string;
+	readonly revision: GitQuickPushRevision;
+	readonly actionDigest: string;
+	readonly signal?: AbortSignal;
+}
+
+export interface GitQuickPushActionResult {
+	readonly index: number;
+	readonly action: GitQuickPushAction;
+	readonly applied: boolean;
+	readonly detail?: string;
+}
+
+export interface GitQuickPushApprovalResult {
+	readonly proposalId: string;
+	readonly applied: boolean;
+	readonly partialFailure: boolean;
+	readonly results: readonly GitQuickPushActionResult[];
+	readonly error?: GitErrorInfo;
+}
+
+export type GitStatus = GitStatusResult;
+export type GitBranch = GitBranchResult;
+export type GitDiff = GitDiffResult;
+export type GitWorktrees = GitWorktreeListResult;
+
+export interface GitReadOnlyRequest {
+	readonly operation: GitReadOnlyOperation;
+	readonly projectId: string;
+	readonly repositoryId?: GitRepositoryId;
+	readonly worktreeId?: GitWorktreeId;
+	/** Project-relative path for diff. Absolute paths and `..` are rejected. */
+	readonly path?: string;
+	readonly signal?: AbortSignal;
+}
+
+export interface GitServiceOptions {
+	readonly runner?: GitCommandRunner;
+	readonly pathAdapter?: GitPathAdapter;
+	readonly limits?: GitServiceLimits;
+	/** Maximum retained progress/status events for authorized subscribers. */
+	readonly maxEvents?: number;
+	/**
+	 * Observes repository and working-tree changes for bound projects. Status
+	 * follows these events; nothing runs Git on a timer (ADR-0028). Defaults to
+	 * `NodeGitStateWatcher`. Tests inject a fake.
+	 */
+	readonly watcher?: GitStateWatcher;
+	/** The ramp that damps refreshes after watch events. Defaults to the shared
+	 *  `REFRESH_RAMP_MS`. */
+	readonly refreshRampMs?: readonly number[];
+	/**
+	 * Receives the observation lifecycle: watches, attributed changes,
+	 * measurements, and cache mismatches. The host decides where reports go;
+	 * the service writes no log. A throwing observer changes no Git result.
+	 */
+	readonly onObservation?: (report: GitObservationReport) => void;
+	/** How long counted changes that raised no measurement wait before they
+	 *  are reported on their own. Defaults to five seconds. */
+	readonly observationFlushMs?: number;
+	/**
+	 * The clock behind the refresh ramp and the change-report flush. Defaults
+	 * to the host's timers. Tests pass one they advance themselves.
+	 */
+	readonly timers?: GitServiceTimers;
+}
+
+/** The only timers the Git service arms: the refresh ramp's pending run and
+ *  the change-report flush. Neither runs Git on its own (ADR-0028). */
+export interface GitServiceTimers {
+	now(): number;
+	setTimeout(callback: () => void, delayMs: number): unknown;
+	clearTimeout(timer: unknown): void;
+}
+
+/** What changed, reduced to a fixed vocabulary. Never a path or a ref name. */
+export type GitObservationEntryClass =
+	| 'head'
+	| 'index'
+	| 'default-branch-ref'
+	| 'branch-ref'
+	| 'remote-ref'
+	| 'packed-refs'
+	| 'config'
+	| 'worktree-registry'
+	| 'linked-worktree-state'
+	| 'lock'
+	| 'inert'
+	| 'working-tree'
+	| 'unnamed'
+	| 'other';
+
+export type GitObservationScope = 'ignore' | 'worktrees' | 'all' | 'registry';
+
+export type GitObservationWatchKind =
+	| 'git-directory'
+	| 'working-tree'
+	| 'discovery';
+
+/** Changes observed since the previous report, by class and by what they
+ *  invalidated, plus the listings answered from cache in that time. */
+export interface GitObservationChangeSummary {
+	readonly byClass: Readonly<Partial<Record<GitObservationEntryClass, number>>>;
+	readonly byScope: Readonly<Partial<Record<GitObservationScope, number>>>;
+	readonly cachedListingsServed: number;
+}
+
+/** A worktree named by its process-local diagnostic id. `listIndex` is its
+ *  position in `git worktree list`. */
+export interface GitObservationWorktreeRef {
+	readonly id: string;
+	readonly role: 'main' | 'linked';
+	readonly listIndex: number;
+}
+
+export interface GitObservationMeasuredWorktree
+	extends GitObservationWorktreeRef {
+	readonly ahead: number | null;
+	readonly additions: number | null;
+	readonly deletions: number | null;
+	readonly changedFiles: number;
+}
+
+export type GitObservationRaisedBy = 'watch' | 'request' | 'refresh';
+
+interface GitObservationMeasurementBase {
+	/** Process-local diagnostic id of the repository. */
+	readonly repository: string;
+	readonly raisedBy: GitObservationRaisedBy;
+	readonly claim: 'all' | 'scoped';
+	/** Whether the cache could be trusted when the measurement began. */
+	readonly trusted: boolean;
+	readonly durationMs: number;
+}
+
+export type GitObservationReport =
+	| {
+			readonly kind: 'watch.opened' | 'watch.closed';
+			/** Null for a discovery watch on a root that is not a repository. */
+			readonly repository: string | null;
+			readonly watch: GitObservationWatchKind;
+			readonly recursive: boolean;
+	  }
+	| {
+			readonly kind: 'watch.failed';
+			readonly repository: string | null;
+			readonly watch: GitObservationWatchKind;
+			readonly recursive: boolean;
+			readonly error: {
+				readonly code: string | null;
+				readonly message: string;
+			};
+	  }
+	| {
+			readonly kind: 'changes';
+			readonly repository: string;
+			readonly changes: GitObservationChangeSummary;
+	  }
+	| (GitObservationMeasurementBase & {
+			readonly kind: 'measurement.completed';
+			readonly remeasured: number;
+			readonly carried: number;
+			/** The re-measured worktrees, bounded. */
+			readonly worktrees: readonly GitObservationMeasuredWorktree[];
+			/** Whether the result became the cached listing. */
+			readonly cached: boolean;
+			readonly published: number;
+			readonly suppressed: number;
+			readonly changes: GitObservationChangeSummary;
+	  })
+	| (GitObservationMeasurementBase & {
+			readonly kind: 'measurement.failed' | 'measurement.abandoned';
+			/** Whether the claimed invalidations were handed back. */
+			readonly restored: boolean;
+			readonly error: {
+				readonly code: string | null;
+				readonly message: string;
+			};
+	  })
+	| {
+			readonly kind: 'cache.mismatch';
+			readonly repository: string;
+			readonly worktrees: readonly (GitObservationWorktreeRef & {
+				readonly fields: readonly string[];
+			})[];
+	  };
+
+/** One live filesystem watch. `close` is idempotent. */
+export interface GitWatchHandle {
+	close(): void;
+}
+
+export interface GitWatchOptions {
+	/** Watch the whole tree beneath `path`, not only its direct entries. */
+	readonly recursive: boolean;
+	/** Called with the changed entry's path relative to the watched path, or
+	 *  null when the host could not name it. */
+	readonly onChange: (relativePath: string | null) => void;
+	/** Called once when the watch can no longer be trusted: it failed to start,
+	 *  the host reported an error, or the watched path went away. */
+	readonly onError: (error: unknown) => void;
+}
+
+/** Host filesystem watch used by the Git service. */
+export interface GitStateWatcher {
+	watch(path: string, options: GitWatchOptions): GitWatchHandle;
+}
+
+export type GitServiceOperation =
+	| GitReadOnlyOperation
+	| 'worktree.remove'
+	| 'worktree.pull'
+	| 'worktree.move'
+	| 'quick-push';
+export type GitProgressPhase = 'started' | 'completed' | 'failed';
+
+/** Bounded progress metadata; command output and credentials stay server-side. */
+export interface GitProgressEvent {
+	readonly revision: number;
+	readonly cursor: string;
+	readonly type: 'git.progress';
+	readonly operation: GitServiceOperation;
+	readonly phase: GitProgressPhase;
+	readonly projectId: string;
+	readonly repositoryId: GitRepositoryId | null;
+	readonly worktreeId: GitWorktreeId | null;
+	readonly state: GitDiscoveryState | 'removed';
+	readonly bounded: boolean;
+}
+
+/** Status metadata emitted when a canonical project/worktree status changes. */
+export interface GitStatusChangeEvent {
+	readonly revision: number;
+	readonly cursor: string;
+	readonly type: 'git.status.changed';
+	readonly projectId: string;
+	readonly repositoryId: GitRepositoryId | null;
+	readonly worktreeId: GitWorktreeId | null;
+	readonly state: GitDiscoveryState;
+	readonly branch: string | null;
+	readonly head: string | null;
+	readonly changedFiles: number;
+	readonly bounded: boolean;
+}
+
+export type GitServiceEvent = GitProgressEvent | GitStatusChangeEvent;
+export type GitServiceListener = (event: GitServiceEvent) => void;
+
+export interface GitServiceReplay {
+	readonly kind: 'events' | 'resync';
+	readonly events: readonly GitServiceEvent[];
+}

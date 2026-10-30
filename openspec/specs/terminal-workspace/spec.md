@@ -1,0 +1,919 @@
+# terminal-workspace Specification
+
+## Purpose
+
+Terminay provides terminal sessions inside the project workspace, where Terminay Server creates and owns each session with its native terminal runtime and Xterm renders it in a client panel that forwards input, resize, and lifecycle commands through the application protocol.
+
+## Requirements
+
+### Requirement: Server-owned terminal sessions
+
+Terminay Server SHALL create and own each terminal session with a native PTY on its own host. Xterm SHALL be a client renderer that forwards input, resize, and lifecycle commands through the application protocol. Terminay Server SHALL own PTY creation, output replay, input, resize, activity, and termination. A PTY SHALL survive browser reload, transport loss, and Electron-window close while its server remains alive. Local and remote clients SHALL use the same terminal command and stream contract, differing only in transport.
+
+#### Scenario: Client goes away
+
+- **WHEN** a browser reloads, a transport is lost, or an Electron window is closed
+- **THEN** the server-owned PTY continues running while its server remains alive
+
+#### Scenario: Remote client
+
+- **WHEN** a remote client operates a terminal
+- **THEN** it uses the same terminal command and stream contract as a local client, differing only in the underlying transport
+
+### Requirement: Canonical shell and working-directory resolution
+
+New sessions SHALL resolve a server-owned shell profile and working directory through the canonical shell profiles and terminal launch policy. Startup, new-project, new-tab, split, local, and remote creation SHALL NOT maintain separate shell or cwd fallbacks. System-default resolution SHALL happen on the server that will own the PTY, and Desktop and browser clients SHALL NOT supply their host shell as a fallback.
+
+#### Scenario: Any creation route
+
+- **WHEN** a terminal is created from startup, a new project, a new tab, a split, or a local or remote client
+- **THEN** the same profile and cwd are resolved for the same server, project, active panel, and explicit user choices
+
+#### Scenario: System default shell
+
+- **WHEN** the system default shell is resolved
+- **THEN** resolution happens on the server that will own the PTY
+- **AND** the client host's own shell is not used as a fallback
+
+### Requirement: Protected emulator environment
+
+Every resolved Terminay PTY SHALL advertise the emulator it actually runs under with `TERM=xterm-256color` and `COLORTERM=truecolor`. Host launcher values such as `TERM=dumb` SHALL NOT cross into a terminal session, and profiles SHALL NOT weaken these protected emulator capabilities.
+
+#### Scenario: Host launcher sets TERM=dumb
+
+- **WHEN** the host launcher environment contains `TERM=dumb`
+- **THEN** the terminal session still advertises `TERM=xterm-256color` and `COLORTERM=truecolor`
+
+#### Scenario: Profile attempts to weaken TERM
+
+- **WHEN** a shell profile sets a weaker `TERM` or `COLORTERM`
+- **THEN** the protected emulator capabilities are preserved
+
+### Requirement: Core terminal interactions
+
+Terminals SHALL support splits, search, copy and paste including bracketed-paste-aware input, dropped paths, guarded external links, resizing, scrollback, zoom, and exit handling.
+
+#### Scenario: Interactive use
+
+- **WHEN** a user splits, searches, copies, pastes, resizes, scrolls back, zooms, or exits a terminal
+- **THEN** each of those interactions is supported by the terminal panel
+
+### Requirement: Chunked clipboard paste with visible progress
+
+Clipboard text that exceeds one terminal-input frame SHALL be sent in ordered, bounded chunks. The terminal SHALL advance the paste one delivered chunk per render frame so its compact indicator reports the actual delivered-byte percentage for the whole transfer, and SHALL NOT complete merely because the browser or transport has buffered the remainder. The indicator SHALL include a Stop control that prevents unsent clipboard chunks from reaching the PTY while leaving bytes already accepted by the transport untouched.
+
+#### Scenario: Large paste
+
+- **WHEN** pasted clipboard text exceeds one terminal-input frame
+- **THEN** it is sent in ordered bounded chunks, one delivered chunk per render frame
+- **AND** the indicator reports the actual delivered-byte percentage and does not complete on transport buffering alone
+
+#### Scenario: Stopping a paste
+
+- **WHEN** the user activates the paste indicator's Stop control
+- **THEN** unsent clipboard chunks do not reach the PTY
+- **AND** bytes already accepted by the transport are left untouched
+
+### Requirement: Desktop clipboard preference order
+
+On Desktop, a user-initiated terminal paste SHALL prefer copied file paths, then text, then convert an image-only clipboard item into a PNG in Terminay's temporary clipboard directory and insert its shell-escaped path. Clipboard images and their temporary paths SHALL be read and created only by Electron. A browser client SHALL paste non-empty clipboard text as text, and SHALL materialise an image-only clipboard on the server into a server-owned clipboard directory and insert its shell-escaped path.
+
+#### Scenario: Image-only clipboard on Desktop
+
+- **WHEN** a Desktop user pastes with only an image on the clipboard
+- **THEN** Electron writes a PNG into Terminay's temporary clipboard directory and inserts its shell-escaped path
+
+#### Scenario: Browser paste
+
+- **WHEN** a browser client pastes into a terminal
+- **THEN** non-empty clipboard text is pasted as text
+- **AND** an image-only clipboard is written under the server-owned clipboard directory and its shell-escaped path is inserted
+
+### Requirement: Browser clipboard image paste
+
+A user-initiated paste in a browser client SHALL prefer non-empty clipboard text, then an image. When the clipboard holds an image and no usable text, Terminay Server SHALL write the bytes into a server-owned clipboard directory — `terminay-clipboard` under the process temporary directory, which is `/tmp/terminay-clipboard` on typical Unix hosts — under a server-chosen name, and the client SHALL insert the shell-escaped absolute server path into the focused terminal. The client SHALL NOT choose the destination path, SHALL NOT write the file into the project, and SHALL NOT receive a browser-local filesystem path.
+
+The read SHALL happen inside the user activation that requested it (`navigator.clipboard.read()` from the Paste control, or the trusted `paste` event's image files). A pointer-activated Paste control SHALL issue the read from the event that carries activation for its pointer type, which for touch is `pointerup`. Where the host exposes only a text clipboard route, the Paste control SHALL still paste text. The mobile accessory Paste control, a native paste into the terminal, and the terminal context-menu paste SHALL share this behaviour. Desktop Electron paste is out of scope for this requirement.
+
+The upload SHALL be authorized for the same project and terminal session that will receive the path, SHALL reject a body larger than 8 MiB, and SHALL accept PNG, JPEG, WebP, and GIF. A denied clipboard permission, an empty clipboard, an unsupported type, or a failed upload SHALL NOT insert a path.
+
+A browser may refuse a programmatic clipboard read outright, and a terminal offers the platform no editable element to raise its own paste control over. When the read is refused, Terminay SHALL offer a focused editable field through which the user can complete the paste using the platform's own paste control, and a paste into that field SHALL reach the terminal through the same preference order and server materialisation as any other browser paste. A refused read SHALL NOT be reported as terminal output.
+
+#### Scenario: iOS Safari screenshot via Paste
+
+- **WHEN** a browser user activates the terminal Paste control with an image-only screenshot on the iOS Safari clipboard
+- **THEN** the image is read inside that user activation
+- **AND** Terminay Server writes it under the server-owned clipboard directory
+- **AND** the shell-escaped absolute server path is inserted into the focused terminal
+
+#### Scenario: Native paste event with an image
+
+- **WHEN** a browser user pastes an image into the terminal through the platform paste gesture
+- **THEN** the image is taken from the paste event
+- **AND** Terminay Server writes it under the server-owned clipboard directory
+- **AND** the shell-escaped absolute server path is inserted into the focused terminal
+
+#### Scenario: Text still wins
+
+- **WHEN** a browser user pastes and the clipboard holds non-empty text
+- **THEN** the text is pasted
+- **AND** no clipboard image is uploaded
+
+#### Scenario: Client cannot choose the path
+
+- **WHEN** a browser client materialises a clipboard image
+- **THEN** the server chooses the directory and file name
+- **AND** the file is not written into the selected project
+
+#### Scenario: Oversized or unsupported clipboard image
+
+- **WHEN** a browser clipboard image exceeds 8 MiB or is not PNG, JPEG, WebP, or GIF
+- **THEN** the server rejects the upload
+- **AND** no path is inserted into the terminal
+
+#### Scenario: Clipboard permission denied
+
+- **WHEN** the browser refuses the clipboard read
+- **THEN** no path is inserted
+- **AND** nothing is written to the terminal as output
+- **AND** a focused editable field is offered so the user can complete the paste with the platform's own paste control
+
+#### Scenario: Paste completed through the offered field
+
+- **WHEN** the user pastes an image into the field offered after a refused read
+- **THEN** Terminay Server writes it under the server-owned clipboard directory
+- **AND** the shell-escaped absolute server path is inserted into the focused terminal
+- **AND** the field is dismissed and the terminal regains input focus
+
+### Requirement: Terminal zoom scope
+
+Desktop Zoom In, Zoom Out, and Reset Zoom SHALL change the terminal font size and Documentation editor text size only and SHALL publish a `terminal.zoom` host event. They SHALL NOT zoom the surrounding UI.
+
+#### Scenario: Zoom invoked
+
+- **WHEN** the user invokes Desktop Zoom In, Zoom Out, or Reset Zoom
+- **THEN** the terminal font size and Documentation text size change and a `terminal.zoom` host event is published
+- **AND** the surrounding UI is not zoomed
+
+### Requirement: Renderer selection for xterm surfaces
+
+Live xterm surfaces SHALL use the WebGL renderer when the host provides WebGL2 so box-drawing and block glyphs fill the cell. Missing WebGL, a lost GPU context, or an automated driver session SHALL fall back to the DOM renderer without changing PTY behaviour. Server-side headless xterm SHALL NOT load a GPU renderer. Recording replay SHALL stay on the DOM renderer. Replay list, play, zoom, and palette chrome SHALL stay mounted if the replay canvas fails to open. Live surfaces SHALL pin the xterm 6.1 WebGL addon so split panes that share a glyph atlas rebuild after atlas page merges instead of painting stale glyphs. Custom box-drawing glyphs SHALL be a WebGL addon option rather than a core xterm option.
+
+#### Scenario: No WebGL2 available
+
+- **WHEN** the host lacks WebGL2, loses its GPU context, or runs under an automated driver session
+- **THEN** the surface falls back to the DOM renderer
+- **AND** PTY behaviour is unchanged
+
+#### Scenario: Split panes sharing a glyph atlas
+
+- **WHEN** split panes share a glyph atlas and atlas pages merge
+- **THEN** the panes rebuild rather than painting stale glyphs
+
+#### Scenario: Replay canvas fails
+
+- **WHEN** the recording replay canvas fails to open
+- **THEN** the replay list, play, zoom, and palette chrome stay mounted
+
+### Requirement: Touch input and software keyboard accessory
+
+On touch devices, xterm SHALL own scrollback and the terminal mouse and key sequences required by interactive TUIs; Terminay SHALL NOT translate or suppress touch input over the xterm surface, except for the remainder of a gesture that has entered text selection. A synchronous, non-cancelling touch focus bridge SHALL focus xterm's helper textarea so iOS can present its software keyboard, and that bridge SHALL claim focus only for a tap — a touch that is released without travelling beyond a small movement threshold. A touch that scrolls, drags, or is cancelled SHALL NOT focus the terminal and SHALL NOT cause a software keyboard to be presented. While that keyboard is visible and the keyboard focus is inside the terminal's panel, Terminay SHALL present a compact accessory row immediately above it for Escape, Tab, Control, Shift, and Alt modifiers, arrow keys, Enter, Paste, and keyboard dismissal. Each modifier SHALL behave like Shift on the iOS keyboard: one tap applies it to the next input only, a second tap locks it on for every input until a third tap releases it, and each state SHALL be visibly distinct on the key. Dismissing the keyboard from the accessory SHALL release every modifier, locked or not. While the keyboard is visible for anything outside the panel, such as a text field in an app window, the accessory row SHALL NOT be shown. The accessory SHALL send its bytes through the terminal panel's normal input boundary and SHALL NOT implement scrolling or gesture translation.
+
+#### Scenario: Touching the terminal on iOS
+
+- **WHEN** a user touches the xterm surface on a touch device and releases without moving beyond the movement threshold
+- **THEN** a synchronous, non-cancelling focus bridge focuses xterm's helper textarea so the software keyboard appears
+- **AND** touch input over the surface is neither translated nor suppressed
+
+#### Scenario: Scrolling the terminal does not raise the keyboard
+
+- **WHEN** a user touches the xterm surface, moves beyond the movement threshold, and releases
+- **THEN** the terminal is not focused and no software keyboard is presented
+- **AND** xterm scrolls the buffer for that gesture as it would for any other touch pan
+
+#### Scenario: Cancelled touch claims nothing
+
+- **WHEN** a touch over the xterm surface is cancelled before it is released
+- **THEN** the terminal is not focused and no software keyboard is presented
+
+#### Scenario: Scrolling an already-focused terminal keeps it focused
+
+- **WHEN** the terminal already holds focus and the user scrolls it by touch
+- **THEN** the terminal remains focused
+- **AND** a software keyboard that was already visible is not dismissed
+
+#### Scenario: Focus is claimed on release, within the activating gesture
+
+- **WHEN** the focus bridge claims focus for a tap
+- **THEN** it does so while the releasing touch event is still in flight, so a platform that gates software-keyboard presentation on a trusted user gesture still presents one
+
+#### Scenario: Accessory row in use
+
+- **WHEN** the software keyboard is visible and the user activates an accessory control
+- **THEN** its bytes are sent through the terminal panel's normal input boundary
+- **AND** the accessory implements no scrolling or gesture translation
+
+#### Scenario: One tap modifies the next input only
+
+- **WHEN** the user taps Control once and then types `c` and `d`
+- **THEN** `c` is sent as Control-C and `d` is sent unmodified
+- **AND** the Control key no longer shows as active
+
+#### Scenario: Two taps lock a modifier
+
+- **WHEN** the user taps Control twice and then types `c` and `d`
+- **THEN** both are sent with Control applied
+- **AND** the Control key shows as locked, distinct from the one-shot state, until the user taps it a third time
+
+#### Scenario: Dismissing the keyboard releases modifiers
+
+- **WHEN** a modifier is one-shot or locked and the user dismisses the keyboard from the accessory row
+- **THEN** every modifier is released
+
+#### Scenario: Keyboard raised by a field in an app window
+
+- **WHEN** the user taps a text field inside an app window and the software keyboard appears
+- **THEN** the terminal's accessory row is not shown
+- **AND** it is shown again when the user taps the terminal
+
+### Requirement: File drop behaviour
+
+Dropping operating-system files onto a Desktop terminal SHALL insert their native paths without copying the files. Dropping browser-local files onto a web terminal SHALL upload bounded file contents into the selected server project's root and insert the resulting server paths. Browser clients SHALL NOT receive or infer a local absolute path.
+
+#### Scenario: Desktop file drop
+
+- **WHEN** operating-system files are dropped onto a Desktop terminal
+- **THEN** their native paths are inserted and the files are not copied
+
+#### Scenario: Browser file drop
+
+- **WHEN** browser-local files are dropped onto a web terminal
+- **THEN** bounded file contents are uploaded into the selected server project's root and the resulting server paths are inserted
+- **AND** the browser client receives no local absolute path
+
+### Requirement: Tab identity, styling, and actions
+
+A tab SHALL be renameable and styleable with colour, emoji, terminal-theme controls, and an optional note. Double-clicking the tab or long-pressing it SHALL open that editor. The editor SHALL stay reachable at a width where no tab strip is drawn: a long press on the active terminal's row in the compact switcher SHALL open it, and the **Edit Active Tab** command SHALL open it for the terminal in front. Tab context actions SHALL expose terminal-specific actions such as recording and moving the tab to another project.
+
+#### Scenario: Opening the tab editor
+
+- **WHEN** the user double-clicks or long-presses a terminal tab
+- **THEN** the editor opens with rename, colour, emoji, terminal-theme controls, and an optional note
+
+#### Scenario: Opening the tab editor where no tab strip is drawn
+
+- **WHEN** a user long-presses a terminal row in the compact switcher
+- **THEN** that terminal's editor opens with the same controls, and the terminal is not merely activated
+
+#### Scenario: Opening the tab editor by command
+
+- **WHEN** a user invokes **Edit Active Tab** with a terminal in front
+- **THEN** that terminal's editor opens
+
+#### Scenario: Tab context menu
+
+- **WHEN** the user opens a terminal tab's context actions
+- **THEN** terminal-specific actions such as recording and moving to another project are available
+
+### Requirement: Command Bar terminal targeting
+
+The Command Bar SHALL expose terminal and workspace actions. A terminal command SHALL report an inline failure rather than silently targeting a different panel.
+
+#### Scenario: No valid terminal target
+
+- **WHEN** a Command Bar terminal action has no valid terminal target
+- **THEN** it reports an inline failure
+- **AND** it does not target a different panel
+
+### Requirement: Output fan-out to integrations
+
+PTY output SHALL fan out in Terminay Server to authorized clients and to recording, activity, and agent integrations. These consumers SHALL NOT change the terminal stream.
+
+#### Scenario: Recording and agents attached
+
+- **WHEN** recording, activity, and agent integrations consume a session's PTY output
+- **THEN** the terminal stream delivered to authorized clients is unchanged
+
+### Requirement: Terminal link and input safety
+
+Terminal content SHALL be treated as untrusted text. Modifier-clicking a detected or OSC-8 HTTP or HTTPS link SHALL open that credential-free URL in the system browser; other schemes and URLs with credentials SHALL be rejected. A pointer device SHALL require a modifier click to open a link. A touch tap on a link SHALL NOT open it; it SHALL show a link menu with **Copy Text**, which copies the link's visible text, **Copy Link**, which copies its URL, and **Open Link**, which opens it as a modifier-click does. On iOS and Android the menu SHALL also offer **Open in Browser**, which hands a credential-free HTTP or HTTPS URL to the platform browser app through its URL scheme so it opens outside an installed web app. A tap on a link SHALL NOT focus the terminal, and SHALL be recognised whatever the foreground program is doing without reaching that program as a button report it never saw pressed. A browser client SHALL open an external URL and write the clipboard within the user activation that requested it. Paste and external drop behaviour SHALL remain user initiated. Screen-reader and reduced-motion settings SHALL be honoured. Secrets typed in a terminal SHALL NOT be collected by default; recording has its own explicit policy.
+
+#### Scenario: Modifier-clicking a link
+
+- **WHEN** a user modifier-clicks a detected `http://` or `https://` terminal link, including an OSC-8 hyperlink
+- **THEN** that credential-free URL opens in the system browser
+
+#### Scenario: Clicking a link without a modifier
+
+- **WHEN** a user clicks a terminal link with a pointer device and holds no modifier
+- **THEN** the link is not opened
+
+#### Scenario: Tapping a link on touch
+
+- **WHEN** a user taps a terminal link on a touch device
+- **THEN** the link is not opened and the terminal is not focused
+- **AND** a menu offers Copy Text, Copy Link, and Open Link
+
+#### Scenario: Copying an OSC-8 hyperlink's text
+
+- **WHEN** a user taps an OSC-8 hyperlink and chooses Copy Text
+- **THEN** the clipboard receives the text shown in the terminal, not the URL
+
+#### Scenario: Opening in the platform browser
+
+- **WHEN** a user on iOS or Android taps an `https://` link and chooses Open in Browser
+- **THEN** the URL is opened through the platform browser's URL scheme rather than an in-app sheet
+
+#### Scenario: Unsafe link
+
+- **WHEN** a terminal link uses another scheme or contains credentials
+- **THEN** opening it is rejected
+
+#### Scenario: Tapping a link inside a mouse tracking program
+
+- **WHEN** a user taps a terminal link while the foreground program is in mouse tracking mode
+- **THEN** the link menu is shown
+- **AND** no button report the program never saw pressed is sent
+
+#### Scenario: Opening a link from a browser client
+
+- **WHEN** a browser client opens a terminal link or copies a selection
+- **THEN** the browser is asked within the user activation that requested it, so a browser that gates windows and the clipboard on a live activation still honours the request
+
+### Requirement: Bounded output framing and replay window
+
+Terminal output SHALL be counted in raw bytes, split into bounded frames, and retained in a bounded replay window with a monotonically increasing byte position. A reconnect from a position older than the retained window SHALL receive an explicit resync or gap result rather than guessed or duplicate output. Queued output SHALL be bounded per subscriber, and a slow consumer SHALL be detached without terminating the server-owned PTY.
+
+#### Scenario: Reconnect from a stale position
+
+- **WHEN** a client reconnects from a byte position older than the retained replay window
+- **THEN** it receives an explicit resync or gap result
+- **AND** no guessed or duplicate output is delivered
+
+#### Scenario: Slow consumer
+
+- **WHEN** one subscriber's queued output exceeds its bound
+- **THEN** that subscriber is detached
+- **AND** the server-owned PTY is not terminated
+
+### Requirement: Exit and interruption metadata
+
+Exit metadata — code, signal, reason, and timestamp — SHALL be committed and published once, and the canonical workspace session record SHALL be marked exited so a later attach or renderer reload cannot treat that panel as a live PTY. Server shutdown or restart SHALL mark live sessions interrupted once, while client disconnect, reload, and native-window close SHALL NOT alter session lifetime.
+
+#### Scenario: Terminal exits
+
+- **WHEN** a PTY exits
+- **THEN** its code, signal, reason, and timestamp are committed and published once and the session record is marked exited
+- **AND** a later attach or renderer reload does not treat that panel as a live PTY
+
+#### Scenario: Closing an exited terminal
+
+- **WHEN** an exited terminal is closed
+- **THEN** its panel is removed without recovering the shared application connection or reloading the renderer
+- **AND** sibling live terminals stay attached and interactive
+
+#### Scenario: Server restart
+
+- **WHEN** the server shuts down or restarts
+- **THEN** live sessions are marked interrupted once
+
+### Requirement: Binary live output framing
+
+Live terminal output SHALL use the protocol frame's binary body. Its event envelope SHALL contain only attachment-scoped identity, byte positions, and output metadata, and the body length SHALL exactly equal `nextPosition - position`. The server MAY coalesce adjacent PTY callbacks into one bounded contiguous body before framing, but SHALL NOT reorder, drop, or split an ANSI sequence by inventing a byte position. A client SHALL advertise `terminal.binary-output` before receiving binary event bodies, and a compatible server SHALL retain the base64 event field only for clients that do not advertise that capability. Attach-result replay SHALL remain base64 because command-result events have no binary body.
+
+#### Scenario: Client advertises binary output
+
+- **WHEN** a client advertises `terminal.binary-output`
+- **THEN** live output arrives in the protocol frame's binary body with a body length exactly equal to `nextPosition - position`
+
+#### Scenario: Client without the capability
+
+- **WHEN** a client does not advertise `terminal.binary-output`
+- **THEN** the server retains the base64 event field for that client
+
+#### Scenario: Coalescing callbacks
+
+- **WHEN** the server coalesces adjacent PTY callbacks
+- **THEN** the resulting body is bounded and contiguous
+- **AND** no output is reordered or dropped and no ANSI sequence is split by an invented byte position
+
+### Requirement: Transport-neutral attach and detach boundary
+
+The transport-neutral `TerminalServiceAdapter` SHALL supply the attach, detach, and resume boundary used by local and remote protocol adapters. It SHALL keep a bounded per-client and per-session high-water mark, advance a stale reconnect cursor before asking the server for replay, and suppress output at or below the last delivered position. Detaching SHALL close only that client subscription while the PTY and its replay window remain owned by the server.
+
+#### Scenario: Stale reconnect cursor
+
+- **WHEN** a client reconnects with a cursor behind its last delivered position
+- **THEN** the cursor is advanced before replay is requested
+- **AND** output at or below the last delivered position is suppressed
+
+#### Scenario: Detach
+
+- **WHEN** a client detaches
+- **THEN** only that client's subscription closes
+- **AND** the PTY and its replay window remain owned by the server
+
+### Requirement: Client terminal command surface
+
+`TerminayTerminalClient` SHALL expose the same boundary over a canonical client command and subscription transport. A write-authorized client SHALL create a new server-owned session through `terminal.create`, and the server SHALL assign its session identity and return its canonical cwd and dimensions. The client SHALL then use `terminal.attach`, `terminal.resume`, `terminal.detach`, and `terminal.ack`, subscribe to the bounded `terminal` stream, decode raw output bytes, and reject events whose immutable identity does not match the requested session. Client and session high-water marks SHALL survive a detach, and stale resume cursors SHALL NOT deliver duplicate output. Local sockets, browser transports, and WebRTC SHALL only provide the underlying command and event transport and SHALL NOT own the PTY.
+
+#### Scenario: Creating a session
+
+- **WHEN** a write-authorized client issues `terminal.create`
+- **THEN** the server assigns the session identity and returns its canonical cwd and dimensions
+
+#### Scenario: Mismatched event identity
+
+- **WHEN** an event's immutable identity does not match the requested session
+- **THEN** the client rejects that event
+
+### Requirement: Subscription established before attach
+
+The client SHALL establish an identity-scoped terminal subscription before it issues `terminal.attach` or `terminal.resume`, then accept events only for the opaque attachment identity returned by that command. It SHALL buffer this bounded handoff until the command result and any authoritative checkpoint are applied. This ordering SHALL NOT relax strict contiguous-position validation.
+
+#### Scenario: Shell writes immediately after spawn
+
+- **WHEN** a newly spawned shell writes after the server allocates its attachment but before the attach command result is applied
+- **THEN** the pre-established subscription buffers that bounded handoff until the result and any authoritative checkpoint are applied
+- **AND** strict contiguous-position validation still applies
+
+### Requirement: Bounded command-result replay
+
+Initial attach and resume replay SHALL be capped independently of the retained server window so its base64 command-result representation always fits the default protocol header budget. The server SHALL enforce the cap even when a client omits or overstates its requested replay budget, and SHALL coalesce contiguous replay chunks so per-event metadata does not exhaust that budget. Live output SHALL continue on the ordered terminal event stream after attachment.
+
+#### Scenario: Client overstates its replay budget
+
+- **WHEN** a client omits or overstates its requested replay budget
+- **THEN** the server enforces the cap and coalesces contiguous replay chunks
+- **AND** live output continues on the ordered terminal event stream after attachment
+
+### Requirement: Replay cap is not a lifetime limit
+
+The command-result replay cap SHALL NOT act as a terminal-lifetime or presentation-size limit. A fresh display SHALL hydrate through a bounded binary checkpoint transfer and SHALL NOT require the complete raw transcript to fit in a command header. Presentation-unavailable SHALL be reserved for a missing, invalid, or resource-exhausted authoritative checkpoint, not for an otherwise healthy terminal whose lifetime output exceeds an attach-header budget.
+
+#### Scenario: Long-running high-output terminal
+
+- **WHEN** a terminal's lifetime output greatly exceeds the attach-header budget and the raw replay window has advanced
+- **THEN** a fresh display still hydrates through a bounded binary checkpoint transfer
+- **AND** the terminal is not reported presentation-unavailable
+
+### Requirement: Attach begins at a valid presentation boundary
+
+An attach or resync SHALL begin from a valid terminal presentation boundary. The server SHALL NOT ask a fresh emulator to reconstruct a screen from an arbitrary byte suffix that may begin inside an escape sequence or depend on discarded terminal mode history. A bounded checkpoint or equivalent canonical screen state SHALL be tied to an exact output position, and live raw bytes SHALL continue from that position without a gap or duplicate. If no valid boundary is retained, the client SHALL receive an explicit unavailable or resync state instead of a plausible but corrupted terminal display.
+
+#### Scenario: Fresh client or recovery after a gap
+
+- **WHEN** a fresh client attaches, or a client recovers after a replay gap
+- **THEN** it hydrates from a valid presentation boundary and then receives uninterrupted live output
+- **AND** it never starts inside a partial ANSI or OSC sequence
+
+#### Scenario: No valid boundary retained
+
+- **WHEN** no valid presentation boundary is retained
+- **THEN** the client receives an explicit unavailable or resync state
+
+### Requirement: Checkpoint hydration authorization
+
+Checkpoint hydration SHALL be authorized by an immutable, one-use pin bound during attach to the exact server, project, session, client, and attachment. A mutable live-attachment registry SHALL NOT be a second authority for that binary handoff. The pin SHALL remain scoped and unguessable, and replacement SHALL release stale pins.
+
+#### Scenario: Registry changes while a query is in flight
+
+- **WHEN** rapid panel replacement or moving a terminal presentation between projects changes the live attachment registry while a bound checkpoint query is in flight
+- **THEN** authorization still follows the immutable one-use pin bound at attach
+- **AND** replacement releases stale pins
+
+### Requirement: Layout changes preserve terminal presentation
+
+Workspace metadata and chrome SHALL NOT be terminal presentation lifecycles. Changing a project root, opening or closing a sidebar, resizing a window, and other layout-only updates SHALL preserve the mounted emulator, its attachment, and its rendered byte position. A surviving emulator SHALL resume from its exact acknowledged position after transient transport loss. Only a genuinely new emulator, such as one created after renderer reload or window restoration, SHALL request checkpoint hydration.
+
+#### Scenario: Sidebar toggled or window resized
+
+- **WHEN** a project root changes, a sidebar opens or closes, or a window is resized
+- **THEN** the mounted emulator, its attachment, and its rendered byte position are preserved
+
+#### Scenario: Transient transport loss
+
+- **WHEN** a surviving emulator reconnects after transient transport loss
+- **THEN** it resumes from its exact acknowledged position without duplicating the PTY or replaying acknowledged output
+
+### Requirement: Transport-neutral panel client
+
+`TerminayTerminalPanelClient` SHALL be the transport-neutral view over an attachment, exposing raw-byte output, exit and resync notifications, and attachment-scoped input, resize, kill, and acknowledgement commands. It SHALL have no Electron or Node dependency so a shared panel uses it identically in Desktop and browser hosts.
+
+#### Scenario: Shared panel in either host
+
+- **WHEN** the shared terminal panel runs in a Desktop host or a browser host
+- **THEN** it uses the same panel client with no Electron or Node dependency
+
+### Requirement: Terminal creation is a server-owned workspace mutation
+
+The production shared Terminal route body SHALL be project-scoped from the current server-owned workspace snapshot. Creating a terminal SHALL be a server-owned workspace mutation: the server creates the PTY session and the corresponding terminal panel record, commits both under the next workspace revision, and publishes the ordered workspace event consumed by every connected client. The event SHALL accelerate reconciliation but SHALL NOT be an acknowledgement: after the create command returns, the initiating client SHALL actively read the authoritative delta and complete only when one atomic projection contains both the returned session and its terminal panel.
+
+#### Scenario: Change notification lost
+
+- **WHEN** the workspace change notification is lost during transport replacement
+- **THEN** the initiating client still completes by actively reading the authoritative delta
+- **AND** it completes only when one atomic projection contains both the returned session and its terminal panel
+
+### Requirement: Renderer does not invent terminal panel identity
+
+Renderer code SHALL NOT create durable terminal panel identity as a fallback for missing server state. It MAY only mount the xterm body for a server-owned panel, attach through `TerminayTerminalPanelClient`, and keep temporary local measurements that are either discarded or committed through explicit workspace commands.
+
+#### Scenario: Server panel record missing
+
+- **WHEN** a renderer lacks a server-owned terminal panel record
+- **THEN** it does not create durable panel identity locally
+
+### Requirement: Hydration presentation for an inactive tab
+
+Because only the active terminal body is mounted, a newly created terminal SHALL NOT complete xterm hydration while its tab remains inactive. While hydration is in progress, the terminal tab SHALL use a small rotating loader in its icon position and the terminal body SHALL remain an undecorated empty terminal surface; it SHALL NOT show a centered Terminay mark or loading copy. The loader SHALL be removed when hydration completes, and an attachment failure SHALL replace the blank state with the actionable terminal error presentation.
+
+#### Scenario: Newly created terminal hydrating
+
+- **WHEN** a newly created terminal is hydrating
+- **THEN** its tab shows a small rotating loader in the icon position and its body is an undecorated empty terminal surface
+- **AND** no centered Terminay mark or loading copy is shown
+
+#### Scenario: Attachment fails during hydration
+
+- **WHEN** attachment fails while the terminal shows its blank hydration state
+- **THEN** the actionable terminal error presentation replaces that blank state
+
+### Requirement: Checkpoint restore then fit
+
+A newly mounted terminal SHALL restore its checkpoint at the checkpoint's original grid, then fit to the active panel's non-zero viewport before hydration becomes visible and before it claims the current viewport dimensions from the PTY. A saved checkpoint grid SHALL NOT leave a newly activated terminal visibly narrow when its active panel is wider.
+
+#### Scenario: Checkpoint narrower than the panel
+
+- **WHEN** a saved checkpoint grid is narrower than the active panel's viewport
+- **THEN** the terminal fits to the panel's non-zero viewport before hydration becomes visible
+- **AND** it is not left visibly narrow
+
+### Requirement: Server-side input write boundary
+
+`TerminalInputSourceAdapter` SHALL be the server-side write boundary for keyboard, paste, macro, dictation, MCP, and remote sources. It SHALL validate the exact server, project, and session authorization, preserve per-session write ordering, track optional per-source sequence numbers, and apply bounded input backpressure before forwarding bytes to the PTY.
+
+#### Scenario: Concurrent input sources
+
+- **WHEN** keyboard, macro, dictation, MCP, and remote input arrive for one session
+- **THEN** per-session write ordering is preserved and bounded input backpressure is applied before bytes reach the PTY
+
+#### Scenario: Input reaching only its own PTY
+
+- **WHEN** input or resize is submitted for a session
+- **THEN** it reaches only that intended live PTY
+
+### Requirement: Viewport dimension lease
+
+Viewport changes SHALL use an explicit lease: one client claims `wide`, `narrow`, or `mobile` dimensions, the owner updates or releases them, and an expired or disconnected owner SHALL NOT continue to block another client from claiming the session.
+
+#### Scenario: Owner disconnects
+
+- **WHEN** the viewport-dimension owner disconnects or its lease expires
+- **THEN** another client can claim the session's dimensions
+
+### Requirement: Interactive presentation lease
+
+Each live session SHALL have one interactive presentation lease shared by keyboard and paste input, viewport ownership, and emulator-generated protocol responses. Only its current holder MAY forward an xterm `onData` stream into the PTY. Other authorized clients SHALL remain live read-only observers and MAY request an explicit takeover; focus, attachment, or receipt of output alone SHALL NOT silently seize control. Handoff, disconnect, expiry, and revocation SHALL release the lease predictably and SHALL be visible to every attached client.
+
+#### Scenario: Two clients attached to one session
+
+- **WHEN** a Desktop client and a browser client are attached to one session
+- **THEN** both render every output byte in order
+- **AND** only the visible lease holder can produce interactive or emulator-generated input
+- **AND** explicit takeover transfers that authority without duplicated terminal-query responses
+
+#### Scenario: Observer focuses the terminal
+
+- **WHEN** a read-only observer focuses, attaches, or receives output
+- **THEN** it does not seize control without an explicit takeover
+
+### Requirement: Lease expiry and renewal after suspension
+
+Lease expiry SHALL distinguish an abandoned attachment from a temporarily suspended host. A still-live, write-authorized exact attachment MAY renew an unowned lease after its timers resume, including after operating-system sleep, and renewal SHALL NOT displace a different holder. If a presentation is read-only while no holder exists, its control surface SHALL remain visible and SHALL offer an explicit acquire action rather than silently discarding input behind an apparently interactive terminal.
+
+#### Scenario: Host resumes from sleep
+
+- **WHEN** a controlling attachment remains live across operating-system sleep and its timers resume
+- **THEN** it renews the otherwise unowned lease
+- **AND** renewal does not displace a different holder
+
+#### Scenario: Automatic renewal cannot restore control
+
+- **WHEN** automatic renewal cannot restore control and no holder exists
+- **THEN** the terminal visibly offers acquisition
+- **AND** it does not remain an unlabelled read-only surface silently discarding input
+
+### Requirement: Initial presentation ownership
+
+When a client creates a terminal, the server SHALL briefly reserve initial presentation ownership for that authenticated creator so reconciliation order cannot let an observing browser win a race by attaching first. The creator SHALL acquire the lease as part of its serialized attach; if it disconnects or fails to attach within the bounded reservation, the server SHALL elect an already attached write-authorized observer. For a pre-existing session with no reservation or holder, the first write-authorized attachment SHALL acquire the lease. Initial ownership SHALL NOT be a takeover and SHALL NOT displace an existing holder.
+
+#### Scenario: Browser attaches before the creating desktop
+
+- **WHEN** an observing browser attaches before the creating desktop client
+- **THEN** the reservation keeps initial presentation ownership for the authenticated creator
+
+#### Scenario: Creator never attaches
+
+- **WHEN** the creator disconnects or fails to attach within the bounded reservation
+- **THEN** the server elects an already attached write-authorized observer
+
+#### Scenario: Pre-existing session
+
+- **WHEN** a pre-existing session has no reservation and no holder
+- **THEN** the first write-authorized attachment acquires the lease without displacing anyone
+
+### Requirement: Control bar and takeover presentation
+
+The owning surface SHALL show no controller badge or control affordance. A write-authorized observer SHALL show takeover UI only while a different live attachment is the holder, as a full-width terminal bar reading "Another device is controlling this terminal." with a "Take back control" action. A lease conflict SHALL be normal read-only presentation state, not a connection failure. The control bar SHALL be an opaque themed layout row above the terminal viewport that reserves its own height and never covers terminal output, the cursor, or the emulator input surface. Its geometry and appearance SHALL be identical in desktop and browser renderers and SHALL remain stable across active-tab changes.
+
+#### Scenario: Sole attachment
+
+- **WHEN** a sole local or remote attachment owns a terminal
+- **THEN** it silently owns and fills that terminal with no controller or read-only badge
+
+#### Scenario: Another device holds the lease
+
+- **WHEN** a different live attachment holds the presentation lease
+- **THEN** the write-authorized observer sees a full-width bar reading "Another device is controlling this terminal." with a "Take back control" action
+- **AND** the state is presented as normal read-only presentation, not a connection failure
+
+### Requirement: Takeover survives congestion recovery
+
+Congestion recovery SHALL NOT drop the takeover action or apply it to a detached attachment: if the observer clicks during checkpoint resync, the replacement attach SHALL perform the requested acquire or takeover. Presentation events with an older revision SHALL NOT overwrite a newer local presentation state.
+
+#### Scenario: Takeover clicked during resync
+
+- **WHEN** an observer requests takeover while a checkpoint resync is in progress
+- **THEN** the replacement attach performs the requested acquire or takeover
+
+#### Scenario: Stale presentation event
+
+- **WHEN** a presentation event arrives with an older revision than local state
+- **THEN** it does not overwrite the newer local presentation state
+
+### Requirement: Terminal journal routing
+
+Terminal journal consumers SHALL route by the exact server, project, session, client, and attachment identity before strict event decoding. Auxiliary or other-client journal payloads SHALL NOT detach a valid terminal stream. An unknown event that does claim the exact attachment SHALL fail closed as a protocol violation.
+
+#### Scenario: Payload for another client
+
+- **WHEN** an auxiliary or other-client journal payload arrives
+- **THEN** it does not detach the valid terminal stream
+
+#### Scenario: Unknown event claiming the exact attachment
+
+- **WHEN** an unrecognized event claims the exact server, project, session, client, and attachment identity
+- **THEN** it fails closed as a protocol violation
+
+### Requirement: Rejected input after a control change
+
+If control changes while emulator or keyboard bytes are already queued, a server `presentation_owner` rejection SHALL definitively mean those bytes were not delivered. The old controller SHALL discard that stale queue and remain attached as a read-only observer, and SHALL NOT show a connection error or retry action.
+
+#### Scenario: Control changes with queued bytes
+
+- **WHEN** a server `presentation_owner` rejection is returned for queued emulator or keyboard bytes
+- **THEN** those bytes were not delivered, the old controller discards the stale queue, and it remains attached as a read-only observer
+- **AND** no connection error or retry action is shown
+
+### Requirement: Presentation command result envelope
+
+Presentation acquire, takeover, and renewal SHALL expose the presentation state as the standard command result payload. Because presentation state contains its own `revision`, the server handler SHALL retain the internal command-result wrapper so the dispatcher does not reinterpret that domain revision as transport metadata. The wire response SHALL contain exactly one command result envelope.
+
+#### Scenario: Acquire returns presentation state
+
+- **WHEN** an acquire, takeover, or renewal command returns presentation state carrying its own `revision`
+- **THEN** the domain revision is not reinterpreted as transport metadata
+- **AND** the wire response contains exactly one command result envelope
+
+### Requirement: Ownership fits and publishes the viewport
+
+Initial ownership and explicit takeover SHALL immediately fit the terminal to the owning surface and submit its current viewport. A resize attempted before the asynchronous attach completed SHALL be retained and submitted once ownership is known, so an unshared terminal always fills its panel and never retains a stale observer viewport.
+
+#### Scenario: Resize before attach completes
+
+- **WHEN** a resize is attempted before the asynchronous attach has completed
+- **THEN** it is retained and submitted once ownership is known
+- **AND** the terminal fills its panel rather than retaining a stale observer viewport
+
+### Requirement: Coalesced resize submission
+
+The controlling renderer SHALL fit its local emulator on every layout observation but SHALL coalesce a burst of changed viewport dimensions before submitting the authoritative PTY resize. The initial ownership and explicit-takeover viewport SHALL remain immediate. An interactive window or panel drag SHALL publish its final settled dimensions once.
+
+#### Scenario: Interactive drag
+
+- **WHEN** the user drags a window or panel edge through many intermediate sizes
+- **THEN** the local display keeps fitting responsively and the authoritative PTY resize is published once with the final settled dimensions
+
+### Requirement: Canonical PTY grid owned by the holder
+
+The current presentation holder SHALL exclusively define the canonical PTY columns and rows. Every accepted holder resize SHALL be published to each exact terminal attachment. Read-only observers SHALL adopt that canonical grid locally, scaling it to their available panel when necessary, and their own layout observers SHALL NOT submit a resize or alter PTY dimensions. Attach and resume SHALL deliver the current canonical dimensions before replayed output. On takeover, the former holder's resize lease SHALL be released, the new holder SHALL clear any observer-size override, fit its own viewport, and immediately publish its dimensions; taking control back SHALL perform the same transition in reverse.
+
+#### Scenario: Observer resizes its panel
+
+- **WHEN** a read-only observer's panel changes size
+- **THEN** it scales the canonical grid locally
+- **AND** it submits no resize and does not alter PTY dimensions
+
+#### Scenario: Attach delivers dimensions
+
+- **WHEN** a client attaches or resumes
+- **THEN** it receives the current canonical dimensions before replayed output
+
+#### Scenario: Takeover
+
+- **WHEN** an observer takes over the presentation
+- **THEN** the former holder's resize lease is released, the new holder clears any observer-size override, fits its own viewport, and immediately publishes its dimensions
+
+### Requirement: Non-interactive sources do not own presentation
+
+Server-authorized non-interactive sources such as macros, dictation, and MCP SHALL retain their own scoped command authorization and SHALL enter the same ordered input queue, but SHALL NOT acquire presentation ownership. Automatic terminal replies SHALL NOT be identified by filtering particular escape strings; the complete emulator input stream SHALL be gated so two renderers cannot answer one PTY query and inject duplicate control responses.
+
+#### Scenario: Macro sends input
+
+- **WHEN** a macro, dictation, or MCP source sends input
+- **THEN** it enters the same ordered input queue under its own scoped authorization
+- **AND** it does not acquire presentation ownership
+
+#### Scenario: PTY queries the emulator
+
+- **WHEN** the PTY issues a query that the emulator answers automatically
+- **THEN** gating the complete emulator input stream prevents a second renderer from injecting a duplicate control response
+
+### Requirement: Terminal identity survives moves and window adoption
+
+Terminal identity SHALL survive panel moves and native-window adoption.
+
+#### Scenario: Panel moved or window adopted
+
+- **WHEN** a terminal panel is moved or its native window is adopted
+- **THEN** the terminal's identity is unchanged
+
+### Requirement: Renderer reload restores interactive control
+
+Reloading a renderer, including a cache-ignoring Force Reload, SHALL hydrate each still-running session from its checkpoint and SHALL make the restored surface the interactive presentation owner. Input and live output SHALL resume immediately, and a stale attachment from the discarded document SHALL NOT leave the tab looking live while silently discarding keystrokes.
+
+#### Scenario: Force Reload
+
+- **WHEN** a renderer is reloaded, including a cache-ignoring Force Reload
+- **THEN** each still-running session hydrates from its checkpoint and the restored surface becomes the interactive presentation owner
+- **AND** input and live output resume immediately without a stale attachment silently discarding keystrokes
+
+### Requirement: Workspace facts sync to every device
+
+A workspace's contents SHALL be shared across devices. Workspace facts SHALL sync to every device: a terminal existing, its title, its project, its shell, its output, and its removal. Closing a terminal SHALL remove it everywhere.
+
+#### Scenario: Terminal closed on one device
+
+- **WHEN** a user closes a terminal on one device
+- **THEN** it is removed on every device, because the terminal is gone
+
+#### Scenario: Terminal created on one device
+
+- **WHEN** a terminal is created on one device
+- **THEN** it appears on every device with its title, project, shell, and output
+
+### Requirement: View state stays local to each device
+
+View state SHALL NOT sync: which terminal tab is selected, which project tab is selected, split layout and pane sizes, scroll position, and focus. A terminal created on one device SHALL be selected only on the device that created it. A device reading one terminal SHALL NOT be moved to another because a second device made or selected something.
+
+#### Scenario: Second device creates a terminal
+
+- **WHEN** a second device creates or selects a terminal
+- **THEN** the first device's selection, layout, pane sizes, scroll position, and focus are unchanged
+
+### Requirement: Per-device selection memory
+
+Each device SHALL remember its own selection per project and restore it on reconnect, and SHALL remember whether the Home dashboard rather than a project was the selected view. That memory SHALL be treated as a hint: a remembered selection SHALL be validated against what exists and otherwise discarded, and a remembered Home selection that cannot be restored SHALL fall back to a project. Storage that is unavailable, full, or disabled SHALL mean the device starts fresh rather than failing. A device with nothing selected SHALL take the first terminal it adopts. When the selected terminal is closed anywhere, each device SHALL independently select a neighbour.
+
+#### Scenario: Workspace changed while away
+
+- **WHEN** a device reconnects to a workspace whose projects and terminals have changed
+- **THEN** its remembered selection is validated against what exists and otherwise discarded
+
+#### Scenario: Home remembered
+
+- **WHEN** a device that had the Home dashboard selected reconnects
+- **THEN** the Home dashboard is selected again
+
+#### Scenario: Storage unavailable
+
+- **WHEN** device storage is unavailable, full, or disabled
+- **THEN** the device starts fresh rather than failing
+
+#### Scenario: Nothing selected
+
+- **WHEN** a device has nothing selected
+- **THEN** it takes the first terminal it adopts rather than showing a blank workspace or following another device
+
+#### Scenario: Selected terminal closed
+
+- **WHEN** the selected terminal is closed anywhere
+- **THEN** each device independently selects a neighbour
+
+### Requirement: Congestion is not a connection failure
+
+High-volume delivery, slow-renderer isolation, attachment-scoped resync, and recovery after genuine transport loss SHALL follow the terminal stream congestion and recovery contract. Terminal presentation congestion SHALL NOT invalidate the shared workspace connection.
+
+#### Scenario: Terminal floods output
+
+- **WHEN** a terminal's presentation becomes congested
+- **THEN** the shared workspace connection remains valid
+
+### Requirement: Current-directory and foreground-process observation
+
+Current-directory and foreground-process observation SHALL inspect the session's own PTY process on the server that owns it.
+
+#### Scenario: Observing a session
+
+- **WHEN** a terminal session's current directory or foreground process is observed
+- **THEN** the server inspects that session's own PTY process
+
+### Requirement: Terminal authorization identity
+
+The server terminal boundary SHALL use immutable `{serverId, projectId, sessionId}` identity. Input SHALL be accepted only for that exact live session and SHALL be bounded by the negotiated input-byte limit; resize and termination SHALL use the same authorization boundary.
+
+A terminal SHALL change project only when the server commits a `panel.move` of its panel. That commit SHALL retire the terminal's identity under the source project and bind an identity under the target project for the same PTY, with the same session id, scrollback, and output position. An identity SHALL never be edited in place: every attachment, presentation lease, checkpoint pin, queued input, resize ownership, and capability bound to the retired identity SHALL end with it, and a request that names the retired identity SHALL be rejected. The terminal SHALL be listed, observed for close protection, and reported in activity and agent status under the target project only.
+
+#### Scenario: Input for another session
+
+- **WHEN** input, resize, or termination is addressed to a session other than the exact live authorized one
+- **THEN** it is rejected
+
+#### Scenario: Terminal moved to another project
+
+- **WHEN** the server commits a move of a live terminal's panel to another project
+- **THEN** the same PTY continues under an identity in the target project, with its session id, scrollback, and output position unchanged
+
+#### Scenario: Request under the retired identity
+
+- **WHEN** input, resize, attach, or termination names a moved terminal's source project
+- **THEN** it is rejected, and nothing bound to the retired identity remains usable
+
+#### Scenario: Client attached during a move
+
+- **WHEN** a client is attached to a terminal as its panel is moved to another project
+- **THEN** that attachment ends, and the client attaches under the target project identity and continues from the terminal's retained output
+
+#### Scenario: Project listings after a move
+
+- **WHEN** terminals are listed or observed for the source project and for the target project after a move
+- **THEN** the moved terminal appears under the target project and not under the source project
+
+### Requirement: Server-owned terminal note
+
+A terminal's note SHALL be part of the server-owned terminal panel. Adding, editing, or removing a note SHALL be a canonical server mutation, bounded in length by the server, and SHALL reach every authorized connected client. A client SHALL present the note from server workspace state. Editing a note SHALL advance the terminal's metadata revision.
+
+#### Scenario: Note shared between clients
+
+- **WHEN** a user edits a terminal's note on one client
+- **THEN** every other authorized client presenting that terminal shows the same note
+
+#### Scenario: Note survives a fresh client
+
+- **WHEN** a client reloads or reconnects after a note was edited
+- **THEN** it shows the note from server state
+
+#### Scenario: Oversized note rejected
+
+- **WHEN** a client submits a note longer than the server's note limit
+- **THEN** the server rejects the mutation and the existing note is unchanged
+
+### Requirement: Touch text selection by hold
+
+A touch held stationary over the xterm surface for one second SHALL enter text selection for the remainder of that gesture: the word under the touch SHALL be selected, subsequent movement SHALL extend the selection, and xterm's panning SHALL be suppressed until the touch is released. A touch that travels beyond the movement threshold before the hold elapses SHALL remain a pan and SHALL NOT be translated or suppressed. A gesture that entered text selection SHALL NOT focus the terminal on release and SHALL NOT cause a software keyboard to be presented. A selection made this way SHALL offer a copy affordance, since a touch device cannot reach the terminal context menu.
+
+Hold-to-select SHALL be governed by an **Edit > Enable Text Selection** toggle that is enabled by default and remembered per device. The preference SHALL NOT travel between devices or reach host settings. While it is disabled, a hold SHALL behave exactly as a touch that never held.
+
+#### Scenario: Holding to select
+
+- **WHEN** a user touches the xterm surface and holds it stationary for one second
+- **THEN** the word under the touch is selected
+- **AND** movement that follows extends the selection instead of panning the terminal
+
+#### Scenario: Releasing a touch selection
+
+- **WHEN** the user lifts the finger that made a touch selection
+- **THEN** the selection remains and a copy affordance is offered for it
+- **AND** the terminal is not focused and no software keyboard is presented
+
+#### Scenario: A pan is never a selection
+
+- **WHEN** a touch travels beyond the movement threshold before the hold elapses
+- **THEN** no selection is made and xterm handles the gesture as it handles any other touch pan
+
+#### Scenario: Holding in a mouse tracking program
+
+- **WHEN** a user holds stationary for one second while the foreground program is in mouse tracking mode
+- **THEN** the hold selects text for the length of that gesture
+- **AND** the program's own drag handling is restored when the touch is released
+
+#### Scenario: Text selection disabled
+
+- **WHEN** Enable Text Selection is off and a user holds stationary over the terminal
+- **THEN** no selection is made and the touch behaves exactly as it would without the feature
+
+#### Scenario: The preference is per device
+
+- **WHEN** a device changes Enable Text Selection
+- **THEN** the choice is remembered for that device only and no other device attached to the workspace is affected

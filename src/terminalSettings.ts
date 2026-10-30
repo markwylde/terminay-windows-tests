@@ -1,0 +1,3243 @@
+import type { FontWeight, ITerminalOptions } from '@xterm/xterm';
+import {
+	appCommandMetadata,
+	defaultKeyboardShortcuts,
+	normalizeAccelerator,
+} from './keyboardShortcuts.ts';
+import {
+	FOLDERS_COLUMN_TAB_IDS,
+	type FoldersColumnTabId,
+	SIDEBAR_GROUP_IDS,
+	SIDEBAR_PANEL_IDS,
+	type SidebarGroupId,
+	type SidebarPanelId,
+	type TerminalSettings,
+	type TerminayMcpPermissionPolicy,
+	type TerminayMcpPermissions,
+} from './types/settings.ts';
+
+type SettingsInputKind =
+	| 'boolean'
+	| 'number'
+	| 'text'
+	| 'textarea'
+	| 'select'
+	| 'color';
+type TerminalThemeKey = keyof TerminalSettings['theme'];
+
+export const TAB_THEME_HUE_COLOR_VALUE = 'tabThemeHue';
+
+// Brightness (HSL lightness, as a percentage) used when a "Tab Theme Hue"
+// color does not specify one. 60% matches the lightness the tab colors are
+// generated with, so the default looks identical to the tab colour.
+export const TAB_THEME_HUE_DEFAULT_BRIGHTNESS = 60;
+
+const TAB_THEME_HUE_COLOR_FALLBACKS: Partial<Record<TerminalThemeKey, string>> =
+	{
+		cursor: '#6ac1ff',
+		selectionBackground: '#ffff00',
+	};
+
+const SERVER_OWNED_TERMINAL_SETTING_KEYS = new Set<keyof TerminalSettings>([
+	'agentIntegration',
+	'aiTabMetadata',
+	'activityIndicators',
+	'autoCloseTerminalOnExitZero',
+	'convertEol',
+	'dictation',
+	'disableStdin',
+	'fileViewer',
+	'gitPushAgent',
+	'pixel',
+	'terminayMcp',
+	'ignoreBracketedPasteMode',
+	'keepTerminalsAfterQuit',
+	'moveTerminalsIntoNewWorktreeFolders',
+	'programSetTabTitles',
+	'recording',
+	'remoteAccess',
+	'rightClickSelectsWord',
+	'scrollback',
+	'scrollOnEraseInDisplay',
+	'scrollOnUserInput',
+	'scrollSensitivity',
+	'shell',
+	'smoothScrollDuration',
+	'tabStopWidth',
+	'wordSeparator',
+]);
+
+/**
+ * Return the device/native presentation projection that Electron may persist.
+ * Connected server settings deliberately never enter the Desktop JSON store.
+ */
+export function selectDeviceTerminalSettings(
+	settings: TerminalSettings,
+): Record<string, unknown> {
+	const normalized = normalizeTerminalSettings(settings);
+	return {
+		...Object.fromEntries(
+			Object.entries(normalized).filter(
+				([key]) =>
+					!SERVER_OWNED_TERMINAL_SETTING_KEYS.has(
+						key as keyof TerminalSettings,
+					),
+			),
+		),
+		dictation: {
+			microphoneDeviceId: normalized.dictation.microphoneDeviceId,
+		},
+	};
+}
+
+// "Tab Theme Hue" colors are stored either as the bare sentinel
+// (`tabThemeHue`, meaning default brightness) or with an explicit brightness
+// suffix (`tabThemeHue:40`, meaning 40% lightness).
+export function isTabThemeHueValue(value: string): boolean {
+	return (
+		typeof value === 'string' &&
+		(value === TAB_THEME_HUE_COLOR_VALUE ||
+			value.startsWith(`${TAB_THEME_HUE_COLOR_VALUE}:`))
+	);
+}
+
+export function getTabThemeHueBrightness(value: string): number {
+	if (typeof value !== 'string') {
+		return TAB_THEME_HUE_DEFAULT_BRIGHTNESS;
+	}
+
+	const prefix = `${TAB_THEME_HUE_COLOR_VALUE}:`;
+	if (!value.startsWith(prefix)) {
+		return TAB_THEME_HUE_DEFAULT_BRIGHTNESS;
+	}
+
+	const parsed = Number.parseInt(value.slice(prefix.length), 10);
+	if (!Number.isFinite(parsed)) {
+		return TAB_THEME_HUE_DEFAULT_BRIGHTNESS;
+	}
+
+	return Math.min(100, Math.max(0, parsed));
+}
+
+export function buildTabThemeHueValue(brightness: number): string {
+	const clamped = Math.round(Math.min(100, Math.max(0, brightness)));
+	return clamped === TAB_THEME_HUE_DEFAULT_BRIGHTNESS
+		? TAB_THEME_HUE_COLOR_VALUE
+		: `${TAB_THEME_HUE_COLOR_VALUE}:${clamped}`;
+}
+
+function hexToRgb(hex: string): [number, number, number] | null {
+	if (typeof hex !== 'string') {
+		return null;
+	}
+
+	const normalized = hex.replace(/^#/, '');
+	if (normalized.length < 6) {
+		return null;
+	}
+
+	const r = Number.parseInt(normalized.slice(0, 2), 16);
+	const g = Number.parseInt(normalized.slice(2, 4), 16);
+	const b = Number.parseInt(normalized.slice(4, 6), 16);
+	if (Number.isNaN(r) || Number.isNaN(g) || Number.isNaN(b)) {
+		return null;
+	}
+
+	return [r / 255, g / 255, b / 255];
+}
+
+function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
+	const max = Math.max(r, g, b);
+	const min = Math.min(r, g, b);
+	const lightness = (max + min) / 2;
+
+	if (max === min) {
+		return [0, 0, lightness];
+	}
+
+	const delta = max - min;
+	const saturation =
+		lightness > 0.5 ? delta / (2 - max - min) : delta / (max + min);
+
+	let hue = 0;
+	switch (max) {
+		case r:
+			hue = (g - b) / delta + (g < b ? 6 : 0);
+			break;
+		case g:
+			hue = (b - r) / delta + 2;
+			break;
+		default:
+			hue = (r - g) / delta + 4;
+			break;
+	}
+	hue /= 6;
+
+	return [hue, saturation, lightness];
+}
+
+function hslToHex(hue: number, saturation: number, lightness: number): string {
+	const hue2rgb = (p: number, q: number, t: number) => {
+		let normalized = t;
+		if (normalized < 0) normalized += 1;
+		if (normalized > 1) normalized -= 1;
+		if (normalized < 1 / 6) return p + (q - p) * 6 * normalized;
+		if (normalized < 1 / 2) return q;
+		if (normalized < 2 / 3) return p + (q - p) * (2 / 3 - normalized) * 6;
+		return p;
+	};
+
+	const q =
+		lightness < 0.5
+			? lightness * (1 + saturation)
+			: lightness + saturation - lightness * saturation;
+	const p = 2 * lightness - q;
+	const r = hue2rgb(p, q, hue + 1 / 3);
+	const g = hue2rgb(p, q, hue);
+	const b = hue2rgb(p, q, hue - 1 / 3);
+
+	const toHex = (value: number) => {
+		const hex = Math.round(value * 255).toString(16);
+		return hex.length === 1 ? `0${hex}` : hex;
+	};
+
+	return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+
+// Re-light a tab colour to the requested brightness, keeping its hue and
+// saturation. Returns the input unchanged if it cannot be parsed.
+export function applyTabThemeHueBrightness(
+	hex: string,
+	brightness: number,
+): string {
+	const rgb = hexToRgb(hex);
+	if (!rgb) {
+		return hex;
+	}
+
+	const [hue, saturation] = rgbToHsl(rgb[0], rgb[1], rgb[2]);
+	const lightness = Math.min(100, Math.max(0, brightness)) / 100;
+	return hslToHex(hue, saturation, lightness);
+}
+
+type SettingsCategoryId =
+	| 'ai'
+	| 'recording'
+	| 'remote'
+	| 'shell'
+	| 'files'
+	| 'appearance'
+	| 'cursor'
+	| 'interaction'
+	| 'keyboard'
+	| 'scrolling'
+	| 'accessibility'
+	| 'theme'
+	| 'updates';
+
+export type SettingsFieldDefinition = {
+	key: string;
+	label: string;
+	description: string;
+	sectionId: string;
+	categoryId: SettingsCategoryId;
+	input: SettingsInputKind;
+	min?: number;
+	max?: number;
+	step?: number;
+	options?: Array<{ label: string; value: string }>;
+	placeholder?: string;
+	keywords?: string[];
+	visibleWhen?: { key: string; value: boolean | number | string };
+};
+
+export type SettingsSectionDefinition = {
+	id: string;
+	categoryId: SettingsCategoryId;
+	title: string;
+	description: string;
+	fields: SettingsFieldDefinition[];
+};
+
+export type SettingsCategoryDefinition = {
+	id: SettingsCategoryId;
+	label: string;
+	description: string;
+};
+
+export const terminalSettingsCategories: SettingsCategoryDefinition[] = [
+	{
+		id: 'ai',
+		label: 'AI',
+		description:
+			'Agent status, providers, and models for AI-assisted workflows.',
+	},
+	{
+		id: 'recording',
+		label: 'Recording',
+		description: 'Local terminal session recording and replay.',
+	},
+	{
+		id: 'remote',
+		label: 'Remote Access',
+		description: 'Remote host, local binding, and optional custom TLS files.',
+	},
+	{
+		id: 'shell',
+		label: 'Shell',
+		description: 'Server-owned shell profiles and terminal launch behaviour.',
+	},
+	{
+		id: 'files',
+		label: 'Files',
+		description: 'File explorer and file viewer refresh behavior.',
+	},
+	{
+		id: 'appearance',
+		label: 'Appearance',
+		description: 'Typography, rendering, and visual density.',
+	},
+	{
+		id: 'cursor',
+		label: 'Cursor',
+		description: 'Cursor style, width, and focus behavior.',
+	},
+	{
+		id: 'interaction',
+		label: 'Interaction',
+		description: 'Input, selection, and keyboard behavior.',
+	},
+	{
+		id: 'keyboard',
+		label: 'Shortcuts',
+		description: 'App command key bindings shown in the command bar.',
+	},
+	{
+		id: 'scrolling',
+		label: 'Scrolling',
+		description: 'Scrollback depth and scroll feel.',
+	},
+	{
+		id: 'accessibility',
+		label: 'Accessibility',
+		description: 'Contrast, assistive tech, and readability.',
+	},
+	{
+		id: 'theme',
+		label: 'Theme',
+		description: 'Base colors, selection, and ANSI palette.',
+	},
+	{
+		id: 'updates',
+		label: 'Updates',
+		description: 'Which Terminay Desktop releases this device installs.',
+	},
+];
+
+/** Pixel has no agent until the user picks one on first click. */
+export const PIXEL_PROVIDER_UNSET = 'unset';
+/** The built-in agents extension's chat providers. */
+export const PIXEL_CLAUDE_CODE_PROVIDER = 'com.terminay.builtin-agents/claude-code';
+export const PIXEL_CODEX_PROVIDER = 'com.terminay.builtin-agents/codex';
+
+export const DEFAULT_GIT_PUSH_AGENT_PROMPT = `You are helping me commit and push my work from the terminal.
+
+Task: {{task}}
+
+Current branch: {{branch}}
+Default branch: {{defaultBranch}}
+
+Please:
+1. Run \`git status\` and \`git diff\` to understand what has changed.
+2. Stage all of the changes.
+3. Write a clear, concise commit message that follows this repository's existing commit style (look at recent commits with \`git log\`).
+4. Carry out the task above end to end. When a pull request is requested, detect the git remote first: use \`gh\` for GitHub remotes, use \`tea\` for Gitea remotes, and otherwise provide the remote URL so I can create the pull request manually.
+
+Work autonomously and do not ask me to confirm individual steps.`;
+
+export const DEFAULT_FOLDER_TASK_IGNORED_DIRECTORIES = [
+	'.git',
+	'.hg',
+	'.svn',
+	'node_modules',
+	'bower_components',
+	'dist',
+	'build',
+	'out',
+	'.next',
+	'.nuxt',
+	'.cache',
+	'coverage',
+	'target',
+	'vendor',
+	'.venv',
+	'venv',
+	'__pycache__',
+].join('\n');
+
+const TERMINAY_MCP_PERMISSION_OPTIONS = [
+	{ label: 'Ask Permission', value: 'ask' },
+	{ label: 'Always Allow', value: 'allow' },
+	{ label: 'Never Allow', value: 'deny' },
+];
+
+export const defaultTerminalSettings: TerminalSettings = {
+	agentIntegration: {
+		enabled: true,
+		harnesses: {},
+	},
+	aiTabMetadata: {
+		title: {
+			provider: 'disabled',
+			claudeCodeModel: '',
+			codexModel: '',
+		},
+		note: {
+			provider: 'disabled',
+			claudeCodeModel: '',
+			codexModel: '',
+		},
+	},
+	dictation: {
+		enabled: true,
+		provider: 'openai',
+		model: 'gpt-4o-transcribe',
+		microphoneDeviceId: '',
+		language: 'en',
+		prompt: '',
+		silenceStopSeconds: 5,
+		maxDurationSeconds: 60,
+	},
+	gitPushAgent: {
+		provider: 'disabled',
+		claudeCodeModel: '',
+		codexModel: '',
+		prompt: DEFAULT_GIT_PUSH_AGENT_PROMPT,
+	},
+	pixel: {
+		enabled: false,
+		provider: PIXEL_PROVIDER_UNSET,
+	},
+	terminayMcp: {
+		enabled: true,
+		permissions: {
+			terminalsRead: 'allow',
+			terminalsManage: 'allow',
+			automationsRead: 'allow',
+			automationsManage: 'ask',
+			projectsWindows: 'allow',
+			settingsRead: 'allow',
+			settingsChange: 'ask',
+			appWindows: 'allow',
+			notifications: 'allow',
+			connectedServerTools: 'allow',
+			windowMessages: 'allow',
+		},
+	},
+	allowTransparency: false,
+	altClickMovesCursor: true,
+	showStatusBar: true,
+	showStatusBarCompact: false,
+	activityIndicators: {
+		amberDelaySeconds: 0,
+		greenDelaySeconds: 1,
+		showActiveTabs: true,
+		showFinishedTabs: true,
+		signalDetection: true,
+		progressStaleSeconds: 15,
+		tabSwitchSuppressionSeconds: 1,
+	},
+	autoCloseTerminalOnExitZero: false,
+	keepTerminalsAfterQuit: '5m',
+	moveTerminalsIntoNewWorktreeFolders: true,
+	programSetTabTitles: true,
+	updateChannel: 'stable',
+	convertEol: true,
+	cursorBlink: true,
+	cursorStyle: 'block',
+	cursorWidth: 1,
+	cursorInactiveStyle: 'outline',
+	customGlyphs: true,
+	disableStdin: false,
+	drawBoldTextInBrightColors: true,
+	fastScrollSensitivity: 5,
+	fontFamily:
+		'ui-monospace, "Cascadia Mono", "Cascadia Code", "DejaVu Sans Mono", "Liberation Mono", Menlo, Monaco, Consolas, "Courier New", monospace, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji"',
+	fontSize: 13,
+	fontWeight: '400',
+	fontWeightBold: '700',
+	ignoreBracketedPasteMode: false,
+	letterSpacing: 0,
+	lineHeight: 1,
+	macOptionIsMeta: false,
+	macOptionClickForcesSelection: false,
+	minimumContrastRatio: 1,
+	rescaleOverlappingGlyphs: false,
+	rightClickSelectsWord: false,
+	screenReaderMode: false,
+	scrollback: 5000,
+	scrollOnEraseInDisplay: false,
+	scrollOnUserInput: true,
+	scrollSensitivity: 1,
+	smoothScrollDuration: 0,
+	tabStopWidth: 8,
+	wordSeparator: ' ()[]{}\',"`',
+	fileViewer: {
+		customFileExtensions: [],
+		diffLayout: 'side-by-side',
+		folderTaskIgnoredDirectories: DEFAULT_FOLDER_TASK_IGNORED_DIRECTORIES,
+		refreshIntervalSeconds: 5,
+	},
+	keyboardShortcuts: defaultKeyboardShortcuts,
+	recording: {
+		captureInput: false,
+		directory: '~/Documents/TerminaySessions',
+		openTimelineAfterSaving: false,
+		recordNewTerminals: false,
+		sensitiveInputPolicy: 'drop',
+	},
+	remoteAccess: {
+		exposeOnStartup: false,
+		webRtcHostedDomain: 'terminay.com',
+		webRtcIceServers: 'stun:stun.l.google.com:19302',
+	},
+	shell: {
+		program: '',
+		startupMode: 'auto',
+		extraArgs: '',
+	},
+	sidebar: {
+		gitPanelViewMode: 'tree',
+		defaultExplorerState: 'expanded',
+		defaultGitState: 'expanded',
+		defaultDocumentationState: 'collapsed',
+		defaultExplorerPaneHeight: 320,
+		defaultGitPaneHeight: 200,
+		defaultDocumentationPaneHeight: 240,
+		panelOrder: [...SIDEBAR_PANEL_IDS],
+		projectVisibility: {},
+		projectActiveGroup: {},
+		projectFoldersVisibility: {},
+		projectFoldersColumnTab: {},
+		projectFoldersCollapsed: {},
+	},
+	theme: {
+		foreground: '#dce2f0',
+		background: buildTabThemeHueValue(10),
+		cursor: TAB_THEME_HUE_COLOR_VALUE,
+		cursorAccent: '#111316',
+		selectionBackground: TAB_THEME_HUE_COLOR_VALUE,
+		selectionInactiveBackground: '#2b3d4b66',
+		selectionForeground: '#000000',
+		scrollbarSliderBackground: '#dce2f033',
+		scrollbarSliderHoverBackground: '#dce2f066',
+		scrollbarSliderActiveBackground: '#dce2f080',
+		black: '#1b1e24',
+		red: '#ff6a7a',
+		green: '#66d28c',
+		yellow: '#ffd166',
+		blue: '#6ac1ff',
+		magenta: '#d690ff',
+		cyan: '#62e0d9',
+		white: '#d8dee9',
+		brightBlack: '#5a6576',
+		brightRed: '#ff8a97',
+		brightGreen: '#8df0a8',
+		brightYellow: '#ffe39b',
+		brightBlue: '#8ed6ff',
+		brightMagenta: '#e4acff',
+		brightCyan: '#87f2ec',
+		brightWhite: '#f5f7fb',
+	},
+};
+
+function makeField(
+	definition: Omit<SettingsFieldDefinition, 'keywords'> & {
+		keywords?: string[];
+	},
+): SettingsFieldDefinition {
+	return definition;
+}
+
+export const terminalSettingsSections: SettingsSectionDefinition[] = [
+	{
+		id: 'agent-integration',
+		categoryId: 'ai',
+		title: 'Agents',
+		description:
+			'Track supported coding agents from their process-bound session journals and show them in terminal and project status surfaces.',
+		fields: [
+			makeField({
+				key: 'agentIntegration.enabled',
+				label: 'Agent status and sidebar',
+				description:
+					'Discover interactive Codex sessions without modifying provider configuration, show reliable working/attention/done status, and add the per-project Agents sidebar panel.',
+				sectionId: 'agent-integration',
+				categoryId: 'ai',
+				input: 'boolean',
+				keywords: [
+					'agents',
+					'agent status',
+					'codex',
+					'claude',
+					'session journals',
+					'sidebar',
+					'activity',
+				],
+			}),
+		],
+	},
+	{
+		id: 'ai-tab-metadata',
+		categoryId: 'ai',
+		title: 'Tab Metadata',
+		description:
+			'Choose whether AI can generate terminal tab titles and notes from recent terminal context.',
+		fields: [
+			makeField({
+				key: 'aiTabMetadata.title.provider',
+				label: 'Set title with AI',
+				description:
+					'Provider used when the Command bar action generates a terminal tab title.',
+				sectionId: 'ai-tab-metadata',
+				categoryId: 'ai',
+				input: 'select',
+				options: [
+					{ label: 'Disable', value: 'disabled' },
+					{ label: 'Codex', value: 'codex' },
+					{ label: 'Claude Code', value: 'claudeCode' },
+				],
+				keywords: [
+					'ai',
+					'codex',
+					'claude',
+					'claude code',
+					'title',
+					'tab title',
+					'metadata',
+					'model',
+				],
+			}),
+			makeField({
+				key: 'aiTabMetadata.title.codexModel',
+				label: 'Title model',
+				description: 'Codex model used for generated terminal tab titles.',
+				sectionId: 'ai-tab-metadata',
+				categoryId: 'ai',
+				input: 'select',
+				visibleWhen: { key: 'aiTabMetadata.title.provider', value: 'codex' },
+				keywords: ['ai', 'codex', 'title', 'model'],
+			}),
+			makeField({
+				key: 'aiTabMetadata.title.claudeCodeModel',
+				label: 'Title model',
+				description:
+					'Claude Code model used for generated terminal tab titles.',
+				sectionId: 'ai-tab-metadata',
+				categoryId: 'ai',
+				input: 'select',
+				visibleWhen: {
+					key: 'aiTabMetadata.title.provider',
+					value: 'claudeCode',
+				},
+				keywords: ['ai', 'claude', 'claude code', 'title', 'model'],
+			}),
+			makeField({
+				key: 'aiTabMetadata.note.provider',
+				label: 'Set note with AI',
+				description:
+					'Provider used when the Command bar action generates a terminal note.',
+				sectionId: 'ai-tab-metadata',
+				categoryId: 'ai',
+				input: 'select',
+				options: [
+					{ label: 'Disable', value: 'disabled' },
+					{ label: 'Codex', value: 'codex' },
+					{ label: 'Claude Code', value: 'claudeCode' },
+				],
+				keywords: [
+					'ai',
+					'codex',
+					'claude',
+					'claude code',
+					'note',
+					'terminal note',
+					'metadata',
+					'model',
+				],
+			}),
+			makeField({
+				key: 'aiTabMetadata.note.codexModel',
+				label: 'Note model',
+				description: 'Codex model used for generated terminal notes.',
+				sectionId: 'ai-tab-metadata',
+				categoryId: 'ai',
+				input: 'select',
+				visibleWhen: { key: 'aiTabMetadata.note.provider', value: 'codex' },
+				keywords: ['ai', 'codex', 'note', 'model'],
+			}),
+			makeField({
+				key: 'aiTabMetadata.note.claudeCodeModel',
+				label: 'Note model',
+				description: 'Claude Code model used for generated terminal notes.',
+				sectionId: 'ai-tab-metadata',
+				categoryId: 'ai',
+				input: 'select',
+				visibleWhen: {
+					key: 'aiTabMetadata.note.provider',
+					value: 'claudeCode',
+				},
+				keywords: ['ai', 'claude', 'claude code', 'note', 'model'],
+			}),
+		],
+	},
+	{
+		id: 'git-push-agent',
+		categoryId: 'ai',
+		title: 'Git Push Agent',
+		description:
+			"Choose the AI agent launched from a folder's Commit & push with AI menu to commit, push, and open pull requests for you.",
+		fields: [
+			makeField({
+				key: 'gitPushAgent.provider',
+				label: 'Push with AI agent',
+				description:
+					'Agent launched in a new terminal tab when you choose Commit & push with AI on a folder.',
+				sectionId: 'git-push-agent',
+				categoryId: 'ai',
+				input: 'select',
+				options: [
+					{ label: 'Disable', value: 'disabled' },
+					{ label: 'Codex', value: 'codex' },
+					{ label: 'Claude Code', value: 'claudeCode' },
+				],
+				keywords: [
+					'ai',
+					'git',
+					'push',
+					'commit',
+					'pull request',
+					'pr',
+					'codex',
+					'claude',
+					'claude code',
+					'agent',
+				],
+			}),
+			makeField({
+				key: 'gitPushAgent.codexModel',
+				label: 'Agent model',
+				description: 'Codex model used by the git push agent.',
+				sectionId: 'git-push-agent',
+				categoryId: 'ai',
+				input: 'select',
+				visibleWhen: { key: 'gitPushAgent.provider', value: 'codex' },
+				keywords: ['ai', 'git', 'push', 'codex', 'model'],
+			}),
+			makeField({
+				key: 'gitPushAgent.claudeCodeModel',
+				label: 'Agent model',
+				description: 'Claude Code model used by the git push agent.',
+				sectionId: 'git-push-agent',
+				categoryId: 'ai',
+				input: 'select',
+				visibleWhen: { key: 'gitPushAgent.provider', value: 'claudeCode' },
+				keywords: ['ai', 'git', 'push', 'claude', 'claude code', 'model'],
+			}),
+			makeField({
+				key: 'gitPushAgent.prompt',
+				label: 'Agent prompt',
+				description:
+					'Prompt sent to the agent. Use {{task}} for the chosen push action, {{branch}} for the current branch, and {{defaultBranch}} for the default branch.',
+				sectionId: 'git-push-agent',
+				categoryId: 'ai',
+				input: 'textarea',
+				placeholder: DEFAULT_GIT_PUSH_AGENT_PROMPT,
+				keywords: ['ai', 'git', 'push', 'prompt', 'template'],
+			}),
+		],
+	},
+	{
+		id: 'pixel',
+		categoryId: 'ai',
+		title: 'Pixel',
+		description:
+			'Pixel lives in the status bar. Click it to chat with Claude Code or Codex about everything on this server: it can read your terminals, type into them, and manage automations, under the Terminay MCP permissions below. Its agent can act only through Terminay MCP as far as each agent allows, but it is not a sandbox.',
+		fields: [
+			makeField({
+				key: 'pixel.enabled',
+				label: 'Enable Pixel',
+				description:
+					'Shows Pixel on every device connected to this server. Off, Pixel is gone everywhere and no agent runs.',
+				sectionId: 'pixel',
+				categoryId: 'ai',
+				input: 'boolean',
+				keywords: ['pixel', 'pet', 'assistant', 'chat', 'agent', 'companion'],
+			}),
+			makeField({
+				key: 'pixel.provider',
+				label: 'Pixel agent',
+				description:
+					'The agent Pixel chats through. It uses the one installed and signed in on this server.',
+				sectionId: 'pixel',
+				categoryId: 'ai',
+				input: 'select',
+				options: [
+					{ label: 'Ask on first click', value: PIXEL_PROVIDER_UNSET },
+					{ label: 'Claude Code', value: PIXEL_CLAUDE_CODE_PROVIDER },
+					{ label: 'Codex', value: PIXEL_CODEX_PROVIDER },
+				],
+				visibleWhen: { key: 'pixel.enabled', value: true },
+				keywords: ['pixel', 'claude', 'claude code', 'codex', 'agent'],
+			}),
+		],
+	},
+	{
+		id: 'terminay-mcp',
+		categoryId: 'ai',
+		title: 'Terminay MCP',
+		description:
+			'Let AI agents running in a Terminay terminal control sibling terminals through the Model Context Protocol.',
+		fields: [
+			makeField({
+				key: 'terminayMcp.enabled',
+				label: 'Enable Terminay MCP server',
+				description:
+					'Issues project-scoped terminal-control capabilities. This does not install or use provider hooks.',
+				sectionId: 'terminay-mcp',
+				categoryId: 'ai',
+				input: 'boolean',
+				keywords: [
+					'mcp',
+					'model context protocol',
+					'claude',
+					'codex',
+					'cursor',
+					'gemini',
+					'opencode',
+					'terminal',
+					'control',
+				],
+			}),
+			makeField({
+				key: 'terminayMcp.permissions.terminalsRead',
+				label: 'Read Terminals',
+				description:
+					'List, read, search, and wait on terminals in reach.',
+				sectionId: 'terminay-mcp',
+				categoryId: 'ai',
+				input: 'select',
+				options: TERMINAY_MCP_PERMISSION_OPTIONS,
+				keywords: ['mcp', 'permission', 'approval', 'ask', 'allow', 'deny', 'agent'],
+			}),
+			makeField({
+				key: 'terminayMcp.permissions.terminalsManage',
+				label: 'Full Terminal Management',
+				description:
+					'Open, close, split, focus, rename, and type into terminals in reach.',
+				sectionId: 'terminay-mcp',
+				categoryId: 'ai',
+				input: 'select',
+				options: TERMINAY_MCP_PERMISSION_OPTIONS,
+				keywords: ['mcp', 'permission', 'approval', 'ask', 'allow', 'deny', 'agent'],
+			}),
+			makeField({
+				key: 'terminayMcp.permissions.automationsRead',
+				label: 'Read Automations',
+				description:
+					'List automations and read their definitions and run history.',
+				sectionId: 'terminay-mcp',
+				categoryId: 'ai',
+				input: 'select',
+				options: TERMINAY_MCP_PERMISSION_OPTIONS,
+				keywords: ['mcp', 'permission', 'approval', 'ask', 'allow', 'deny', 'agent'],
+			}),
+			makeField({
+				key: 'terminayMcp.permissions.automationsManage',
+				label: 'Full Automation Management',
+				description:
+					'Create, edit, enable, delete, run, and stop automations. An automation runs unattended with reach over every project on this server.',
+				sectionId: 'terminay-mcp',
+				categoryId: 'ai',
+				input: 'select',
+				options: TERMINAY_MCP_PERMISSION_OPTIONS,
+				keywords: ['mcp', 'permission', 'approval', 'ask', 'allow', 'deny', 'agent'],
+			}),
+			makeField({
+				key: 'terminayMcp.permissions.projectsWindows',
+				label: 'Projects & Windows',
+				description:
+					'List, create, rename, move, and close projects, and open, rename, and close workspace windows. An agent in a project terminal may only rename, re-icon, and recolour its own project.',
+				sectionId: 'terminay-mcp',
+				categoryId: 'ai',
+				input: 'select',
+				options: TERMINAY_MCP_PERMISSION_OPTIONS,
+				keywords: ['mcp', 'permission', 'approval', 'ask', 'allow', 'deny', 'agent', 'project', 'window', 'workspace'],
+			}),
+			makeField({
+				key: 'terminayMcp.permissions.settingsRead',
+				label: 'Read Settings',
+				description:
+					'Read this server’s settings and shell profiles. Credentials, Remote Access, recording, and these MCP settings are never readable.',
+				sectionId: 'terminay-mcp',
+				categoryId: 'ai',
+				input: 'select',
+				options: TERMINAY_MCP_PERMISSION_OPTIONS,
+				keywords: ['mcp', 'permission', 'approval', 'ask', 'allow', 'deny', 'agent', 'settings', 'shell', 'profile'],
+			}),
+			makeField({
+				key: 'terminayMcp.permissions.settingsChange',
+				label: 'Change Settings',
+				description:
+					'Change this server’s settings and shell profiles for every client. Credentials, Remote Access, recording, and these MCP settings are never changeable.',
+				sectionId: 'terminay-mcp',
+				categoryId: 'ai',
+				input: 'select',
+				options: TERMINAY_MCP_PERMISSION_OPTIONS,
+				keywords: ['mcp', 'permission', 'approval', 'ask', 'allow', 'deny', 'agent', 'settings', 'shell', 'profile'],
+			}),
+			makeField({
+				key: 'terminayMcp.permissions.appWindows',
+				label: 'App Windows',
+				description:
+					'Show, update, list, and close windows in the terminal the agent is running in, including the views of connected servers’ tools.',
+				sectionId: 'terminay-mcp',
+				categoryId: 'ai',
+				input: 'select',
+				options: TERMINAY_MCP_PERMISSION_OPTIONS,
+				keywords: ['mcp', 'permission', 'approval', 'ask', 'allow', 'deny', 'agent', 'window', 'app'],
+			}),
+			makeField({
+				key: 'terminayMcp.permissions.notifications',
+				label: 'Notifications',
+				description:
+					'Send, update, and dismiss notifications for the terminal the agent is running in.',
+				sectionId: 'terminay-mcp',
+				categoryId: 'ai',
+				input: 'select',
+				options: TERMINAY_MCP_PERMISSION_OPTIONS,
+				keywords: ['mcp', 'permission', 'approval', 'ask', 'allow', 'deny', 'agent', 'notification', 'notify'],
+			}),
+			makeField({
+				key: 'terminayMcp.permissions.connectedServerTools',
+				label: 'Connected Server Tools',
+				description:
+					'Use the tools of the MCP servers connected below, from an agent or from one of their own windows.',
+				sectionId: 'terminay-mcp',
+				categoryId: 'ai',
+				input: 'select',
+				options: TERMINAY_MCP_PERMISSION_OPTIONS,
+				keywords: ['mcp', 'permission', 'approval', 'ask', 'allow', 'deny', 'agent', 'window', 'app'],
+			}),
+			makeField({
+				key: 'terminayMcp.permissions.windowMessages',
+				label: 'Window Messages',
+				description:
+					'Let a window type a message into its terminal and send it, as when you press a button in it.',
+				sectionId: 'terminay-mcp',
+				categoryId: 'ai',
+				input: 'select',
+				options: TERMINAY_MCP_PERMISSION_OPTIONS,
+				keywords: ['mcp', 'permission', 'approval', 'ask', 'allow', 'deny', 'agent', 'window', 'app'],
+			}),
+		],
+	},
+	{
+		id: 'dictation',
+		categoryId: 'ai',
+		title: 'Dictation',
+		description:
+			'Record speech, transcribe it on this Mac or with OpenAI, and type the result into the active terminal.',
+		fields: [
+			makeField({
+				key: 'dictation.provider',
+				label: 'Transcription provider',
+				description:
+					'Choose whether audio stays on this Mac or is sent to OpenAI.',
+				sectionId: 'dictation',
+				categoryId: 'ai',
+				input: 'select',
+				options: [
+					{ label: 'On-device (Parakeet)', value: 'parakeet' },
+					{ label: 'OpenAI', value: 'openai' },
+				],
+				keywords: [
+					'dictation',
+					'provider',
+					'local',
+					'on-device',
+					'parakeet',
+					'openai',
+				],
+			}),
+			makeField({
+				key: 'dictation.openaiApiKey',
+				label: 'OpenAI API key',
+				description:
+					'Stored with OS-level encryption and used only by the local main process for dictation transcription.',
+				sectionId: 'dictation',
+				categoryId: 'ai',
+				input: 'text',
+				visibleWhen: { key: 'dictation.provider', value: 'openai' },
+				keywords: [
+					'openai',
+					'api key',
+					'dictation',
+					'audio',
+					'speech',
+					'transcription',
+					'microphone',
+				],
+			}),
+			makeField({
+				key: 'dictation.enabled',
+				label: 'Enable dictation',
+				description:
+					'Allow the Command bar action to record microphone audio and insert a transcript.',
+				sectionId: 'dictation',
+				categoryId: 'ai',
+				input: 'boolean',
+				keywords: ['dictation', 'voice', 'speech', 'microphone', 'openai'],
+			}),
+			makeField({
+				key: 'dictation.model',
+				label: 'OpenAI model',
+				description:
+					'OpenAI speech-to-text model used when a dictation recording stops.',
+				sectionId: 'dictation',
+				categoryId: 'ai',
+				input: 'select',
+				options: [
+					{ label: 'GPT-4o Transcribe', value: 'gpt-4o-transcribe' },
+					{
+						label: 'GPT-4o Mini Transcribe',
+						value: 'gpt-4o-mini-transcribe',
+					},
+				],
+				visibleWhen: { key: 'dictation.provider', value: 'openai' },
+				keywords: ['openai', 'model', 'gpt-4o', 'transcribe', 'speech to text'],
+			}),
+			makeField({
+				key: 'dictation.model',
+				label: 'On-device model',
+				description:
+					'Parakeet TDT 0.6B v3 runs locally using MLX and the Apple GPU.',
+				sectionId: 'dictation',
+				categoryId: 'ai',
+				input: 'select',
+				options: [
+					{
+						label: 'Parakeet TDT 0.6B v3',
+						value: 'mlx-community/parakeet-tdt-0.6b-v3',
+					},
+				],
+				visibleWhen: { key: 'dictation.provider', value: 'parakeet' },
+				keywords: ['parakeet', 'mlx', 'metal', 'local', 'on-device'],
+			}),
+			makeField({
+				key: 'dictation.parakeetRuntime',
+				label: 'On-device engine',
+				description:
+					'Install the pinned MLX runtime and model before using local dictation.',
+				sectionId: 'dictation',
+				categoryId: 'ai',
+				input: 'text',
+				visibleWhen: { key: 'dictation.provider', value: 'parakeet' },
+				keywords: ['parakeet', 'install', 'runtime', 'model'],
+			}),
+			makeField({
+				key: 'dictation.microphoneDeviceId',
+				label: 'Microphone',
+				description: 'Audio input device used for dictation recording.',
+				sectionId: 'dictation',
+				categoryId: 'ai',
+				input: 'select',
+				options: [{ label: 'System default', value: '' }],
+				visibleWhen: { key: 'dictation.enabled', value: true },
+				keywords: ['dictation', 'microphone', 'input', 'audio', 'device'],
+			}),
+			makeField({
+				key: 'dictation.language',
+				label: 'Language hint',
+				description: 'ISO language hint for transcription. Defaults to en.',
+				sectionId: 'dictation',
+				categoryId: 'ai',
+				input: 'text',
+				placeholder: 'en',
+				visibleWhen: { key: 'dictation.provider', value: 'openai' },
+				keywords: ['dictation', 'language', 'locale', 'openai'],
+			}),
+			makeField({
+				key: 'dictation.prompt',
+				label: 'Prompt',
+				description:
+					'Optional terms or formatting hints for dictation transcription.',
+				sectionId: 'dictation',
+				categoryId: 'ai',
+				input: 'textarea',
+				visibleWhen: { key: 'dictation.provider', value: 'openai' },
+				keywords: ['dictation', 'prompt', 'terms', 'context', 'openai'],
+			}),
+			makeField({
+				key: 'dictation.silenceStopSeconds',
+				label: 'Stop after silence',
+				description:
+					'Seconds of quiet audio before Terminay automatically stops recording.',
+				sectionId: 'dictation',
+				categoryId: 'ai',
+				input: 'number',
+				min: 1,
+				max: 15,
+				step: 0.5,
+				visibleWhen: { key: 'dictation.enabled', value: true },
+				keywords: ['dictation', 'silence', 'timeout', 'voice activity'],
+			}),
+			makeField({
+				key: 'dictation.maxDurationSeconds',
+				label: 'Max recording duration',
+				description:
+					'Maximum seconds for a single dictation recording before it stops.',
+				sectionId: 'dictation',
+				categoryId: 'ai',
+				input: 'number',
+				min: 5,
+				max: 300,
+				step: 5,
+				visibleWhen: { key: 'dictation.enabled', value: true },
+				keywords: ['dictation', 'duration', 'recording', 'limit'],
+			}),
+		],
+	},
+	{
+		id: 'recording-defaults',
+		categoryId: 'recording',
+		title: 'Session Recording',
+		description:
+			'Choose when terminals are recorded and where local asciicast files are stored.',
+		fields: [
+			makeField({
+				key: 'recording.recordNewTerminals',
+				label: 'Record new terminals',
+				description:
+					'Automatically start recording each terminal when it opens.',
+				sectionId: 'recording-defaults',
+				categoryId: 'recording',
+				input: 'boolean',
+				keywords: [
+					'recording',
+					'terminal session',
+					'asciinema',
+					'cast',
+					'timeline',
+					'replay',
+				],
+			}),
+			makeField({
+				key: 'recording.directory',
+				label: 'Recording directory',
+				description:
+					'Folder where recordings are saved. The default expands to your Documents folder.',
+				sectionId: 'recording-defaults',
+				categoryId: 'recording',
+				input: 'text',
+				placeholder: '~/Documents/TerminaySessions',
+				keywords: [
+					'recording',
+					'folder',
+					'directory',
+					'path',
+					'asciinema',
+					'cast',
+				],
+			}),
+			makeField({
+				key: 'recording.captureInput',
+				label: 'Capture input',
+				description:
+					'Record typed input events when Terminay does not consider the input sensitive.',
+				sectionId: 'recording-defaults',
+				categoryId: 'recording',
+				input: 'boolean',
+				keywords: ['recording', 'input', 'keys', 'stdin', 'privacy'],
+			}),
+			makeField({
+				key: 'recording.sensitiveInputPolicy',
+				label: 'Sensitive input',
+				description:
+					'Choose how likely passwords, tokens, and passphrases are handled in input events.',
+				sectionId: 'recording-defaults',
+				categoryId: 'recording',
+				input: 'select',
+				options: [
+					{ label: 'Drop input', value: 'drop' },
+					{ label: 'Mask with *', value: 'mask' },
+				],
+				visibleWhen: { key: 'recording.captureInput', value: true },
+				keywords: [
+					'recording',
+					'password',
+					'secret',
+					'token',
+					'mask',
+					'privacy',
+				],
+			}),
+			makeField({
+				key: 'recording.openTimelineAfterSaving',
+				label: 'Open timeline after saving',
+				description:
+					'Open the recordings timeline when a manual recording is stopped.',
+				sectionId: 'recording-defaults',
+				categoryId: 'recording',
+				input: 'boolean',
+				keywords: ['recording', 'timeline', 'replay', 'open'],
+			}),
+		],
+	},
+	{
+		id: 'remote-access-host',
+		categoryId: 'remote',
+		title: 'Remote exposure',
+		description:
+			'Configure WebRTC signaling for this server. Pairing is approved on this computer with a match code.',
+		fields: [
+			makeField({
+				key: 'remoteAccess.exposeOnStartup',
+				label: 'Automatically expose server on startup',
+				description:
+					'Expose this server for remote access when Terminay starts, without selecting Expose this server. You can still stop exposure from the connections menu.',
+				sectionId: 'remote-access-host',
+				categoryId: 'remote',
+				input: 'boolean',
+				keywords: [
+					'remote',
+					'expose',
+					'startup',
+					'launch',
+					'automatic',
+					'webrtc',
+				],
+			}),
+			makeField({
+				key: 'remoteAccess.webRtcHostedDomain',
+				label: 'WebRTC hosted domain',
+				description:
+					'Base domain used for production per-session WebRTC subdomains.',
+				sectionId: 'remote-access-host',
+				categoryId: 'remote',
+				input: 'text',
+				placeholder: 'terminay.com',
+				keywords: [
+					'webrtc',
+					'relay',
+					'domain',
+					'wildcard',
+					'subdomain',
+					'terminay.com',
+				],
+			}),
+			makeField({
+				key: 'remoteAccess.webRtcIceServers',
+				label: 'WebRTC ICE servers',
+				description:
+					'Comma-separated STUN/TURN URLs, or a JSON array of ICE server objects with urls and optional TURN username/credential.',
+				sectionId: 'remote-access-host',
+				categoryId: 'remote',
+				input: 'text',
+				placeholder: 'stun:stun.l.google.com:19302',
+				keywords: ['webrtc', 'ice', 'stun', 'turn', 'nat', 'relay'],
+			}),
+		],
+	},
+	{
+		id: 'shell-launch',
+		categoryId: 'shell',
+		title: 'Shell Profiles',
+		description:
+			'Choose defaults and manage profiles available on the connected server.',
+		fields: [],
+	},
+	{
+		id: 'shell-lifecycle',
+		categoryId: 'shell',
+		title: 'Lifecycle',
+		description: 'Choose what happens when a terminal process finishes.',
+		fields: [
+			makeField({
+				key: 'autoCloseTerminalOnExitZero',
+				label: 'Close tabs on successful exit',
+				description:
+					'Automatically close a terminal tab when its shell exits with code 0.',
+				sectionId: 'shell-lifecycle',
+				categoryId: 'shell',
+				input: 'boolean',
+				keywords: [
+					'exit',
+					'close tab',
+					'process exited',
+					'successful exit',
+					'zero',
+				],
+			}),
+			makeField({
+				key: 'keepTerminalsAfterQuit',
+				label: 'Keep terminals running after quit',
+				description:
+					'How long terminals keep running in the background after Terminay quits or restarts. Reopening Terminay within this time brings them back as they were.',
+				sectionId: 'shell-lifecycle',
+				categoryId: 'shell',
+				input: 'select',
+				options: [
+					{ label: '1 minute', value: '1m' },
+					{ label: '5 minutes', value: '5m' },
+					{ label: '30 minutes', value: '30m' },
+					{ label: '2 hours', value: '2h' },
+					{ label: 'Until this computer restarts', value: 'untilRestart' },
+				],
+				keywords: [
+					'quit',
+					'restart',
+					'update',
+					'background',
+					'keep running',
+					'restore',
+					'session',
+				],
+			}),
+			makeField({
+				key: 'moveTerminalsIntoNewWorktreeFolders',
+				label: 'Move terminals into new worktree folders',
+				description:
+					"When a terminal creates a Git worktree, move it into that worktree's folder. When off, the folder offers the move instead.",
+				sectionId: 'shell-lifecycle',
+				categoryId: 'shell',
+				input: 'boolean',
+				keywords: [
+					'worktree',
+					'folder',
+					'git',
+					'move terminal',
+					'capture',
+					'agent',
+				],
+			}),
+			makeField({
+				key: 'programSetTabTitles',
+				label: 'Let programs set tab titles',
+				description:
+					'A program running in a terminal can name its tab. A name you give a tab always wins. When off, tabs show your name or Terminal N.',
+				sectionId: 'shell-lifecycle',
+				categoryId: 'shell',
+				input: 'boolean',
+				keywords: [
+					'title',
+					'tab name',
+					'rename',
+					'osc',
+					'escape sequence',
+					'window title',
+				],
+			}),
+		],
+	},
+	{
+		id: 'file-viewer-refresh',
+		categoryId: 'files',
+		title: 'File Viewer',
+		description:
+			'Control watched file refreshes and custom extension default tabs.',
+		fields: [
+			makeField({
+				key: 'fileViewer.refreshIntervalSeconds',
+				label: 'Refresh interval',
+				description:
+					'Minimum seconds between automatic reloads after watched file changes.',
+				sectionId: 'file-viewer-refresh',
+				categoryId: 'files',
+				input: 'number',
+				min: 1,
+				max: 60,
+				step: 1,
+				keywords: [
+					'file',
+					'file viewer',
+					'refresh',
+					'reload',
+					'watch',
+					'debounce',
+					'throttle',
+					'extension',
+					'default tab',
+				],
+			}),
+			makeField({
+				key: 'fileViewer.folderTaskIgnoredDirectories',
+				label: 'Folder Tasks ignored folders',
+				description:
+					'Folder names or relative paths to skip when recursively scanning markdown tasks.',
+				sectionId: 'file-viewer-refresh',
+				categoryId: 'files',
+				input: 'textarea',
+				placeholder: DEFAULT_FOLDER_TASK_IGNORED_DIRECTORIES,
+				keywords: [
+					'folder',
+					'tasks',
+					'markdown',
+					'ignore',
+					'exclude',
+					'node_modules',
+					'dist',
+				],
+			}),
+		],
+	},
+	{
+		id: 'sidebar',
+		categoryId: 'files',
+		title: 'Sidebar',
+		description:
+			'Default layout for Files, Changes, and Documentation panes in the project sidebar groups.',
+		fields: [
+			makeField({
+				key: 'sidebar.gitPanelViewMode',
+				label: 'Changes view',
+				description: 'Show changed files as a nested tree or a flat list.',
+				sectionId: 'sidebar',
+				categoryId: 'files',
+				input: 'select',
+				options: [
+					{ label: 'Tree', value: 'tree' },
+					{ label: 'List', value: 'list' },
+				],
+				keywords: ['git', 'sidebar', 'tree', 'list', 'changes', 'view'],
+			}),
+			makeField({
+				key: 'sidebar.defaultExplorerState',
+				label: 'Default Explorer state',
+				description:
+					'Whether the Explorer pane starts expanded or collapsed in new projects.',
+				sectionId: 'sidebar',
+				categoryId: 'files',
+				input: 'select',
+				options: [
+					{ label: 'Expanded', value: 'expanded' },
+					{ label: 'Collapsed', value: 'collapsed' },
+				],
+				keywords: ['sidebar', 'explorer', 'collapse', 'expand', 'default'],
+			}),
+			makeField({
+				key: 'sidebar.defaultGitState',
+				label: 'Default Changes state',
+				description:
+					'Whether the Changes pane starts expanded or collapsed in new projects.',
+				sectionId: 'sidebar',
+				categoryId: 'files',
+				input: 'select',
+				options: [
+					{ label: 'Expanded', value: 'expanded' },
+					{ label: 'Collapsed', value: 'collapsed' },
+				],
+				keywords: ['sidebar', 'git', 'collapse', 'expand', 'default'],
+			}),
+			makeField({
+				key: 'sidebar.defaultDocumentationState',
+				label: 'Default Documentation state',
+				description: 'Whether the Documentation pane starts expanded or collapsed in new projects.',
+				sectionId: 'sidebar', categoryId: 'files', input: 'select',
+				options: [{ label: 'Expanded', value: 'expanded' }, { label: 'Collapsed', value: 'collapsed' }],
+				keywords: ['sidebar', 'documentation', 'markdown', 'collapse', 'expand', 'default'],
+			}),
+			makeField({
+				key: 'sidebar.defaultExplorerPaneHeight',
+				label: 'Default Explorer pane height',
+				description:
+					'Initial height in pixels of the Explorer pane in new projects.',
+				sectionId: 'sidebar',
+				categoryId: 'files',
+				input: 'number',
+				min: 80,
+				max: 1000,
+				step: 10,
+				keywords: [
+					'sidebar',
+					'explorer',
+					'git',
+					'height',
+					'splitter',
+					'divider',
+					'default',
+				],
+			}),
+			makeField({
+				key: 'sidebar.defaultGitPaneHeight',
+				label: 'Default Changes pane height',
+				description:
+					'Initial height in pixels of the Changes pane in new projects.',
+				sectionId: 'sidebar',
+				categoryId: 'files',
+				input: 'number',
+				min: 80,
+				max: 1000,
+				step: 10,
+				keywords: [
+					'sidebar',
+					'git',
+					'height',
+					'splitter',
+					'divider',
+					'default',
+				],
+			}),
+			makeField({
+				key: 'sidebar.defaultDocumentationPaneHeight',
+				label: 'Default Documentation pane height',
+				description: 'Initial height in pixels of the Documentation pane in new projects.',
+				sectionId: 'sidebar', categoryId: 'files', input: 'number', min: 80, max: 1000, step: 10,
+				keywords: ['sidebar', 'documentation', 'markdown', 'height', 'splitter', 'divider', 'default'],
+			}),
+		],
+	},
+	{
+		id: 'tab-indicators',
+		categoryId: 'appearance',
+		title: 'Tab Indicators',
+		description: 'Choose which terminal activity indicators appear on tabs.',
+		fields: [
+			makeField({
+				key: 'activityIndicators.showActiveTabs',
+				label: 'Show indicator for active tabs',
+				description:
+					'Show a yellow indicator for tabs that had activity within the last few seconds.',
+				sectionId: 'tab-indicators',
+				categoryId: 'appearance',
+				input: 'boolean',
+				keywords: [
+					'activity',
+					'indicator',
+					'tab',
+					'active',
+					'recent',
+					'yellow',
+				],
+			}),
+			makeField({
+				key: 'activityIndicators.showFinishedTabs',
+				label: 'Show indicator for finished tabs',
+				description:
+					'Show a green indicator for tabs that had activity and then went quiet.',
+				sectionId: 'tab-indicators',
+				categoryId: 'appearance',
+				input: 'boolean',
+				keywords: [
+					'activity',
+					'indicator',
+					'tab',
+					'finished',
+					'quiet',
+					'green',
+				],
+			}),
+			makeField({
+				key: 'activityIndicators.signalDetection',
+				label: 'Use terminal signals for activity',
+				description:
+					'Detect activity from escape sequences that agents and shells emit (OSC 9;4 progress, OSC 133/633 commands, bell), instead of guessing from raw output. Fixes flickering on Claude Code and Codex tabs.',
+				sectionId: 'tab-indicators',
+				categoryId: 'appearance',
+				input: 'boolean',
+				keywords: [
+					'activity',
+					'indicator',
+					'tab',
+					'signal',
+					'escape',
+					'sequence',
+					'osc',
+					'claude',
+					'codex',
+					'agent',
+					'progress',
+					'attention',
+				],
+			}),
+			makeField({
+				key: 'activityIndicators.progressStaleSeconds',
+				label: 'Progress signal timeout',
+				description:
+					'Seconds without a progress update before a busy tab is treated as finished, so a crashed program cannot pin a tab busy forever.',
+				sectionId: 'tab-indicators',
+				categoryId: 'appearance',
+				input: 'number',
+				min: 1,
+				max: 120,
+				step: 1,
+				keywords: [
+					'activity',
+					'indicator',
+					'tab',
+					'progress',
+					'signal',
+					'stale',
+					'timeout',
+					'seconds',
+				],
+			}),
+			makeField({
+				key: 'activityIndicators.amberDelaySeconds',
+				label: 'Show amber after',
+				description:
+					'Seconds of unseen terminal activity before the active activity indicator appears.',
+				sectionId: 'tab-indicators',
+				categoryId: 'appearance',
+				input: 'number',
+				min: 0,
+				max: 60,
+				step: 0.25,
+				keywords: [
+					'activity',
+					'indicator',
+					'tab',
+					'active',
+					'recent',
+					'yellow',
+					'amber',
+					'delay',
+					'seconds',
+				],
+			}),
+			makeField({
+				key: 'activityIndicators.greenDelaySeconds',
+				label: 'Show green after',
+				description:
+					'Seconds after unseen activity before the finished activity indicator appears.',
+				sectionId: 'tab-indicators',
+				categoryId: 'appearance',
+				input: 'number',
+				min: 0,
+				max: 300,
+				step: 0.25,
+				keywords: [
+					'activity',
+					'indicator',
+					'tab',
+					'finished',
+					'quiet',
+					'green',
+					'delay',
+					'seconds',
+				],
+			}),
+			makeField({
+				key: 'activityIndicators.tabSwitchSuppressionSeconds',
+				label: 'Ignore after tab switch',
+				description: 'Seconds of output to ignore from the tab you just left.',
+				sectionId: 'tab-indicators',
+				categoryId: 'appearance',
+				input: 'number',
+				min: 0,
+				max: 60,
+				step: 0.25,
+				keywords: [
+					'activity',
+					'indicator',
+					'tab',
+					'focus',
+					'switch',
+					'claude',
+					'delay',
+					'seconds',
+				],
+			}),
+		],
+	},
+	{
+		id: 'typography',
+		categoryId: 'appearance',
+		title: 'Typography',
+		description: 'Tune the typeface and text spacing used by the terminal.',
+		fields: [
+			makeField({
+				key: 'fontFamily',
+				label: 'Font family',
+				description: 'Preferred font stack used to render terminal text.',
+				sectionId: 'typography',
+				categoryId: 'appearance',
+				input: 'text',
+				placeholder:
+					'ui-monospace, "DejaVu Sans Mono", "Liberation Mono", monospace',
+				keywords: ['typeface', 'font', 'mono'],
+			}),
+			makeField({
+				key: 'fontSize',
+				label: 'Font size',
+				description: 'Base text size in pixels.',
+				sectionId: 'typography',
+				categoryId: 'appearance',
+				input: 'number',
+				min: 8,
+				max: 32,
+				step: 1,
+			}),
+			makeField({
+				key: 'fontWeight',
+				label: 'Font weight',
+				description: 'Weight used for standard text.',
+				sectionId: 'typography',
+				categoryId: 'appearance',
+				input: 'select',
+				options: [
+					'100',
+					'200',
+					'300',
+					'400',
+					'500',
+					'600',
+					'700',
+					'800',
+					'900',
+					'normal',
+					'bold',
+				].map((value) => ({
+					label: value,
+					value,
+				})),
+			}),
+			makeField({
+				key: 'fontWeightBold',
+				label: 'Bold font weight',
+				description: 'Weight used when ANSI bold text is emitted.',
+				sectionId: 'typography',
+				categoryId: 'appearance',
+				input: 'select',
+				options: ['400', '500', '600', '700', '800', '900', 'bold'].map(
+					(value) => ({
+						label: value,
+						value,
+					}),
+				),
+			}),
+			makeField({
+				key: 'lineHeight',
+				label: 'Line height',
+				description: 'Vertical spacing multiplier for each text row.',
+				sectionId: 'typography',
+				categoryId: 'appearance',
+				input: 'number',
+				min: 1,
+				max: 2,
+				step: 0.05,
+			}),
+			makeField({
+				key: 'letterSpacing',
+				label: 'Letter spacing',
+				description: 'Extra spacing between characters in pixels.',
+				sectionId: 'typography',
+				categoryId: 'appearance',
+				input: 'number',
+				min: -2,
+				max: 10,
+				step: 0.1,
+			}),
+		],
+	},
+	{
+		id: 'rendering',
+		categoryId: 'appearance',
+		title: 'Rendering',
+		description: 'Adjust how glyphs and emphasis are drawn.',
+		fields: [
+			makeField({
+				key: 'drawBoldTextInBrightColors',
+				label: 'Bright bold ANSI colors',
+				description:
+					'Render bold ANSI colors using their bright palette variants.',
+				sectionId: 'rendering',
+				categoryId: 'appearance',
+				input: 'boolean',
+			}),
+			makeField({
+				key: 'customGlyphs',
+				label: 'Custom box drawing glyphs',
+				description:
+					'Fill box-drawing and block glyphs to the cell edges. This uses the WebGL renderer when the host provides it.',
+				sectionId: 'rendering',
+				categoryId: 'appearance',
+				input: 'boolean',
+			}),
+			makeField({
+				key: 'rescaleOverlappingGlyphs',
+				label: 'Rescale overlapping glyphs',
+				description:
+					'Improve ambiguous-width glyph rendering for some font combinations.',
+				sectionId: 'rendering',
+				categoryId: 'appearance',
+				input: 'boolean',
+			}),
+			makeField({
+				key: 'allowTransparency',
+				label: 'Transparent background support',
+				description:
+					'Allow semi-transparent terminal backgrounds and overlays.',
+				sectionId: 'rendering',
+				categoryId: 'appearance',
+				input: 'boolean',
+			}),
+		],
+	},
+	{
+		id: 'cursor-shape',
+		categoryId: 'cursor',
+		title: 'Cursor',
+		description: 'Choose how the caret looks and behaves when focused.',
+		fields: [
+			makeField({
+				key: 'cursorStyle',
+				label: 'Cursor style',
+				description: 'Visual shape of the active cursor.',
+				sectionId: 'cursor-shape',
+				categoryId: 'cursor',
+				input: 'select',
+				options: [
+					{ label: 'Block', value: 'block' },
+					{ label: 'Underline', value: 'underline' },
+					{ label: 'Bar', value: 'bar' },
+				],
+			}),
+			makeField({
+				key: 'cursorInactiveStyle',
+				label: 'Inactive cursor style',
+				description: 'How the cursor appears when the terminal loses focus.',
+				sectionId: 'cursor-shape',
+				categoryId: 'cursor',
+				input: 'select',
+				options: [
+					{ label: 'Outline', value: 'outline' },
+					{ label: 'Block', value: 'block' },
+					{ label: 'Bar', value: 'bar' },
+					{ label: 'Underline', value: 'underline' },
+					{ label: 'Hidden', value: 'none' },
+				],
+			}),
+			makeField({
+				key: 'cursorBlink',
+				label: 'Blinking cursor',
+				description: 'Animate the cursor when the terminal is focused.',
+				sectionId: 'cursor-shape',
+				categoryId: 'cursor',
+				input: 'boolean',
+			}),
+			makeField({
+				key: 'cursorWidth',
+				label: 'Bar cursor width',
+				description: 'Width used for the bar cursor style in CSS pixels.',
+				sectionId: 'cursor-shape',
+				categoryId: 'cursor',
+				input: 'number',
+				min: 1,
+				max: 8,
+				step: 1,
+			}),
+		],
+	},
+	{
+		id: 'input',
+		categoryId: 'interaction',
+		title: 'Input & Keyboard',
+		description: 'Control how typing, paste, and modifier keys behave.',
+		fields: [
+			makeField({
+				key: 'disableStdin',
+				label: 'Read-only terminal input',
+				description: 'Prevent keyboard input from being sent to the shell.',
+				sectionId: 'input',
+				categoryId: 'interaction',
+				input: 'boolean',
+			}),
+			makeField({
+				key: 'convertEol',
+				label: 'Convert LF to CRLF',
+				description:
+					'Translate line feeds to carriage return plus line feed on write.',
+				sectionId: 'input',
+				categoryId: 'interaction',
+				input: 'boolean',
+			}),
+			makeField({
+				key: 'ignoreBracketedPasteMode',
+				label: 'Ignore bracketed paste mode',
+				description:
+					'Paste plain text even when the shell requests bracketed paste.',
+				sectionId: 'input',
+				categoryId: 'interaction',
+				input: 'boolean',
+			}),
+			makeField({
+				key: 'tabStopWidth',
+				label: 'Tab stop width',
+				description: 'Spaces between tab stops.',
+				sectionId: 'input',
+				categoryId: 'interaction',
+				input: 'number',
+				min: 1,
+				max: 16,
+				step: 1,
+			}),
+		],
+	},
+	{
+		id: 'selection',
+		categoryId: 'interaction',
+		title: 'Selection & Mouse',
+		description: 'Tune mouse behavior and text selection rules.',
+		fields: [
+			makeField({
+				key: 'altClickMovesCursor',
+				label: 'Alt-click moves cursor',
+				description:
+					'Move the shell cursor to the mouse position when supported.',
+				sectionId: 'selection',
+				categoryId: 'interaction',
+				input: 'boolean',
+			}),
+			makeField({
+				key: 'rightClickSelectsWord',
+				label: 'Right-click selects word',
+				description: 'Select the word under the pointer on right click.',
+				sectionId: 'selection',
+				categoryId: 'interaction',
+				input: 'boolean',
+			}),
+			makeField({
+				key: 'macOptionIsMeta',
+				label: 'Treat Option as Meta',
+				description: 'Use the macOS Option key as the terminal Meta modifier.',
+				sectionId: 'selection',
+				categoryId: 'interaction',
+				input: 'boolean',
+			}),
+			makeField({
+				key: 'macOptionClickForcesSelection',
+				label: 'Option-click forces selection',
+				description:
+					'Allow regular selection while apps like tmux capture mouse events.',
+				sectionId: 'selection',
+				categoryId: 'interaction',
+				input: 'boolean',
+			}),
+			makeField({
+				key: 'wordSeparator',
+				label: 'Word separators',
+				description:
+					'Characters that split words during double-click selection.',
+				sectionId: 'selection',
+				categoryId: 'interaction',
+				input: 'text',
+			}),
+		],
+	},
+	{
+		id: 'keyboard-shortcuts',
+		categoryId: 'keyboard',
+		title: 'Command Shortcuts',
+		description:
+			'Customize command key bindings. Leave a field blank to disable that shortcut.',
+		fields: appCommandMetadata.map((command) =>
+			makeField({
+				key: `keyboardShortcuts.${command.command}`,
+				label: command.title,
+				description: command.description,
+				sectionId: 'keyboard-shortcuts',
+				categoryId: 'keyboard',
+				input: 'text',
+				placeholder: defaultKeyboardShortcuts[command.command],
+				keywords: [
+					'shortcut',
+					'keyboard',
+					'key binding',
+					'accelerator',
+					command.keywords,
+				],
+			}),
+		),
+	},
+	{
+		id: 'history',
+		categoryId: 'scrolling',
+		title: 'Scrollback',
+		description:
+			'Decide how much history stays available and how the viewport reacts.',
+		fields: [
+			makeField({
+				key: 'scrollback',
+				label: 'Scrollback lines',
+				description: 'Number of lines preserved above the viewport.',
+				sectionId: 'history',
+				categoryId: 'scrolling',
+				input: 'number',
+				min: 0,
+				max: 500000,
+				step: 100,
+			}),
+			makeField({
+				key: 'scrollOnUserInput',
+				label: 'Scroll to bottom on input',
+				description: 'Jump back to the latest prompt whenever you type.',
+				sectionId: 'history',
+				categoryId: 'scrolling',
+				input: 'boolean',
+			}),
+			makeField({
+				key: 'scrollOnEraseInDisplay',
+				label: 'Push clears into scrollback',
+				description: 'Preserve clear-screen output in scrollback history.',
+				sectionId: 'history',
+				categoryId: 'scrolling',
+				input: 'boolean',
+			}),
+		],
+	},
+	{
+		id: 'scroll-feel',
+		categoryId: 'scrolling',
+		title: 'Scroll Feel',
+		description:
+			'Match trackpad, wheel, and animated scrolling to your preference.',
+		fields: [
+			makeField({
+				key: 'scrollSensitivity',
+				label: 'Scroll sensitivity',
+				description:
+					'Multiplier applied to standard wheel and trackpad scrolling.',
+				sectionId: 'scroll-feel',
+				categoryId: 'scrolling',
+				input: 'number',
+				min: 0.1,
+				max: 10,
+				step: 0.1,
+			}),
+			makeField({
+				key: 'fastScrollSensitivity',
+				label: 'Fast scroll sensitivity',
+				description: 'Multiplier used while holding Alt during scroll.',
+				sectionId: 'scroll-feel',
+				categoryId: 'scrolling',
+				input: 'number',
+				min: 0.1,
+				max: 20,
+				step: 0.1,
+			}),
+			makeField({
+				key: 'smoothScrollDuration',
+				label: 'Smooth scroll duration',
+				description: 'Animation time in milliseconds for viewport scrolling.',
+				sectionId: 'scroll-feel',
+				categoryId: 'scrolling',
+				input: 'number',
+				min: 0,
+				max: 2000,
+				step: 10,
+			}),
+		],
+	},
+	{
+		id: 'update-channel',
+		categoryId: 'updates',
+		title: 'Update channel',
+		description:
+			'Terminay Desktop downloads updates in the background and installs them when you restart.',
+		fields: [
+			makeField({
+				key: 'updateChannel',
+				label: 'Update channel',
+				description:
+					'Stable follows tagged releases. Beta follows every merge to main and may be unstable. Switching never installs an older version.',
+				sectionId: 'update-channel',
+				categoryId: 'updates',
+				input: 'select',
+				options: [
+					{ label: 'Stable', value: 'stable' },
+					{ label: 'Beta', value: 'beta' },
+				],
+				keywords: ['update', 'upgrade', 'beta', 'prerelease', 'release'],
+			}),
+		],
+	},
+	{
+		id: 'readability',
+		categoryId: 'accessibility',
+		title: 'Readability',
+		description: 'Improve contrast and assistive technology support.',
+		fields: [
+			makeField({
+				key: 'minimumContrastRatio',
+				label: 'Minimum contrast ratio',
+				description: 'Adjust text colors dynamically to preserve readability.',
+				sectionId: 'readability',
+				categoryId: 'accessibility',
+				input: 'number',
+				min: 1,
+				max: 21,
+				step: 0.5,
+			}),
+			makeField({
+				key: 'screenReaderMode',
+				label: 'Screen reader mode',
+				description:
+					'Expose extra accessibility affordances for assistive technology.',
+				sectionId: 'readability',
+				categoryId: 'accessibility',
+				input: 'boolean',
+			}),
+		],
+	},
+	{
+		id: 'surface',
+		categoryId: 'theme',
+		title: 'Surface',
+		description: 'Core canvas, selection, and scrollbar colors.',
+		fields: [
+			{
+				key: 'theme.foreground',
+				label: 'Foreground',
+				description: 'Default text color.',
+				sectionId: 'surface',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.background',
+				label: 'Background',
+				description: 'Default terminal background color.',
+				sectionId: 'surface',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.cursor',
+				label: 'Cursor',
+				description: 'Active cursor color.',
+				sectionId: 'surface',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.cursorAccent',
+				label: 'Cursor accent',
+				description: 'Text color inside a block cursor.',
+				sectionId: 'surface',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.selectionBackground',
+				label: 'Selection',
+				description: 'Selection highlight color.',
+				sectionId: 'surface',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.selectionInactiveBackground',
+				label: 'Inactive selection',
+				description: 'Selection color when the terminal is unfocused.',
+				sectionId: 'surface',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.selectionForeground',
+				label: 'Selection text',
+				description: 'Text color while selected.',
+				sectionId: 'surface',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.scrollbarSliderBackground',
+				label: 'Scrollbar',
+				description: 'Scrollbar thumb color.',
+				sectionId: 'surface',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.scrollbarSliderHoverBackground',
+				label: 'Scrollbar hover',
+				description: 'Scrollbar thumb hover color.',
+				sectionId: 'surface',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.scrollbarSliderActiveBackground',
+				label: 'Scrollbar active',
+				description: 'Scrollbar thumb pressed color.',
+				sectionId: 'surface',
+				categoryId: 'theme',
+				input: 'color',
+			},
+		],
+	},
+	{
+		id: 'ansi-normal',
+		categoryId: 'theme',
+		title: 'ANSI Colors',
+		description: 'Standard 16-color ANSI palette used by terminal output.',
+		fields: [
+			{
+				key: 'theme.black',
+				label: 'Black',
+				description: 'ANSI black.',
+				sectionId: 'ansi-normal',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.red',
+				label: 'Red',
+				description: 'ANSI red.',
+				sectionId: 'ansi-normal',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.green',
+				label: 'Green',
+				description: 'ANSI green.',
+				sectionId: 'ansi-normal',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.yellow',
+				label: 'Yellow',
+				description: 'ANSI yellow.',
+				sectionId: 'ansi-normal',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.blue',
+				label: 'Blue',
+				description: 'ANSI blue.',
+				sectionId: 'ansi-normal',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.magenta',
+				label: 'Magenta',
+				description: 'ANSI magenta.',
+				sectionId: 'ansi-normal',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.cyan',
+				label: 'Cyan',
+				description: 'ANSI cyan.',
+				sectionId: 'ansi-normal',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.white',
+				label: 'White',
+				description: 'ANSI white.',
+				sectionId: 'ansi-normal',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.brightBlack',
+				label: 'Bright black',
+				description: 'Bright ANSI black.',
+				sectionId: 'ansi-normal',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.brightRed',
+				label: 'Bright red',
+				description: 'Bright ANSI red.',
+				sectionId: 'ansi-normal',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.brightGreen',
+				label: 'Bright green',
+				description: 'Bright ANSI green.',
+				sectionId: 'ansi-normal',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.brightYellow',
+				label: 'Bright yellow',
+				description: 'Bright ANSI yellow.',
+				sectionId: 'ansi-normal',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.brightBlue',
+				label: 'Bright blue',
+				description: 'Bright ANSI blue.',
+				sectionId: 'ansi-normal',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.brightMagenta',
+				label: 'Bright magenta',
+				description: 'Bright ANSI magenta.',
+				sectionId: 'ansi-normal',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.brightCyan',
+				label: 'Bright cyan',
+				description: 'Bright ANSI cyan.',
+				sectionId: 'ansi-normal',
+				categoryId: 'theme',
+				input: 'color',
+			},
+			{
+				key: 'theme.brightWhite',
+				label: 'Bright white',
+				description: 'Bright ANSI white.',
+				sectionId: 'ansi-normal',
+				categoryId: 'theme',
+				input: 'color',
+			},
+		],
+	},
+];
+
+export function buildTerminalOptions(
+	settings: TerminalSettings,
+): ITerminalOptions {
+	return {
+		allowTransparency: settings.allowTransparency,
+		altClickMovesCursor: settings.altClickMovesCursor,
+		convertEol: settings.convertEol,
+		cursorBlink: settings.cursorBlink,
+		cursorStyle: settings.cursorStyle,
+		cursorWidth: settings.cursorWidth,
+		cursorInactiveStyle: settings.cursorInactiveStyle,
+		disableStdin: settings.disableStdin,
+		drawBoldTextInBrightColors: settings.drawBoldTextInBrightColors,
+		fastScrollSensitivity: settings.fastScrollSensitivity,
+		fontFamily: settings.fontFamily,
+		fontSize: settings.fontSize,
+		fontWeight: settings.fontWeight as FontWeight,
+		fontWeightBold: settings.fontWeightBold as FontWeight,
+		ignoreBracketedPasteMode: settings.ignoreBracketedPasteMode,
+		letterSpacing: settings.letterSpacing,
+		lineHeight: settings.lineHeight,
+		macOptionIsMeta: settings.macOptionIsMeta,
+		macOptionClickForcesSelection: settings.macOptionClickForcesSelection,
+		minimumContrastRatio: settings.minimumContrastRatio,
+		rescaleOverlappingGlyphs: settings.rescaleOverlappingGlyphs,
+		rightClickSelectsWord: settings.rightClickSelectsWord,
+		screenReaderMode: settings.screenReaderMode,
+		scrollback: settings.scrollback,
+		scrollOnEraseInDisplay: settings.scrollOnEraseInDisplay,
+		scrollOnUserInput: settings.scrollOnUserInput,
+		scrollSensitivity: settings.scrollSensitivity,
+		smoothScrollDuration: settings.smoothScrollDuration,
+		tabStopWidth: settings.tabStopWidth,
+		wordSeparator: settings.wordSeparator,
+		theme: resolveTerminalTheme(settings),
+	};
+}
+
+export function getTerminalThemeColorFallback(key: string): string {
+	if (!(key in defaultTerminalSettings.theme)) {
+		return '#000000';
+	}
+
+	const themeKey = key as TerminalThemeKey;
+	const defaultValue = defaultTerminalSettings.theme[themeKey];
+	return isTabThemeHueValue(defaultValue)
+		? (TAB_THEME_HUE_COLOR_FALLBACKS[themeKey] ?? '#000000')
+		: defaultValue;
+}
+
+export function resolveTerminalTheme(
+	settings: TerminalSettings,
+	tabColor?: string,
+): TerminalSettings['theme'] {
+	const nextTheme = { ...settings.theme };
+
+	for (const key of Object.keys(nextTheme) as TerminalThemeKey[]) {
+		const themeValue = nextTheme[key];
+		if (isTabThemeHueValue(themeValue)) {
+			const base = tabColor ?? getTerminalThemeColorFallback(key);
+			const brightness = getTabThemeHueBrightness(themeValue);
+			nextTheme[key] =
+				brightness === TAB_THEME_HUE_DEFAULT_BRIGHTNESS
+					? base
+					: applyTabThemeHueBrightness(base, brightness);
+		}
+	}
+
+	return nextTheme;
+}
+
+function clampNumber(
+	value: number,
+	fallback: number,
+	min?: number,
+	max?: number,
+): number {
+	if (!Number.isFinite(value)) {
+		return fallback;
+	}
+
+	const minApplied = min === undefined ? value : Math.max(min, value);
+	return max === undefined ? minApplied : Math.min(max, minApplied);
+}
+
+export function normalizeSidebarPanelOrder(value: unknown): SidebarPanelId[] {
+	const validIds = new Set<string>(SIDEBAR_PANEL_IDS);
+	const ordered = Array.isArray(value)
+		? value.filter(
+				(candidate, index, input): candidate is SidebarPanelId =>
+					typeof candidate === 'string' &&
+					validIds.has(candidate) &&
+					input.indexOf(candidate) === index,
+			)
+		: [];
+	return [
+		...ordered,
+		...SIDEBAR_PANEL_IDS.filter((id) => !ordered.includes(id)),
+	];
+}
+
+function normalizeTerminayMcpPermissions(value: unknown): TerminayMcpPermissions {
+	const defaults = defaultTerminalSettings.terminayMcp.permissions;
+	const input =
+		typeof value === 'object' && value !== null && !Array.isArray(value)
+			? (value as Record<string, unknown>)
+			: {};
+	const policy = (key: keyof TerminayMcpPermissions): TerminayMcpPermissionPolicy =>
+		input[key] === 'ask' || input[key] === 'allow' || input[key] === 'deny'
+			? input[key]
+			: defaults[key];
+	return {
+		terminalsRead: policy('terminalsRead'),
+		terminalsManage: policy('terminalsManage'),
+		automationsRead: policy('automationsRead'),
+		automationsManage: policy('automationsManage'),
+		projectsWindows: policy('projectsWindows'),
+		settingsRead: policy('settingsRead'),
+		settingsChange: policy('settingsChange'),
+		appWindows: policy('appWindows'),
+		notifications: policy('notifications'),
+		connectedServerTools: policy('connectedServerTools'),
+		windowMessages: policy('windowMessages'),
+	};
+}
+
+function normalizeProjectSidebarVisibility(value: unknown): Record<string, boolean> {
+	if (typeof value !== 'object' || value === null || Array.isArray(value))
+		return {};
+	const entries = Object.entries(value).flatMap(([key, isOpen]) =>
+		typeof isOpen === 'boolean' && key.length > 0 && key.length <= 512
+			? ([[key, isOpen]] as const)
+			: [],
+	);
+	return Object.fromEntries(entries.slice(-256));
+}
+
+function normalizeProjectFoldersColumnTab(
+	value: unknown,
+): Record<string, FoldersColumnTabId> {
+	if (typeof value !== 'object' || value === null || Array.isArray(value))
+		return {};
+	const allowed = new Set<string>(FOLDERS_COLUMN_TAB_IDS);
+	const entries = Object.entries(value).flatMap(([key, tabId]) =>
+		typeof tabId === 'string' &&
+		allowed.has(tabId) &&
+		key.length > 0 &&
+		key.length <= 512
+			? ([[key, tabId as FoldersColumnTabId]] as const)
+			: [],
+	);
+	return Object.fromEntries(entries.slice(-256));
+}
+
+function normalizeProjectFoldersCollapsed(
+	value: unknown,
+): Record<string, string[]> {
+	if (typeof value !== 'object' || value === null || Array.isArray(value))
+		return {};
+	const entries = Object.entries(value).flatMap(([key, folderIds]) => {
+		if (!Array.isArray(folderIds) || key.length === 0 || key.length > 512)
+			return [];
+		const ids = [
+			...new Set(
+				folderIds.filter(
+					(id): id is string =>
+						typeof id === 'string' && id.length > 0 && id.length <= 256,
+				),
+			),
+		].slice(0, 256);
+		// A project with nothing collapsed needs no entry.
+		return ids.length === 0 ? [] : ([[key, ids]] as const);
+	});
+	return Object.fromEntries(entries.slice(-256));
+}
+
+function normalizeProjectSidebarActiveGroup(
+	value: unknown,
+): Record<string, SidebarGroupId> {
+	if (typeof value !== 'object' || value === null || Array.isArray(value))
+		return {};
+	const allowed = new Set<string>(SIDEBAR_GROUP_IDS);
+	const entries = Object.entries(value).flatMap(([key, groupId]) =>
+		typeof groupId === 'string' &&
+		allowed.has(groupId) &&
+		key.length > 0 &&
+		key.length <= 512
+			? ([[key, groupId as SidebarGroupId]] as const)
+			: [],
+	);
+	return Object.fromEntries(entries.slice(-256));
+}
+
+function normalizeThemeColor(
+	input: Partial<TerminalSettings['theme']>,
+	key: TerminalThemeKey,
+	legacyDefaultValues: string[] = [],
+): string {
+	const value = input[key];
+
+	if (typeof value !== 'string') {
+		return defaultTerminalSettings.theme[key];
+	}
+
+	if (legacyDefaultValues.includes(value.toLowerCase())) {
+		return defaultTerminalSettings.theme[key];
+	}
+
+	return value;
+}
+
+export function normalizeTerminalSettings(
+	candidate: unknown,
+): TerminalSettings {
+	const input =
+		typeof candidate === 'object' && candidate !== null
+			? (candidate as Partial<TerminalSettings>)
+			: {};
+	const aiTabMetadataInput =
+		typeof input.aiTabMetadata === 'object' && input.aiTabMetadata !== null
+			? input.aiTabMetadata
+			: defaultTerminalSettings.aiTabMetadata;
+	const agentIntegrationInput =
+		typeof input.agentIntegration === 'object' &&
+		input.agentIntegration !== null
+			? input.agentIntegration
+			: defaultTerminalSettings.agentIntegration;
+	const aiTitleInput =
+		typeof aiTabMetadataInput.title === 'object' &&
+		aiTabMetadataInput.title !== null
+			? aiTabMetadataInput.title
+			: defaultTerminalSettings.aiTabMetadata.title;
+	const aiNoteInput =
+		typeof aiTabMetadataInput.note === 'object' &&
+		aiTabMetadataInput.note !== null
+			? aiTabMetadataInput.note
+			: defaultTerminalSettings.aiTabMetadata.note;
+	const gitPushAgentInput =
+		typeof input.gitPushAgent === 'object' && input.gitPushAgent !== null
+			? input.gitPushAgent
+			: defaultTerminalSettings.gitPushAgent;
+	const dictationInput =
+		typeof input.dictation === 'object' && input.dictation !== null
+			? input.dictation
+			: defaultTerminalSettings.dictation;
+	const pixelInput =
+		typeof input.pixel === 'object' && input.pixel !== null
+			? input.pixel
+			: defaultTerminalSettings.pixel;
+	const terminayMcpInput =
+		typeof input.terminayMcp === 'object' && input.terminayMcp !== null
+			? input.terminayMcp
+			: defaultTerminalSettings.terminayMcp;
+	const activityIndicatorsInput =
+		typeof input.activityIndicators === 'object' &&
+		input.activityIndicators !== null
+			? input.activityIndicators
+			: defaultTerminalSettings.activityIndicators;
+	const remoteAccessInput =
+		typeof input.remoteAccess === 'object' && input.remoteAccess !== null
+			? input.remoteAccess
+			: defaultTerminalSettings.remoteAccess;
+	const recordingInput =
+		typeof input.recording === 'object' && input.recording !== null
+			? input.recording
+			: defaultTerminalSettings.recording;
+	const fileViewerInput =
+		typeof input.fileViewer === 'object' && input.fileViewer !== null
+			? input.fileViewer
+			: defaultTerminalSettings.fileViewer;
+	const sidebarInput =
+		typeof input.sidebar === 'object' && input.sidebar !== null
+			? input.sidebar
+			: defaultTerminalSettings.sidebar;
+	const themeInput =
+		typeof input.theme === 'object' && input.theme !== null
+			? (input.theme as Partial<TerminalSettings['theme']>)
+			: {};
+	const keyboardShortcutsInput =
+		typeof input.keyboardShortcuts === 'object' &&
+		input.keyboardShortcuts !== null
+			? (input.keyboardShortcuts as Partial<
+					TerminalSettings['keyboardShortcuts']
+				>)
+			: {};
+
+	return {
+		agentIntegration: {
+			enabled:
+				typeof agentIntegrationInput.enabled === 'boolean'
+					? agentIntegrationInput.enabled
+					: defaultTerminalSettings.agentIntegration.enabled,
+			harnesses: normalizeHarnessSwitches(agentIntegrationInput.harnesses),
+		},
+		aiTabMetadata: {
+			title: {
+				provider:
+					aiTitleInput.provider === 'codex' ||
+					aiTitleInput.provider === 'claudeCode'
+						? aiTitleInput.provider
+						: defaultTerminalSettings.aiTabMetadata.title.provider,
+				claudeCodeModel:
+					typeof aiTitleInput.claudeCodeModel === 'string'
+						? aiTitleInput.claudeCodeModel.trim()
+						: defaultTerminalSettings.aiTabMetadata.title.claudeCodeModel,
+				codexModel:
+					typeof aiTitleInput.codexModel === 'string'
+						? aiTitleInput.codexModel.trim()
+						: defaultTerminalSettings.aiTabMetadata.title.codexModel,
+			},
+			note: {
+				provider:
+					aiNoteInput.provider === 'codex' ||
+					aiNoteInput.provider === 'claudeCode'
+						? aiNoteInput.provider
+						: defaultTerminalSettings.aiTabMetadata.note.provider,
+				claudeCodeModel:
+					typeof aiNoteInput.claudeCodeModel === 'string'
+						? aiNoteInput.claudeCodeModel.trim()
+						: defaultTerminalSettings.aiTabMetadata.note.claudeCodeModel,
+				codexModel:
+					typeof aiNoteInput.codexModel === 'string'
+						? aiNoteInput.codexModel.trim()
+						: defaultTerminalSettings.aiTabMetadata.note.codexModel,
+			},
+		},
+		gitPushAgent: {
+			provider:
+				gitPushAgentInput.provider === 'codex' ||
+				gitPushAgentInput.provider === 'claudeCode'
+					? gitPushAgentInput.provider
+					: defaultTerminalSettings.gitPushAgent.provider,
+			claudeCodeModel:
+				typeof gitPushAgentInput.claudeCodeModel === 'string'
+					? gitPushAgentInput.claudeCodeModel.trim()
+					: defaultTerminalSettings.gitPushAgent.claudeCodeModel,
+			codexModel:
+				typeof gitPushAgentInput.codexModel === 'string'
+					? gitPushAgentInput.codexModel.trim()
+					: defaultTerminalSettings.gitPushAgent.codexModel,
+			prompt:
+				typeof gitPushAgentInput.prompt === 'string'
+					? gitPushAgentInput.prompt
+					: defaultTerminalSettings.gitPushAgent.prompt,
+		},
+		pixel: {
+			enabled:
+				typeof pixelInput.enabled === 'boolean'
+					? pixelInput.enabled
+					: defaultTerminalSettings.pixel.enabled,
+			provider:
+				typeof pixelInput.provider === 'string' &&
+				/^[a-z0-9][a-z0-9.-]*\/[a-z][a-z0-9-]*$|^unset$/.test(pixelInput.provider)
+					? pixelInput.provider
+					: defaultTerminalSettings.pixel.provider,
+		},
+		terminayMcp: {
+			enabled:
+				typeof terminayMcpInput.enabled === 'boolean'
+					? terminayMcpInput.enabled
+					: defaultTerminalSettings.terminayMcp.enabled,
+			permissions: normalizeTerminayMcpPermissions(
+				(terminayMcpInput as { permissions?: unknown }).permissions,
+			),
+		},
+		dictation: {
+			enabled:
+				typeof dictationInput.enabled === 'boolean'
+					? dictationInput.enabled
+					: defaultTerminalSettings.dictation.enabled,
+			provider: dictationInput.provider === 'parakeet' ? 'parakeet' : 'openai',
+			model:
+				dictationInput.provider === 'parakeet'
+					? 'mlx-community/parakeet-tdt-0.6b-v3'
+					: dictationInput.model === 'gpt-4o-mini-transcribe' ||
+							dictationInput.model === 'gpt-4o-transcribe'
+						? dictationInput.model
+						: defaultTerminalSettings.dictation.model,
+			language:
+				typeof dictationInput.language === 'string' &&
+				dictationInput.language.trim().length > 0
+					? dictationInput.language.trim()
+					: defaultTerminalSettings.dictation.language,
+			microphoneDeviceId:
+				typeof dictationInput.microphoneDeviceId === 'string'
+					? dictationInput.microphoneDeviceId.trim()
+					: defaultTerminalSettings.dictation.microphoneDeviceId,
+			prompt:
+				typeof dictationInput.prompt === 'string'
+					? dictationInput.prompt
+					: defaultTerminalSettings.dictation.prompt,
+			silenceStopSeconds: clampNumber(
+				Number(dictationInput.silenceStopSeconds),
+				defaultTerminalSettings.dictation.silenceStopSeconds,
+				1,
+				15,
+			),
+			maxDurationSeconds: clampNumber(
+				Number(dictationInput.maxDurationSeconds),
+				defaultTerminalSettings.dictation.maxDurationSeconds,
+				5,
+				300,
+			),
+		},
+		allowTransparency:
+			typeof input.allowTransparency === 'boolean'
+				? input.allowTransparency
+				: defaultTerminalSettings.allowTransparency,
+		altClickMovesCursor:
+			typeof input.altClickMovesCursor === 'boolean'
+				? input.altClickMovesCursor
+				: defaultTerminalSettings.altClickMovesCursor,
+		showStatusBar:
+			typeof input.showStatusBar === 'boolean'
+				? input.showStatusBar
+				: defaultTerminalSettings.showStatusBar,
+		showStatusBarCompact:
+			typeof input.showStatusBarCompact === 'boolean'
+				? input.showStatusBarCompact
+				: defaultTerminalSettings.showStatusBarCompact,
+		activityIndicators: {
+			amberDelaySeconds: clampNumber(
+				Number(activityIndicatorsInput.amberDelaySeconds),
+				defaultTerminalSettings.activityIndicators.amberDelaySeconds,
+				0,
+				60,
+			),
+			greenDelaySeconds: clampNumber(
+				Number(activityIndicatorsInput.greenDelaySeconds),
+				defaultTerminalSettings.activityIndicators.greenDelaySeconds,
+				0,
+				300,
+			),
+			showActiveTabs:
+				typeof activityIndicatorsInput.showActiveTabs === 'boolean'
+					? activityIndicatorsInput.showActiveTabs
+					: defaultTerminalSettings.activityIndicators.showActiveTabs,
+			showFinishedTabs:
+				typeof activityIndicatorsInput.showFinishedTabs === 'boolean'
+					? activityIndicatorsInput.showFinishedTabs
+					: defaultTerminalSettings.activityIndicators.showFinishedTabs,
+			signalDetection:
+				typeof activityIndicatorsInput.signalDetection === 'boolean'
+					? activityIndicatorsInput.signalDetection
+					: defaultTerminalSettings.activityIndicators.signalDetection,
+			progressStaleSeconds: clampNumber(
+				Number(activityIndicatorsInput.progressStaleSeconds),
+				defaultTerminalSettings.activityIndicators.progressStaleSeconds,
+				1,
+				120,
+			),
+			tabSwitchSuppressionSeconds: clampNumber(
+				Number(activityIndicatorsInput.tabSwitchSuppressionSeconds),
+				defaultTerminalSettings.activityIndicators.tabSwitchSuppressionSeconds,
+				0,
+				60,
+			),
+		},
+		autoCloseTerminalOnExitZero:
+			typeof input.autoCloseTerminalOnExitZero === 'boolean'
+				? input.autoCloseTerminalOnExitZero
+				: defaultTerminalSettings.autoCloseTerminalOnExitZero,
+		keepTerminalsAfterQuit: (
+			['1m', '5m', '30m', '2h', 'untilRestart'] as const
+		).includes(input.keepTerminalsAfterQuit as never)
+			? (input.keepTerminalsAfterQuit as TerminalSettings['keepTerminalsAfterQuit'])
+			: defaultTerminalSettings.keepTerminalsAfterQuit,
+		moveTerminalsIntoNewWorktreeFolders:
+			typeof input.moveTerminalsIntoNewWorktreeFolders === 'boolean'
+				? input.moveTerminalsIntoNewWorktreeFolders
+				: defaultTerminalSettings.moveTerminalsIntoNewWorktreeFolders,
+		programSetTabTitles:
+			typeof input.programSetTabTitles === 'boolean'
+				? input.programSetTabTitles
+				: defaultTerminalSettings.programSetTabTitles,
+		updateChannel: input.updateChannel === 'beta' ? 'beta' : 'stable',
+		convertEol:
+			typeof input.convertEol === 'boolean'
+				? input.convertEol
+				: defaultTerminalSettings.convertEol,
+		cursorBlink:
+			typeof input.cursorBlink === 'boolean'
+				? input.cursorBlink
+				: defaultTerminalSettings.cursorBlink,
+		cursorStyle:
+			input.cursorStyle === 'underline' || input.cursorStyle === 'bar'
+				? input.cursorStyle
+				: defaultTerminalSettings.cursorStyle,
+		cursorWidth: clampNumber(
+			Number(input.cursorWidth),
+			defaultTerminalSettings.cursorWidth,
+			1,
+			8,
+		),
+		cursorInactiveStyle:
+			input.cursorInactiveStyle === 'block' ||
+			input.cursorInactiveStyle === 'bar' ||
+			input.cursorInactiveStyle === 'underline' ||
+			input.cursorInactiveStyle === 'none'
+				? input.cursorInactiveStyle
+				: defaultTerminalSettings.cursorInactiveStyle,
+		customGlyphs:
+			typeof input.customGlyphs === 'boolean'
+				? input.customGlyphs
+				: defaultTerminalSettings.customGlyphs,
+		disableStdin:
+			typeof input.disableStdin === 'boolean'
+				? input.disableStdin
+				: defaultTerminalSettings.disableStdin,
+		drawBoldTextInBrightColors:
+			typeof input.drawBoldTextInBrightColors === 'boolean'
+				? input.drawBoldTextInBrightColors
+				: defaultTerminalSettings.drawBoldTextInBrightColors,
+		fastScrollSensitivity: clampNumber(
+			Number(input.fastScrollSensitivity),
+			defaultTerminalSettings.fastScrollSensitivity,
+			0.1,
+			20,
+		),
+		fontFamily:
+			typeof input.fontFamily === 'string' && input.fontFamily.trim().length > 0
+				? input.fontFamily
+				: defaultTerminalSettings.fontFamily,
+		fontSize: clampNumber(
+			Number(input.fontSize),
+			defaultTerminalSettings.fontSize,
+			8,
+			32,
+		),
+		fontWeight:
+			typeof input.fontWeight === 'string' && input.fontWeight.trim().length > 0
+				? input.fontWeight
+				: defaultTerminalSettings.fontWeight,
+		fontWeightBold:
+			typeof input.fontWeightBold === 'string' &&
+			input.fontWeightBold.trim().length > 0
+				? input.fontWeightBold
+				: defaultTerminalSettings.fontWeightBold,
+		ignoreBracketedPasteMode:
+			typeof input.ignoreBracketedPasteMode === 'boolean'
+				? input.ignoreBracketedPasteMode
+				: defaultTerminalSettings.ignoreBracketedPasteMode,
+		letterSpacing: clampNumber(
+			Number(input.letterSpacing),
+			defaultTerminalSettings.letterSpacing,
+			-2,
+			10,
+		),
+		lineHeight: clampNumber(
+			Number(input.lineHeight),
+			defaultTerminalSettings.lineHeight,
+			1,
+			2,
+		),
+		macOptionIsMeta:
+			typeof input.macOptionIsMeta === 'boolean'
+				? input.macOptionIsMeta
+				: defaultTerminalSettings.macOptionIsMeta,
+		macOptionClickForcesSelection:
+			typeof input.macOptionClickForcesSelection === 'boolean'
+				? input.macOptionClickForcesSelection
+				: defaultTerminalSettings.macOptionClickForcesSelection,
+		minimumContrastRatio: clampNumber(
+			Number(input.minimumContrastRatio),
+			defaultTerminalSettings.minimumContrastRatio,
+			1,
+			21,
+		),
+		rescaleOverlappingGlyphs:
+			typeof input.rescaleOverlappingGlyphs === 'boolean'
+				? input.rescaleOverlappingGlyphs
+				: defaultTerminalSettings.rescaleOverlappingGlyphs,
+		rightClickSelectsWord:
+			typeof input.rightClickSelectsWord === 'boolean'
+				? input.rightClickSelectsWord
+				: defaultTerminalSettings.rightClickSelectsWord,
+		screenReaderMode:
+			typeof input.screenReaderMode === 'boolean'
+				? input.screenReaderMode
+				: defaultTerminalSettings.screenReaderMode,
+		scrollback: clampNumber(
+			Number(input.scrollback),
+			defaultTerminalSettings.scrollback,
+			0,
+			500000,
+		),
+		scrollOnEraseInDisplay:
+			typeof input.scrollOnEraseInDisplay === 'boolean'
+				? input.scrollOnEraseInDisplay
+				: defaultTerminalSettings.scrollOnEraseInDisplay,
+		scrollOnUserInput:
+			typeof input.scrollOnUserInput === 'boolean'
+				? input.scrollOnUserInput
+				: defaultTerminalSettings.scrollOnUserInput,
+		scrollSensitivity: clampNumber(
+			Number(input.scrollSensitivity),
+			defaultTerminalSettings.scrollSensitivity,
+			0.1,
+			10,
+		),
+		smoothScrollDuration: clampNumber(
+			Number(input.smoothScrollDuration),
+			defaultTerminalSettings.smoothScrollDuration,
+			0,
+			2000,
+		),
+		tabStopWidth: clampNumber(
+			Number(input.tabStopWidth),
+			defaultTerminalSettings.tabStopWidth,
+			1,
+			16,
+		),
+		wordSeparator:
+			typeof input.wordSeparator === 'string'
+				? input.wordSeparator
+				: defaultTerminalSettings.wordSeparator,
+		fileViewer: {
+			customFileExtensions: Array.isArray(fileViewerInput.customFileExtensions)
+				? fileViewerInput.customFileExtensions
+						.map((entry) => {
+							if (typeof entry !== 'object' || entry === null) {
+								return null;
+							}
+
+							const extension =
+								typeof entry.extension === 'string'
+									? `.${entry.extension.trim().toLowerCase().replace(/^\.+/, '')}`
+									: '';
+							const defaultMode: TerminalSettings['fileViewer']['customFileExtensions'][number]['defaultMode'] =
+								entry.defaultMode === 'text' || entry.defaultMode === 'hex'
+									? entry.defaultMode
+									: 'preview';
+
+							return extension.length > 1 ? { extension, defaultMode } : null;
+						})
+						.filter(
+							(entry): entry is NonNullable<typeof entry> => entry !== null,
+						)
+						.filter(
+							(entry, index, entries) =>
+								entries.findIndex(
+									(candidate) => candidate.extension === entry.extension,
+								) === index,
+						)
+				: defaultTerminalSettings.fileViewer.customFileExtensions,
+			diffLayout:
+				fileViewerInput.diffLayout === 'unified' ||
+				fileViewerInput.diffLayout === 'side-by-side'
+					? fileViewerInput.diffLayout
+					: defaultTerminalSettings.fileViewer.diffLayout,
+			folderTaskIgnoredDirectories:
+				typeof fileViewerInput.folderTaskIgnoredDirectories === 'string'
+					? fileViewerInput.folderTaskIgnoredDirectories
+					: defaultTerminalSettings.fileViewer.folderTaskIgnoredDirectories,
+			refreshIntervalSeconds: clampNumber(
+				Number(fileViewerInput.refreshIntervalSeconds),
+				defaultTerminalSettings.fileViewer.refreshIntervalSeconds,
+				1,
+				60,
+			),
+		},
+		keyboardShortcuts: Object.fromEntries(
+			appCommandMetadata.map(({ command }) => {
+				const value = keyboardShortcutsInput[command];
+				if (typeof value !== 'string') {
+					return [command, defaultTerminalSettings.keyboardShortcuts[command]];
+				}
+
+				const trimmed = value.trim();
+				return [
+					command,
+					trimmed.length > 0
+						? normalizeAccelerator(trimmed) ||
+							defaultTerminalSettings.keyboardShortcuts[command]
+						: '',
+				];
+			}),
+		) as TerminalSettings['keyboardShortcuts'],
+		recording: {
+			captureInput:
+				typeof recordingInput.captureInput === 'boolean'
+					? recordingInput.captureInput
+					: defaultTerminalSettings.recording.captureInput,
+			directory:
+				typeof recordingInput.directory === 'string' &&
+				recordingInput.directory.trim().length > 0
+					? recordingInput.directory.trim()
+					: defaultTerminalSettings.recording.directory,
+			openTimelineAfterSaving:
+				typeof recordingInput.openTimelineAfterSaving === 'boolean'
+					? recordingInput.openTimelineAfterSaving
+					: defaultTerminalSettings.recording.openTimelineAfterSaving,
+			recordNewTerminals:
+				typeof recordingInput.recordNewTerminals === 'boolean'
+					? recordingInput.recordNewTerminals
+					: defaultTerminalSettings.recording.recordNewTerminals,
+			sensitiveInputPolicy:
+				recordingInput.sensitiveInputPolicy === 'mask'
+					? recordingInput.sensitiveInputPolicy
+					: defaultTerminalSettings.recording.sensitiveInputPolicy,
+		},
+		remoteAccess: {
+			exposeOnStartup:
+				typeof remoteAccessInput.exposeOnStartup === 'boolean'
+					? remoteAccessInput.exposeOnStartup
+					: defaultTerminalSettings.remoteAccess.exposeOnStartup,
+			webRtcHostedDomain:
+				typeof remoteAccessInput.webRtcHostedDomain === 'string' &&
+				remoteAccessInput.webRtcHostedDomain.trim().length > 0
+					? remoteAccessInput.webRtcHostedDomain
+							.trim()
+							.toLowerCase()
+							.replace(/^https?:\/\//, '')
+							.replace(/\/.*$/, '')
+					: defaultTerminalSettings.remoteAccess.webRtcHostedDomain,
+			webRtcIceServers:
+				typeof remoteAccessInput.webRtcIceServers === 'string' &&
+				remoteAccessInput.webRtcIceServers.trim().length > 0
+					? remoteAccessInput.webRtcIceServers.trim()
+					: defaultTerminalSettings.remoteAccess.webRtcIceServers,
+		},
+		shell: {
+			program:
+				typeof input.shell === 'object' &&
+				input.shell !== null &&
+				typeof input.shell.program === 'string'
+					? input.shell.program.trim()
+					: defaultTerminalSettings.shell.program,
+			startupMode:
+				typeof input.shell === 'object' &&
+				input.shell !== null &&
+				(input.shell.startupMode === 'auto' ||
+					input.shell.startupMode === 'login' ||
+					input.shell.startupMode === 'non-login')
+					? input.shell.startupMode
+					: defaultTerminalSettings.shell.startupMode,
+			extraArgs:
+				typeof input.shell === 'object' &&
+				input.shell !== null &&
+				typeof input.shell.extraArgs === 'string'
+					? input.shell.extraArgs
+					: defaultTerminalSettings.shell.extraArgs,
+		},
+		sidebar: {
+			gitPanelViewMode:
+				sidebarInput.gitPanelViewMode === 'list' ||
+				sidebarInput.gitPanelViewMode === 'tree'
+					? sidebarInput.gitPanelViewMode
+					: defaultTerminalSettings.sidebar.gitPanelViewMode,
+			defaultExplorerState:
+				sidebarInput.defaultExplorerState === 'collapsed' ||
+				sidebarInput.defaultExplorerState === 'expanded'
+					? sidebarInput.defaultExplorerState
+					: defaultTerminalSettings.sidebar.defaultExplorerState,
+			defaultGitState:
+				sidebarInput.defaultGitState === 'collapsed' ||
+				sidebarInput.defaultGitState === 'expanded'
+					? sidebarInput.defaultGitState
+					: defaultTerminalSettings.sidebar.defaultGitState,
+			defaultDocumentationState:
+				sidebarInput.defaultDocumentationState === 'collapsed' ||
+				sidebarInput.defaultDocumentationState === 'expanded'
+					? sidebarInput.defaultDocumentationState
+					: defaultTerminalSettings.sidebar.defaultDocumentationState,
+			defaultExplorerPaneHeight: clampNumber(
+				Number(sidebarInput.defaultExplorerPaneHeight),
+				defaultTerminalSettings.sidebar.defaultExplorerPaneHeight,
+				80,
+				2000,
+			),
+			defaultGitPaneHeight: clampNumber(
+				Number(sidebarInput.defaultGitPaneHeight),
+				defaultTerminalSettings.sidebar.defaultGitPaneHeight,
+				80,
+				2000,
+			),
+			defaultDocumentationPaneHeight: clampNumber(
+				Number(sidebarInput.defaultDocumentationPaneHeight),
+				defaultTerminalSettings.sidebar.defaultDocumentationPaneHeight,
+				80,
+				1_000,
+			),
+			panelOrder: normalizeSidebarPanelOrder(sidebarInput.panelOrder),
+			projectVisibility: normalizeProjectSidebarVisibility(
+				sidebarInput.projectVisibility,
+			),
+			projectActiveGroup: normalizeProjectSidebarActiveGroup(
+				sidebarInput.projectActiveGroup,
+			),
+			projectFoldersVisibility: normalizeProjectSidebarVisibility(
+				sidebarInput.projectFoldersVisibility,
+			),
+			projectFoldersColumnTab: normalizeProjectFoldersColumnTab(
+				sidebarInput.projectFoldersColumnTab,
+			),
+			projectFoldersCollapsed: normalizeProjectFoldersCollapsed(
+				sidebarInput.projectFoldersCollapsed,
+			),
+		},
+		theme: {
+			foreground:
+				typeof themeInput.foreground === 'string'
+					? themeInput.foreground
+					: defaultTerminalSettings.theme.foreground,
+			background:
+				typeof themeInput.background === 'string'
+					? themeInput.background
+					: defaultTerminalSettings.theme.background,
+			cursor: normalizeThemeColor(themeInput, 'cursor', ['#6ac1ff']),
+			cursorAccent:
+				typeof themeInput.cursorAccent === 'string'
+					? themeInput.cursorAccent
+					: defaultTerminalSettings.theme.cursorAccent,
+			selectionBackground: normalizeThemeColor(
+				themeInput,
+				'selectionBackground',
+				['#32536b80', '#ffff00'],
+			),
+			selectionInactiveBackground:
+				typeof themeInput.selectionInactiveBackground === 'string'
+					? themeInput.selectionInactiveBackground
+					: defaultTerminalSettings.theme.selectionInactiveBackground,
+			selectionForeground: normalizeThemeColor(
+				themeInput,
+				'selectionForeground',
+				['#f8fbff'],
+			),
+			scrollbarSliderBackground:
+				typeof themeInput.scrollbarSliderBackground === 'string'
+					? themeInput.scrollbarSliderBackground
+					: defaultTerminalSettings.theme.scrollbarSliderBackground,
+			scrollbarSliderHoverBackground:
+				typeof themeInput.scrollbarSliderHoverBackground === 'string'
+					? themeInput.scrollbarSliderHoverBackground
+					: defaultTerminalSettings.theme.scrollbarSliderHoverBackground,
+			scrollbarSliderActiveBackground:
+				typeof themeInput.scrollbarSliderActiveBackground === 'string'
+					? themeInput.scrollbarSliderActiveBackground
+					: defaultTerminalSettings.theme.scrollbarSliderActiveBackground,
+			black:
+				typeof themeInput.black === 'string'
+					? themeInput.black
+					: defaultTerminalSettings.theme.black,
+			red:
+				typeof themeInput.red === 'string'
+					? themeInput.red
+					: defaultTerminalSettings.theme.red,
+			green:
+				typeof themeInput.green === 'string'
+					? themeInput.green
+					: defaultTerminalSettings.theme.green,
+			yellow:
+				typeof themeInput.yellow === 'string'
+					? themeInput.yellow
+					: defaultTerminalSettings.theme.yellow,
+			blue:
+				typeof themeInput.blue === 'string'
+					? themeInput.blue
+					: defaultTerminalSettings.theme.blue,
+			magenta:
+				typeof themeInput.magenta === 'string'
+					? themeInput.magenta
+					: defaultTerminalSettings.theme.magenta,
+			cyan:
+				typeof themeInput.cyan === 'string'
+					? themeInput.cyan
+					: defaultTerminalSettings.theme.cyan,
+			white:
+				typeof themeInput.white === 'string'
+					? themeInput.white
+					: defaultTerminalSettings.theme.white,
+			brightBlack:
+				typeof themeInput.brightBlack === 'string'
+					? themeInput.brightBlack
+					: defaultTerminalSettings.theme.brightBlack,
+			brightRed:
+				typeof themeInput.brightRed === 'string'
+					? themeInput.brightRed
+					: defaultTerminalSettings.theme.brightRed,
+			brightGreen:
+				typeof themeInput.brightGreen === 'string'
+					? themeInput.brightGreen
+					: defaultTerminalSettings.theme.brightGreen,
+			brightYellow:
+				typeof themeInput.brightYellow === 'string'
+					? themeInput.brightYellow
+					: defaultTerminalSettings.theme.brightYellow,
+			brightBlue:
+				typeof themeInput.brightBlue === 'string'
+					? themeInput.brightBlue
+					: defaultTerminalSettings.theme.brightBlue,
+			brightMagenta:
+				typeof themeInput.brightMagenta === 'string'
+					? themeInput.brightMagenta
+					: defaultTerminalSettings.theme.brightMagenta,
+			brightCyan:
+				typeof themeInput.brightCyan === 'string'
+					? themeInput.brightCyan
+					: defaultTerminalSettings.theme.brightCyan,
+			brightWhite:
+				typeof themeInput.brightWhite === 'string'
+					? themeInput.brightWhite
+					: defaultTerminalSettings.theme.brightWhite,
+		},
+	};
+}
+
+const HARNESS_SWITCH_KEY =
+	/^[a-z0-9](?:[a-z0-9.-]{1,126}[a-z0-9])?\/[a-z][a-z0-9-]{0,63}\/[a-z][a-z0-9-]{0,63}$/u;
+const MAX_HARNESS_SWITCHES = 256;
+
+/** Keep only well-formed `<sourceId>/<harnessId>` keys with boolean values. */
+function normalizeHarnessSwitches(value: unknown): Record<string, boolean> {
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+		return {};
+	}
+	const harnesses: Record<string, boolean> = {};
+	for (const [key, enabled] of Object.entries(value)) {
+		if (Object.keys(harnesses).length >= MAX_HARNESS_SWITCHES) break;
+		if (HARNESS_SWITCH_KEY.test(key) && typeof enabled === 'boolean') {
+			harnesses[key] = enabled;
+		}
+	}
+	return harnesses;
+}

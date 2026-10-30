@@ -1,0 +1,288 @@
+import { useCallback, useEffect, useState } from 'react';
+import type { JSX } from 'react';
+import { Check, Plug } from 'lucide-react';
+import type {
+	McpAgentId,
+	McpAgentInstallState,
+	McpInstallStatus,
+} from '../types/terminay';
+import { InPageWindow } from '../shared/inPageWindow/InPageWindow';
+import './mcpInstallModal.css';
+import type { McpInstallClient } from '../services/serverApplicationFeatureClients';
+
+export interface McpInstallModalProps {
+	client?: McpInstallClient;
+	open: boolean;
+	onClose: () => void;
+}
+
+export function McpInstallModal({
+	client,
+	open,
+	onClose,
+}: McpInstallModalProps): JSX.Element | null {
+	const [status, setStatus] = useState<McpInstallStatus | null>(null);
+	const [isLoading, setIsLoading] = useState(false);
+	const [loadError, setLoadError] = useState<string | null>(null);
+	const [busyAgent, setBusyAgent] = useState<McpAgentId | null>(null);
+	const [rowErrors, setRowErrors] = useState<Partial<Record<McpAgentId, string>>>(
+		{},
+	);
+
+	const refreshStatus = useCallback(async () => {
+		setIsLoading(true);
+		setLoadError(null);
+		try {
+			if (client === undefined) throw new Error('MCP installation is unavailable on the selected server.');
+			const nextStatus = await client.getStatus();
+			setStatus(nextStatus);
+		} catch (error) {
+			setLoadError(
+				error instanceof Error ? error.message : 'Failed to load MCP status.',
+			);
+		} finally {
+			setIsLoading(false);
+		}
+	}, [client]);
+
+	useEffect(() => {
+		if (!open) {
+			return;
+		}
+
+		let isMounted = true;
+
+		setIsLoading(true);
+		setLoadError(null);
+		if (client === undefined) {
+			setLoadError('MCP installation is unavailable on the selected server.');
+			setIsLoading(false);
+			return;
+		}
+		void client
+			.getStatus()
+			.then((nextStatus) => {
+				if (!isMounted) {
+					return;
+				}
+				setStatus(nextStatus);
+			})
+			.catch((error: unknown) => {
+				if (!isMounted) {
+					return;
+				}
+				setLoadError(
+					error instanceof Error ? error.message : 'Failed to load MCP status.',
+				);
+			})
+			.finally(() => {
+				if (!isMounted) {
+					return;
+				}
+				setIsLoading(false);
+			});
+
+		return () => {
+			isMounted = false;
+		};
+	}, [client, open]);
+
+	const runAction = useCallback(
+		async (agent: McpAgentId, installed: boolean) => {
+			if (busyAgent) {
+				return;
+			}
+
+			setBusyAgent(agent);
+			setRowErrors((previous) => {
+				if (!previous[agent]) {
+					return previous;
+				}
+				const { [agent]: _removed, ...rest } = previous;
+				return rest;
+			});
+
+			try {
+				const result = installed
+					? await client?.uninstall(agent)
+					: await client?.install(agent);
+				if (result === undefined) throw new Error('MCP installation is unavailable on the selected server.');
+
+				if (!result.ok) {
+					setRowErrors((previous) => ({
+						...previous,
+						[agent]: result.error ?? result.message ?? 'Something went wrong.',
+					}));
+				}
+
+				setStatus((previous) => {
+					if (!previous) {
+						return previous;
+					}
+					return {
+						...previous,
+						agents: previous.agents.map((entry) =>
+							entry.id === agent
+								? { ...entry, installed: result.installed }
+								: entry,
+						),
+					};
+				});
+			} catch (error) {
+				setRowErrors((previous) => ({
+					...previous,
+					[agent]:
+						error instanceof Error ? error.message : 'Something went wrong.',
+				}));
+				await refreshStatus();
+			} finally {
+				setBusyAgent(null);
+			}
+		},
+		[busyAgent, client, refreshStatus],
+	);
+
+	if (!open) {
+		return null;
+	}
+
+	return (
+		<InPageWindow
+			icon={<Plug size={14} className="mcp-install-title-icon" />}
+			kind={{ resizable: false, width: 560 }}
+			name="mcp-install"
+			title="Install Terminay MCP"
+			onClose={onClose}
+		>
+			<div className="project-edit-modal project-edit-modal--wide mcp-install-modal">
+				<p className="mcp-install-description">
+					Let coding agents running in a Terminay terminal control the tabs in
+					this window.
+				</p>
+
+				{loadError ? (
+					<div className="mcp-install-load-error">{loadError}</div>
+				) : null}
+
+				{isLoading && !status ? (
+					<div className="mcp-install-loading">Loading agents…</div>
+				) : null}
+
+				{status ? (
+					<McpInstallTargetList
+						status={status}
+						busyTarget={busyAgent}
+						rowErrors={rowErrors}
+						onAction={(agent) => void runAction(agent.id, agent.installed)}
+					/>
+				) : null}
+			</div>
+		</InPageWindow>
+	);
+}
+
+export interface McpInstallTargetListProps {
+	status: McpInstallStatus;
+	busyTarget: McpAgentId | null;
+	rowErrors: Partial<Record<McpAgentId, string>>;
+	onAction: (agent: McpAgentInstallState) => void;
+}
+
+/**
+ * One row per contributed install target, keyed by target id. With no targets
+ * the Built-in Agents extension that contributes them is disabled or missing,
+ * so there is nothing to install.
+ */
+export function McpInstallTargetList({
+	status,
+	busyTarget,
+	rowErrors,
+	onAction,
+}: McpInstallTargetListProps): JSX.Element {
+	if (status.agents.length === 0) {
+		return (
+			<div className="mcp-install-empty" role="note">
+				MCP install targets come from the Built-in Agents extension, which is
+				disabled or missing on this server. Enable it in Settings → Extensions
+				to install Terminay MCP.
+			</div>
+		);
+	}
+	return (
+		<ul className="mcp-install-list">
+			{status.agents.map((agent) => (
+				<McpAgentRow
+					key={agent.id}
+					agent={agent}
+					busy={busyTarget === agent.id}
+					disabled={busyTarget !== null && busyTarget !== agent.id}
+					error={rowErrors[agent.id]}
+					onAction={() => onAction(agent)}
+				/>
+			))}
+		</ul>
+	);
+}
+
+interface McpAgentRowProps {
+	agent: McpAgentInstallState;
+	busy: boolean;
+	disabled: boolean;
+	error: string | undefined;
+	onAction: () => void;
+}
+
+function McpAgentRow({
+	agent,
+	busy,
+	disabled,
+	error,
+	onAction,
+}: McpAgentRowProps): JSX.Element {
+	const canAct = agent.state === 'installed' || agent.state === 'not-installed';
+	const actionLabel = agent.state === 'installed' ? 'Uninstall' : 'Install';
+	const stateLabel =
+		agent.state === 'installed'
+			? 'Installed'
+			: agent.state === 'not-installed'
+				? 'Not installed'
+				: agent.state === 'changed'
+					? 'Changed — review config'
+					: agent.state === 'error'
+						? 'Error'
+						: 'Unavailable';
+
+	return (
+		<li className="mcp-install-row" data-mcp-install-target={agent.id}>
+			<div className="mcp-install-row-main">
+				<span
+					className={`mcp-install-status-icon${agent.state === 'installed' ? ' mcp-install-status-icon--installed' : ''}`}
+					aria-hidden="true"
+				>
+					{agent.state === 'installed' ? <Check size={14} /> : null}
+				</span>
+				<div className="mcp-install-row-copy">
+					<span className="mcp-install-row-label">{agent.label}</span>
+					<span className="mcp-install-row-state">
+						{stateLabel}
+					</span>
+					<span className="mcp-install-row-path" title={agent.configPath}>
+						{agent.configPath}
+					</span>
+					{error ? <span className="mcp-install-row-error">{error}</span> : null}
+					{agent.message ? (
+						<span className="mcp-install-row-error">{agent.message}</span>
+					) : null}
+				</div>
+			</div>
+			<button
+				type="button"
+				className={`mcp-install-action${agent.installed ? ' mcp-install-action--uninstall' : ''}`}
+				onClick={onAction}
+				disabled={busy || disabled || !canAct}
+			>
+				{busy ? 'Working…' : actionLabel}
+			</button>
+		</li>
+	);
+}

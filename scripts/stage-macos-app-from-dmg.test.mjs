@@ -1,0 +1,52 @@
+import assert from 'node:assert/strict'
+import { readFile, stat } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
+import test from 'node:test'
+
+const script = new URL('./stage-macos-app-from-dmg.sh', import.meta.url)
+
+test('the DMG staging helper is a macOS-only ditto copy off a read-only volume', async () => {
+  const source = await readFile(script, 'utf8')
+  const mode = (await stat(script)).mode
+  assert.equal(Boolean(mode & 0o111), true, 'staging helper must be executable')
+  assert.match(source, /ditto/u)
+  assert.match(source, /hdiutil attach/u)
+  assert.match(source, /-readonly/u)
+  assert.doesNotMatch(source, /mapfile/u)
+  assert.doesNotMatch(source, /codesign --verify/u,
+    'unsigned electron-builder apps fail codesign --verify; release verifies signed bytes separately')
+})
+
+test('the DMG staging helper rejects missing arguments', async () => {
+  const result = await new Promise((resolve, reject) => {
+    const child = spawn('bash', [script.pathname], { stdio: ['ignore', 'pipe', 'pipe'] })
+    let stderr = ''
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk)
+    })
+    child.on('error', reject)
+    child.on('close', (code) => resolve({ code, stderr }))
+  })
+  assert.equal(result.code, 1)
+  assert.match(result.stderr, /usage: stage-macos-app-from-dmg\.sh/u)
+})
+
+test('the unsigned PR smoke copies the app off a DMG before boot', async () => {
+  const smoke = new URL('./packaged-macos-pr-smoke.sh', import.meta.url)
+  const runner = new URL('./run-packaged-macos-smoke.sh', import.meta.url)
+  const source = await readFile(smoke, 'utf8')
+  const runnerSource = await readFile(runner, 'utf8')
+  const mode = (await stat(smoke)).mode
+  const runnerMode = (await stat(runner)).mode
+  assert.equal(Boolean(mode & 0o111), true, 'PR smoke helper must be executable')
+  assert.equal(Boolean(runnerMode & 0o111), true, 'packaged smoke runner must be executable')
+  assert.match(source, /hdiutil create/u)
+  assert.match(source, /stage-macos-app-from-dmg\.sh/u)
+  assert.match(source, /run-packaged-macos-smoke\.sh/u)
+  assert.match(runnerSource, /test:packaged-startup-macos/u)
+  assert.match(runnerSource, /launchctl managername/u)
+  assert.match(runnerSource, /TERMINAY_ELECTRON_HEADLESS=1/u)
+  assert.doesNotMatch(runnerSource, /export -p/u,
+    'the Aqua subprocess must receive only the explicit smoke environment')
+  assert.doesNotMatch(source, /codesign --verify/u)
+})

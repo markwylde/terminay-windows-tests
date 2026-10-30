@@ -1,0 +1,490 @@
+.session-workspace {
+	position: relative;
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	width: 100%;
+}
+
+.session-workspace--reconnecting .connected-web-renderer-workspace {
+	pointer-events: none;
+}
+
+.session-workspace__reconnecting {
+	position: absolute;
+	z-index: 4000;
+	inset: 0;
+	display: grid;
+	place-content: center;
+	justify-items: center;
+	gap: 14px;
+	background: rgba(13, 17, 23, 0.72);
+	color: #9ba9ba;
+	font-size: 14px;
+	font-weight: 600;
+	pointer-events: auto;
+}
+
+.session-workspace__reconnecting p {
+	margin: 0;
+}
+
+.session-workspace__reconnecting .browser-host-shell__loading-dots {
+	display: flex;
+	gap: 7px;
+}
+
+.session-workspace__reconnecting .browser-host-shell__loading-dots span {
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	opacity: 0.2;
+	transform: scale(0.65);
+	animation: browser-host-loading-dot 1.6s ease-in-out infinite;
+}
+
+.session-workspace__reconnecting
+	.browser-host-shell__loading-dots
+	span:nth-child(1) {
+	background: #db5757;
+}
+.session-workspace__reconnecting
+	.browser-host-shell__loading-dots
+	span:nth-child(2) {
+	background: #c1db57;
+	animation-delay: 0.12s;
+}
+.session-workspace__reconnecting
+	.browser-host-shell__loading-dots
+	span:nth-child(3) {
+	background: #57db8c;
+	animation-delay: 0.24s;
+}
+.session-workspace__reconnecting
+	.browser-host-shell__loading-dots
+	span:nth-child(4) {
+	background: #578cdb;
+	animation-delay: 0.36s;
+}
+.session-workspace__reconnecting
+	.browser-host-shell__loading-dots
+	span:nth-child(5) {
+	background: #c157db;
+	animation-delay: 0.48s;
+}
+
+@keyframes browser-host-loading-dot {
+	0%,
+	55%,
+	100% {
+		opacity: 0.2;
+		transform: scale(0.65);
+	}
+	18%,
+	36% {
+		opacity: 1;
+		transform: scale(1);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.session-workspace__reconnecting .browser-host-shell__loading-dots span {
+		animation: none;
+		opacity: 1;
+		transform: none;
+	}
+}
+
+.connected-web-renderer-workspace {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	width: 100%;
+}
+
+.connected-web-renderer-workspace
+	> :not(
+		.connected-web-menubar,
+		.in-page-window-layer,
+		.connected-web-connection-backdrop
+	) {
+	min-height: 0;
+	flex: 1;
+}
+
+.connected-web-menubar {
+	position: relative;
+	z-index: 3000;
+	flex: 0 0 auto;
+	min-height: calc(30px + env(safe-area-inset-top, 0px));
+	height: auto;
+	display: flex;
+	align-items: stretch;
+	border-bottom: 1px solid #232b35;
+	background: #11161d;
+	color: #dce2f0;
+	padding-top: env(safe-area-inset-top, 0px);
+	user-select: none;
+}
+
+/* Safari copies the parent safe-area into iframe documents; Chromium reports
+   0. The manager already reserved the status bar and titlebar, so a framed
+   workspace must not add that inset or size itself with 100dvh. */
+html.is-framed .connected-web-menubar {
+	min-height: 30px;
+	padding-top: 0;
+}
+
+html.is-framed .connected-web-renderer-workspace,
+html.is-framed .workspace-shell,
+html.is-framed .responsive-workspace-shell {
+	min-height: 0;
+	height: 100%;
+	max-height: 100%;
+}
+
+.connected-web-menubar__menus {
+	display: flex;
+	align-items: stretch;
+	gap: 2px;
+	padding: 0 8px;
+}
+
+.connected-web-menu {
+	position: relative;
+	display: flex;
+	align-items: stretch;
+}
+
+.connected-web-menu__button,
+.connected-web-menu__item {
+	border: 0;
+	color: inherit;
+	font: inherit;
+	background: transparent;
+}
+
+.connected-web-menu__button {
+	min-width: 44px;
+	padding: 0 10px;
+	text-align: center;
+}
+
+.connected-web-menu__button:hover,
+.connected-web-menu__button:focus-visible,
+.connected-web-menu__button[aria-expanded="true"] {
+	background: #26303b;
+	outline: none;
+}
+
+.connected-web-menu__popup {
+	position: absolute;
+	top: 100%;
+	left: 0;
+	z-index: 4000;
+	min-width: 240px;
+	padding: 6px;
+	border: 1px solid #303b47;
+	border-radius: 7px;
+	background: #151b23;
+	box-shadow: 0 18px 60px rgba(0, 0, 0, 0.45);
+}
+
+.connected-web-menu__item {
+	width: 100%;
+	display: block;
+	padding: 7px 10px;
+	border-radius: 5px;
+	text-align: left;
+	white-space: nowrap;
+}
+
+/* A checkable item reserves its tick column whether or not it is ticked, so
+   toggling it does not shift the label. */
+.connected-web-menu__item--checkable {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+
+.connected-web-menu__check {
+	flex: 0 0 auto;
+	width: 12px;
+	text-align: center;
+}
+
+.connected-web-menu__item--group {
+	margin-top: 4px;
+	padding-top: 10px;
+	border-top: 1px solid #303b47;
+	border-radius: 0 0 5px 5px;
+}
+
+.connected-web-menu__item:hover,
+.connected-web-menu__item:focus-visible {
+	background: #2b3744;
+	outline: none;
+}
+
+.connected-web-connection-backdrop {
+	position: fixed;
+	inset: 0;
+	z-index: 10000;
+	display: grid;
+	place-items: center;
+	padding: 24px;
+	background: rgba(3, 5, 9, 0.7);
+	backdrop-filter: blur(7px);
+}
+
+.connected-web-connection-dialog {
+	width: min(720px, 100%);
+	max-height: calc(100dvh - 48px);
+	overflow: auto;
+	border: 1px solid #2a3542;
+	border-radius: 10px;
+	background: #0d1014;
+	color: #dce2f0;
+	box-shadow: 0 24px 90px rgba(0, 0, 0, 0.55);
+	padding: 18px;
+}
+
+.connected-web-connection-backdrop {
+	padding: 20px;
+	background: rgba(0, 0, 0, 0.6);
+	backdrop-filter: blur(4px);
+}
+
+.connected-web-connection-dialog {
+	display: flex;
+	flex-direction: column;
+	gap: 24px;
+	width: min(560px, 100%);
+	max-height: min(860px, calc(100dvh - 40px));
+	padding: 32px 32px 24px;
+	overflow: hidden;
+	border: 0;
+	border-radius: 20px;
+	background: #0d0f12;
+	color: #e2e8f0;
+	box-shadow: 0 24px 80px rgba(0, 0, 0, 0.5);
+	font-family:
+		-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial,
+		sans-serif;
+}
+
+.connected-web-connection-dialog > header {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 16px;
+	margin-bottom: 16px;
+}
+
+.connected-web-connection-dialog > header {
+	flex: 0 0 auto;
+	align-items: flex-start;
+	margin: 0;
+	padding: 0;
+	border-bottom: 0;
+}
+
+.connected-web-connection-dialog > header h2 {
+	margin: 0;
+	color: #fff;
+	font-size: 20px;
+	font-weight: 700;
+	letter-spacing: -0.02em;
+}
+
+.connected-web-connection-dialog > header p {
+	margin: 4px 0 0;
+	color: #94a3b8;
+	font-size: 13px;
+	font-weight: 400;
+	line-height: 1.5;
+}
+
+.connected-web-connection-dialog > header button {
+	flex: 0 0 auto;
+	min-height: 38px;
+	padding: 8px 14px;
+	border: 1px solid #1e293b;
+	border-radius: 8px;
+	background: transparent;
+	color: #94a3b8;
+	font: inherit;
+	font-size: 12px;
+	font-weight: 600;
+}
+
+.connected-web-connection-dialog > header button:hover {
+	border-color: #334155;
+	background: rgba(255, 255, 255, 0.05);
+	color: #f1f5f9;
+}
+
+.connected-web-connection-dialog > [data-shared-route-body="connections"] {
+	min-height: 0;
+	flex: 1;
+	padding: 0;
+	overflow: auto;
+	background: transparent;
+}
+
+/* The About document fills its window; the window gives it a height. */
+.connected-web-about-frame {
+	display: block;
+	width: 100%;
+	height: 464px;
+	border: 0;
+}
+
+.in-page-window[data-in-page-window="edit-tab"] .edit-window-shell {
+	height: auto;
+}
+
+.in-page-window[data-in-page-window="settings"] .settings-content {
+	max-width: none;
+	margin: 0;
+}
+
+.connected-web-settings-summary {
+	max-width: 720px;
+	display: grid;
+	gap: 16px;
+}
+
+.connected-web-settings-summary h3,
+.connected-web-settings-summary p {
+	margin: 0;
+}
+
+.connected-web-settings-summary dl {
+	display: grid;
+	gap: 10px;
+	margin: 0;
+}
+
+.connected-web-settings-summary dl > div {
+	display: flex;
+	justify-content: space-between;
+	gap: 16px;
+	padding: 10px 0;
+	border-bottom: 1px solid var(--settings-border, #303944);
+}
+
+.connected-web-settings-summary dt {
+	color: var(--settings-text-muted, #8b9bb5);
+}
+
+.connected-web-settings-summary dd {
+	margin: 0;
+	color: var(--settings-text, #f2f4f8);
+}
+
+.connected-web-recordings-detail {
+	display: grid;
+	align-content: start;
+	gap: 16px;
+	padding: 24px;
+	color: #dce2f0;
+}
+
+.connected-web-recordings-detail h3,
+.connected-web-recordings-detail p {
+	margin: 0;
+}
+
+.connected-web-recordings-detail dl {
+	display: grid;
+	gap: 10px;
+	margin: 0;
+	max-width: 520px;
+}
+
+.connected-web-recordings-detail dl > div {
+	display: flex;
+	justify-content: space-between;
+	gap: 16px;
+	padding: 10px 0;
+	border-bottom: 1px solid #303944;
+}
+
+.connected-web-recordings-detail dt {
+	color: #8b9bb5;
+}
+
+.connected-web-recordings-detail dd {
+	margin: 0;
+}
+
+.connected-web-native-auxiliary {
+	width: 100vw;
+	height: 100vh;
+	overflow: hidden;
+	background: #10151b;
+}
+
+/* Native window controls drawn over the page: macOS traffic lights and the
+   Windows title-bar overlay. Settings keeps its header band below them. */
+.connected-web-native-auxiliary[data-native-titlebar='mac'] {
+	--settings-chrome-top: 28px;
+}
+
+.connected-web-native-auxiliary[data-native-titlebar='overlay'] {
+	--settings-chrome-top: 38px;
+}
+
+/* The workspace, not this file, decides what "compact" means: it observes the
+   bar it already measures and stamps the shell. The band reacts to that
+   decision rather than measuring the viewport a second time and disagreeing.
+   Below that width the same menus live in the chrome row's single control. */
+.connected-web-renderer-workspace:has(
+	.app-shell[data-terminay-compact-chrome="true"]
+) .connected-web-menubar {
+	display: none;
+}
+
+.connected-web-compact-menu {
+	position: relative;
+	display: flex;
+	align-items: center;
+	flex: 0 0 auto;
+}
+
+.connected-web-compact-menu__popup {
+	position: absolute;
+	top: calc(100% + 4px);
+	left: 0;
+	z-index: 3000;
+	min-width: 232px;
+	max-height: 70vh;
+	overflow-y: auto;
+	padding: 5px;
+	border: 1px solid rgba(255, 255, 255, 0.12);
+	border-radius: 10px;
+	background: #1b1f28;
+	box-shadow: 0 14px 34px rgba(0, 0, 0, 0.55);
+}
+
+/* The four menus keep their names here: one control, still File, Edit, View
+   and Help rather than one undifferentiated list. */
+.connected-web-compact-menu__group + .connected-web-compact-menu__group {
+	margin-top: 4px;
+	padding-top: 4px;
+	border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.connected-web-compact-menu__label {
+	padding: 6px 10px 3px;
+	color: rgba(220, 226, 240, 0.45);
+	font-size: 11px;
+	font-weight: 700;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+}
+
+.connected-web-compact-menu__popup .connected-web-menu__item {
+	width: 100%;
+}

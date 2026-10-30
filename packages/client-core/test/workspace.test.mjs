@@ -1,0 +1,294 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { ClientError, WorkspaceClient } from "../dist/index.js";
+
+test("workspace facade keeps panel activation on the canonical server operation", async () => {
+  const calls = [];
+  const fake = {
+    async query(operation, payload) { calls.push([operation, payload]); return { result: operation === "workspace.delta" ? deltaEnvelope(2, 3) : { schemaVersion: 1, serverId: "server-a", revision: 2, cursor: "2" } }; },
+    async command(operation, payload) { calls.push([operation, payload]); return { result: { revision: 3 } }; },
+  };
+  const workspace = new WorkspaceClient(fake);
+  assert.equal((await workspace.snapshot()).cursor, "2");
+  assert.equal((await workspace.delta(2, "2")).cursor, "3");
+  await workspace.activatePanel({ projectId: "project-a", panelId: "panel-a" });
+  assert.deepEqual(calls.map(([operation]) => operation), ["workspace.snapshot", "workspace.delta", "workspace.command"]);
+  assert.deepEqual(calls[2][1], { command: { type: "panel.activate", projectId: "project-a", panelId: "panel-a" } });
+});
+
+test("workspace facade rejects unbounded panel activation identities before transport", async () => {
+  const calls = [];
+  const workspace = new WorkspaceClient({
+    async query() { throw new Error("not reached"); },
+    async command(operation, payload) { calls.push([operation, payload]); return { result: null }; },
+  });
+
+  await assert.rejects(workspace.activatePanel({ projectId: "project-a", panelId: "not a panel id" }), /panel activation ids are invalid/);
+  assert.deepEqual(calls, []);
+});
+
+test("workspace facade commits a bounded terminal tab order through canonical state", async () => {
+  const calls = [];
+  const workspace = new WorkspaceClient({
+    async command(operation, payload) { calls.push([operation, payload]); return { result: null }; },
+  });
+
+  await workspace.reorderPanels({ projectId: "project-a", panelIds: ["panel-b", "panel-a"] });
+  assert.deepEqual(calls, [[
+    "workspace.command",
+    { command: { type: "panel.reorder", projectId: "project-a", panelIds: ["panel-b", "panel-a"] } },
+  ]]);
+  await assert.rejects(
+    workspace.reorderPanels({ projectId: "project-a", panelIds: ["panel-a", "panel-a"] }),
+    /panel reorder ids are invalid/,
+  );
+  assert.equal(calls.length, 1);
+});
+
+test("workspace facade exposes bounded project and panel lifecycle operations", async () => {
+  const calls = [];
+  const workspace = new WorkspaceClient({
+    async command(operation, payload) { calls.push([operation, payload]); return { result: null }; },
+  });
+  await workspace.createProject({ projectId: "project-mobile", viewId: "view-mobile", root: "/workspace/mobile", name: "Mobile" });
+  await workspace.createPanel({ panel: { id: "panel-mobile", projectId: "project-mobile", type: "file", path: "README.md", createdAt: 1 } });
+  await workspace.activatePanel({ projectId: "project-mobile", panelId: "panel-mobile" });
+  await workspace.movePanel({ panelId: "panel-mobile", targetProjectId: "project-archive", index: 0 });
+  await workspace.closePanel("panel-mobile");
+  await workspace.closeProject("project-mobile");
+  assert.deepEqual(calls.map(([, payload]) => payload.command.type), [
+    "project.create",
+    "panel.create",
+    "panel.activate",
+    "panel.move",
+    "panel.close",
+    "project.close",
+  ]);
+  await assert.rejects(workspace.createProject({ projectId: "bad id", viewId: "view-mobile", root: "/workspace", name: "Bad" }), /project create request is invalid/);
+  await assert.rejects(workspace.closeProject("bad id"), /project close id is invalid/);
+  assert.equal(calls.length, 6);
+});
+
+test("workspace facade activates projects through canonical workspace state", async () => {
+  const calls = [];
+  const workspace = new WorkspaceClient({
+    async command(operation, payload) { calls.push([operation, payload]); return { result: null }; },
+  });
+
+  await workspace.activateProject({ projectId: "project-a" });
+  assert.deepEqual(calls, [[
+    "workspace.command",
+    { command: { type: "project.activate", projectId: "project-a" } },
+  ]]);
+  await assert.rejects(workspace.activateProject({ projectId: "bad id" }), /project activation id is invalid/);
+  assert.equal(calls.length, 1);
+});
+
+test("workspace delta accepts only the canonical revision cursor and snapshot shape", async () => {
+  const calls = [];
+  const workspace = new WorkspaceClient({
+    async query(operation, payload) {
+      calls.push([operation, payload]);
+      return { result: { ...deltaEnvelope(3, 4), state: { schemaVersion: 1, serverId: "server-a", revision: 4, cursor: "3" } } };
+    },
+    async command() { throw new Error("not reached"); },
+  });
+
+  await assert.rejects(workspace.delta(3, "legacy-cursor"), /workspace delta cursor is invalid/);
+  await assert.rejects(workspace.delta(-1, "-1"), /workspace delta cursor is invalid/);
+  assert.deepEqual(calls, []);
+
+  await assert.rejects(workspace.delta(3, "3"), /invalid workspace snapshot/);
+  assert.deepEqual(calls, [["workspace.delta", { revision: 3, cursor: "3" }]]);
+});
+
+test("workspace facade preserves and validates the versioned delta envelope", async () => {
+  const workspace = new WorkspaceClient({
+    async query() { return { result: deltaEnvelope(4, 6, [
+      { revision: 5, cursor: "5", commandId: "command-5", type: "panel.create", changedIds: ["panel-b"] },
+      { revision: 6, cursor: "6", commandId: "command-6", type: "panel.activate", changedIds: ["panel-b"] },
+    ]) }; },
+  });
+  const delta = await workspace.delta(4, "4");
+  assert.equal(delta.fromRevision, 4);
+  assert.deepEqual(delta.events.map((event) => event.revision), [5, 6]);
+
+  const malformed = new WorkspaceClient({
+    async query() { return { result: deltaEnvelope(4, 6, [
+      { revision: 6, cursor: "6", commandId: "command-6", type: "panel.activate", changedIds: ["panel-b"] },
+      { revision: 5, cursor: "5", commandId: "command-5", type: "panel.create", changedIds: ["panel-b"] },
+    ]) }; },
+  });
+  await assert.rejects(malformed.delta(4, "4"), /invalid workspace delta event/);
+});
+
+function deltaEnvelope(fromRevision, revision, events = []) {
+  return {
+    deltaVersion: 1,
+    serverId: "server-a",
+    fromRevision,
+    fromCursor: String(fromRevision),
+    revision,
+    cursor: String(revision),
+    state: { schemaVersion: 1, serverId: "server-a", revision, cursor: String(revision) },
+    events,
+  };
+}
+
+test("workspace facade binds a project move acknowledgement to its canonical request identity", async () => {
+  const calls = [];
+  const workspace = new WorkspaceClient({
+    async query() { throw new Error("not reached"); },
+    async command(operation, payload) {
+      calls.push([operation, payload]);
+      return { result: { projectId: "project-b", revision: 4, cursor: "4" } };
+    },
+  });
+
+  await assert.rejects(
+    workspace.moveProject({ projectId: "project-a", targetViewId: "view-b", index: 0 }),
+    /project move response identity is invalid/,
+  );
+  assert.deepEqual(calls, [["project.move", { projectId: "project-a", targetViewId: "view-b", index: 0 }]]);
+});
+
+test("workspace root update reports an older peer as precisely incompatible", async () => {
+  const workspace = new WorkspaceClient({
+    async command(operation) {
+      assert.equal(operation, "project.root.update");
+      throw new ClientError("not_found", "unknown command operation");
+    },
+  });
+
+  await assert.rejects(
+    workspace.updateProjectRoot({ projectId: "project-a", root: "/repo/a", expectedRevision: 2 }),
+    (error) => error instanceof ClientError
+      && error.code === "incompatible"
+      && error.message === "connected server does not support project root updates"
+      && error.cause?.code === "not_found",
+  );
+});
+
+test("workspace view adapters expose only typed create and close operations", async () => {
+  const calls = [];
+  const workspace = new WorkspaceClient({
+    async command(operation, payload, options) {
+      calls.push({ operation, payload, options });
+      return { result: { revision: calls.length, cursor: String(calls.length) } };
+    },
+  });
+
+  assert.deepEqual(await workspace.createView({ viewId: "view-a", name: "A" }, { commandId: "create-view" }), { revision: 1, cursor: "1" });
+  assert.deepEqual(await workspace.closeView("view-a", { commandId: "close-view" }), { revision: 2, cursor: "2" });
+  assert.equal("command" in workspace, false);
+  assert.deepEqual(calls.map(({ operation, payload }) => ({ operation, payload })), [
+    { operation: "workspace.command", payload: { command: { type: "view.create", viewId: "view-a", name: "A" } } },
+    { operation: "workspace.command", payload: { command: { type: "view.close", viewId: "view-a" } } },
+  ]);
+  await assert.rejects(workspace.createView({ viewId: "view-a", name: "\n" }), /workspace view create request is invalid/);
+});
+
+test("workspace facade sends a bounded terminal note and rejects an invalid one before transport", async () => {
+  const calls = [];
+  const workspace = new WorkspaceClient({
+    async command(operation, payload) { calls.push([operation, payload]); return { result: null }; },
+  });
+
+  await workspace.updatePanel({ panelId: "panel-a", patch: { note: "Watching the build" } });
+  await workspace.updatePanel({ panelId: "panel-a", patch: { note: "" } });
+  await workspace.updatePanel({ panelId: "panel-a", patch: { note: null } });
+  assert.deepEqual(calls.map(([, payload]) => payload.command.patch), [{ note: "Watching the build" }, { note: "" }, { note: null }]);
+
+  await assert.rejects(workspace.updatePanel({ panelId: "panel-a", patch: { note: "x".repeat(1201) } }), /panel note is invalid/);
+  await assert.rejects(workspace.updatePanel({ panelId: "panel-a", patch: { note: 7 } }), /panel note is invalid/);
+  await assert.rejects(workspace.updatePanel({ panelId: "panel-a", patch: { note: "a\0b" } }), /panel note is invalid/);
+  assert.equal(calls.length, 3);
+});
+
+test("workspace facade sends folder commands and rejects unbounded ones before transport", async () => {
+  const calls = [];
+  const workspace = new WorkspaceClient({
+    async query() { throw new Error("not reached"); },
+    async command(operation, payload) { calls.push([operation, payload]); return { result: { revision: 1 } }; },
+  });
+  await workspace.createFolder({ projectId: "project-a", name: "Servers" });
+  await workspace.renameFolder({ folderId: "folder:r3", name: "Dev servers" });
+  await workspace.reorderFolders({ projectId: "project-a", folderIds: ["folder:r1", "folder:r3"] });
+  await workspace.movePanelToFolder({ panelId: "panel-a", folderId: "folder:r3", index: 0 });
+  await workspace.reorderPanels({ projectId: "project-a", folderId: "folder:r3", panelIds: ["panel-a"] });
+  await workspace.createPanel({ panel: { id: "panel-file", projectId: "project-a", folderId: "folder:r3", type: "file", path: "README.md", createdAt: 1 } });
+  await workspace.answerFolderOffer("folder:r3", "accept");
+  await workspace.answerFolderOffer("folder:r3", "decline");
+  await workspace.deleteFolder("folder:r3");
+  assert.deepEqual(calls.map(([operation]) => operation), Array(9).fill("workspace.command"));
+  assert.deepEqual(calls.map(([, payload]) => payload.command), [
+    { type: "folder.create", projectId: "project-a", name: "Servers" },
+    { type: "folder.rename", folderId: "folder:r3", name: "Dev servers" },
+    { type: "folder.reorder", projectId: "project-a", folderIds: ["folder:r1", "folder:r3"] },
+    { type: "panel.moveToFolder", panelId: "panel-a", folderId: "folder:r3", index: 0 },
+    { type: "panel.reorder", projectId: "project-a", folderId: "folder:r3", panelIds: ["panel-a"] },
+    { type: "panel.create", panel: { id: "panel-file", projectId: "project-a", folderId: "folder:r3", type: "file", path: "README.md", createdAt: 1 } },
+    { type: "folder.offer.accept", folderId: "folder:r3" },
+    { type: "folder.offer.decline", folderId: "folder:r3" },
+    { type: "folder.delete", folderId: "folder:r3" },
+  ]);
+
+  await assert.rejects(workspace.createFolder({ projectId: "project-a", name: "  " }), /folder create request is invalid/);
+  await assert.rejects(workspace.createFolder({ projectId: "project-a", name: "x".repeat(257) }), /folder create request is invalid/);
+  await assert.rejects(workspace.renameFolder({ folderId: "bad id", name: "x" }), /folder rename request is invalid/);
+  await assert.rejects(workspace.reorderFolders({ projectId: "project-a", folderIds: ["folder:r1", "folder:r1"] }), /folder reorder ids are invalid/);
+  await assert.rejects(workspace.movePanelToFolder({ panelId: "panel-a", folderId: "bad id" }), /panel folder move request is invalid/);
+  await assert.rejects(workspace.movePanelToFolder({ panelId: "panel-a", folderId: "folder:r3", index: -1 }), /panel folder move request is invalid/);
+  await assert.rejects(workspace.reorderPanels({ projectId: "project-a", folderId: "bad id", panelIds: ["panel-a"] }), /panel reorder ids are invalid/);
+  await assert.rejects(workspace.answerFolderOffer("folder:r3", "maybe"), /folder offer answer is invalid/);
+  await assert.rejects(workspace.deleteFolder("bad id"), /folder delete id is invalid/);
+  assert.equal(calls.length, 9);
+});
+
+test("workspace facade starts a project, reads and forgets recent folders, and browses server folders by name", async () => {
+  const calls = [];
+  const workspace = new WorkspaceClient({
+    async query(operation, payload) {
+      calls.push([operation, payload]);
+      if (operation === "recent.list") return { result: { revision: 4, entries: [{ path: "/srv/a", usedAt: 9, available: false }] } };
+      return { result: { path: "/home/mark", parent: "/home", entries: [{ name: "code" }], truncated: true } };
+    },
+    async command(operation, payload) {
+      calls.push([operation, payload]);
+      if (operation === "recent.forget") return { result: { forgotten: true, revision: 6, cursor: "6" } };
+      return { result: { projectId: "project-a", root: "", rootOrigin: "none", revision: 5, cursor: "5" } };
+    },
+  });
+  assert.deepEqual(await workspace.startProject({ projectId: "project-a", choice: { kind: "home" } }), { projectId: "project-a", root: "", rootOrigin: "none", revision: 5, cursor: "5" });
+  assert.equal((await workspace.listRecentProjectFolders()).entries[0].available, false);
+  assert.deepEqual(await workspace.forgetRecentProjectFolder("/srv/a"), { forgotten: true, revision: 6, cursor: "6" });
+  assert.equal((await workspace.browseRootFolders()).truncated, true);
+  await workspace.browseRootFolders("~/code");
+  assert.deepEqual(calls, [
+    ["project.start", { projectId: "project-a", choice: { kind: "home" } }],
+    ["recent.list", {}],
+    ["recent.forget", { path: "/srv/a" }],
+    ["fs.browse-root-folders", {}],
+    ["fs.browse-root-folders", { path: "~/code" }],
+  ]);
+});
+
+test("workspace facade rejects malformed start choices and answers that name another project", async () => {
+  const calls = [];
+  const workspace = new WorkspaceClient({
+    async command(operation, payload) { calls.push([operation, payload]); return { result: { projectId: "project-b", root: "/srv/b", rootOrigin: "explicit", revision: 2, cursor: "2" } }; },
+    async query() { return { result: { path: "/x", entries: [{ name: "../escape" }], truncated: false } }; },
+  });
+  await assert.rejects(workspace.startProject({ projectId: "project-a", choice: { kind: "folder", path: "" } }), /project start request is invalid/);
+  await assert.rejects(workspace.startProject({ projectId: "project-a", choice: { kind: "root" } }), /project start request is invalid/);
+  assert.deepEqual(calls, []);
+  await assert.rejects(workspace.startProject({ projectId: "project-a", choice: { kind: "folder", path: "/srv/b" } }), /identity is invalid/);
+  await assert.rejects(workspace.browseRootFolders(), /folder browse result is invalid/);
+});
+
+test("a project with no root folder can be renamed and keeps having none", async () => {
+  const calls = [];
+  const workspace = new WorkspaceClient({ async command(_operation, payload) { calls.push(payload.command); return { result: null }; } });
+  await workspace.updateProject({ projectId: "project-a", name: "Scratch", root: "", color: "#fff", icon: "" });
+  assert.equal(calls[0].root, "");
+});

@@ -1,0 +1,109 @@
+// @see - https://www.electron.build/configuration/configuration
+{
+  "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
+  "appId": "com.terminay.app",
+  "asar": true,
+  // Electron's sandboxed preload and the MCP stdio entry launched with
+  // ELECTRON_RUN_AS_NODE must resolve as regular files.
+  "asarUnpack": [
+    "dist-electron/**"
+  ],
+  "productName": "Terminay",
+  // electron-updater reads latest-mac.yml / latest-linux.yml from the GitHub
+  // release; electron-builder writes them beside the artifacts because this
+  // block exists. Every build still passes --publish never: the release
+  // workflow uploads the payloads itself and attaches the metadata last,
+  // after the release notes are final.
+  "publish": {
+    "provider": "github",
+    "owner": "markwylde",
+    "repo": "terminay",
+    "releaseType": "release"
+  },
+  "directories": {
+    "output": "release/${version}"
+  },
+  "files": [
+    "dist",
+    "dist-web",
+    "dist-electron",
+    // Icon component libraries. Only the renderer imports them and Vite
+    // bundles what it uses, so their installed copies are never loaded.
+    // They were 27,000 of the 48,000 files in app.asar.
+    "!**/node_modules/@tabler/**",
+    "!**/node_modules/lucide-react/**"
+  ],
+  // The selection record is always packaged. Release preparation stages the
+  // verified self-contained runtime beside it; the production loader fails
+  // closed when that payload is absent or does not match the record.
+  "extraResources": [
+    {
+      "from": "build/webrtc-runtime",
+      "to": "webrtc-runtime"
+    },
+    {
+      "from": "node_modules/@esbuild",
+      "to": "esbuild"
+    },
+    // Extension children execute their packed ESM from ordinary files; do not
+    // place this release-verified payload in app.asar.
+    {
+      "from": "build/built-in-extensions",
+      "to": "built-in-extensions"
+    }
+  ],
+  "mac": {
+    "icon": "public/icon.icns",
+    "hardenedRuntime": true,
+    // Built-in extension native modules are signed while staging, before the
+    // release inventory hashes them; re-signing here would change their bytes.
+    "signIgnore": [
+      "built-in-extensions/.+\\.node$"
+    ],
+    "entitlements": "build/entitlements.mac.plist",
+    "entitlementsInherit": "build/entitlements.mac.inherit.plist",
+    "extendInfo": {
+      "NSMicrophoneUsageDescription": "Terminay uses the microphone to record dictation and transcribe it into the active terminal."
+    },
+    // Squirrel.Mac installs updates from the zip; the DMG stays the installer.
+    "target": [
+      "dmg",
+      "zip"
+    ],
+    "artifactName": "${productName}-Mac-${version}.${ext}"
+  },
+  "dmg": {
+    "artifactName": "${productName}-Mac-${version}-Installer.${ext}",
+    // The release stapler rewrites the DMG after it is built, so its digest
+    // would go stale in latest-mac.yml. Updates come only from the zip.
+    "writeUpdateInfo": false
+  },
+  "win": {
+    "icon": "public/terminay.png",
+    "target": [
+      {
+        "target": "nsis",
+        "arch": [
+          "x64"
+        ]
+      }
+    ],
+    "artifactName": "${productName}-Windows-${version}-Setup.${ext}"
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "deleteAppDataOnUninstall": false
+  },
+  "linux": {
+    "icon": "public/terminay.png",
+    // Pinned rather than derived from the workspace package name, which is
+    // private and says nothing about what the binary is called.
+    "executableName": "terminay",
+    "target": [
+      "AppImage"
+    ],
+    "artifactName": "${productName}-Linux-${version}.${ext}"
+  }
+}

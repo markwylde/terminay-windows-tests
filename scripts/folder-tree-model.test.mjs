@@ -1,0 +1,390 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import {
+	buildFolderTree,
+	folderAttentionState,
+	folderDisplayName,
+	folderIdOfPanel,
+	folderLabelText,
+	generalFolderIdOf,
+	isChangeDirty,
+	linkedFolderLabel,
+	resolveSelectedFolderId,
+} from '../src/workspace/folderTreeModel.ts';
+
+const terminal = (id, folderId, extra = {}) => ({ id, projectId: 'project-a', folderId, type: 'terminal', sessionId: `s-${id}`, ...extra });
+
+/** General with a dev server and an agent; a linked folder with one terminal
+ * and a file panel; an empty linked folder; a plain folder. */
+function workspace(overrides = {}) {
+	const panels = {
+		dev: terminal('dev', 'general', { title: 'npm run dev' }),
+		agent: terminal('agent', 'general', { title: 'one project, one window' }),
+		release: terminal('release', 'releases', { title: 'release notes' }),
+		readme: { id: 'readme', projectId: 'project-a', folderId: 'releases', type: 'file', path: 'README.md' },
+		ssh: terminal('ssh', 'servers'),
+		...overrides.panels,
+	};
+	const folder = (id, name, kind, panelIds, extra = {}) => ({ id, projectId: 'project-a', name, kind, panelIds, ...extra });
+	const folders = {
+		general: folder('general', 'General', 'general', ['dev', 'agent']),
+		releases: folder('releases', 'Releases', 'linked', ['release', 'readme'], { worktree: { repositoryId: 'repo', path: '/repo/.worktrees/release-notes' } }),
+		window: folder('window', 'one-project-one-window', 'linked', [], { worktree: { repositoryId: 'repo', path: '/repo/.worktrees/one-project-one-window' } }),
+		servers: folder('servers', 'Servers', 'plain', ['ssh']),
+		...overrides.folders,
+	};
+	return {
+		project: { id: 'project-a', root: '/repo', folderIds: ['general', 'releases', 'window', 'servers'] },
+		folders,
+		panels,
+		worktrees: [
+			{ path: '/repo', branch: 'main' },
+			{ path: '/repo/.worktrees/release-notes', branch: 'fix/release-notes', pullRequest: { number: 351, state: 'open', title: 'Release notes' }, checks: { failed: 0, pending: 0, passed: 26, skipped: 0 } },
+			{ path: '/repo/.worktrees/one-project-one-window', branch: 'feat/one-project-one-window' },
+		],
+		...overrides.input,
+	};
+}
+const byId = (rows) => Object.fromEntries(rows.map((row) => [row.id, row]));
+
+test('folders are listed in order, each with every panel it holds', () => {
+	const rows = buildFolderTree(workspace());
+	// A linked folder is named by its worktree's branch, whatever name the
+	// server holds for it; General and a plain folder keep their own.
+	assert.deepEqual(rows.map((row) => row.name), ['General', 'fix/release-notes', 'feat/one-project-one-window', 'Servers']);
+	const tree = byId(rows);
+	assert.deepEqual(tree.general.panels.map((row) => row.title), ['npm run dev', 'one project, one window']);
+	// The file panel is a row of its folder, after the terminal before it.
+	assert.deepEqual(tree.releases.panels.map((row) => [row.panelId, row.kind]), [['release', 'terminal'], ['readme', 'file']]);
+	assert.equal(tree.releases.isEmpty, false);
+	assert.deepEqual(tree.window.panels, []);
+	assert.equal(tree.window.isEmpty, true);
+	// A terminal with no title of its own still has a label.
+	assert.equal(tree.servers.panels[0].title, 'Terminal');
+});
+
+test('a folder lists terminals, files and folder tabs in panel order', () => {
+	const input = workspace({
+		panels: {
+			notes: { id: 'notes', projectId: 'project-a', folderId: 'general', type: 'file', path: '/repo/docs/notes.md', title: 'notes.md' },
+			src: { id: 'src', projectId: 'project-a', folderId: 'general', type: 'folder', path: '/repo/src' },
+		},
+		folders: {
+			general: { id: 'general', projectId: 'project-a', name: 'General', kind: 'general', panelIds: ['notes', 'dev', 'src', 'agent'] },
+		},
+		input: {
+			selectedFolderId: 'general',
+			activePanelId: 'notes',
+			panelFacts: (panelId) => (panelId === 'src' ? { status: 'idle', title: 'src — repo' } : undefined),
+		},
+	});
+	const { general, releases } = byId(buildFolderTree(input));
+	assert.deepEqual(
+		general.panels.map((row) => [row.panelId, row.kind, row.title, row.isActive]),
+		[
+			['notes', 'file', 'notes.md', true],
+			['dev', 'terminal', 'npm run dev', false],
+			// Titled by what its tab shows, as the inventory reads it.
+			['src', 'folder', 'src — repo', false],
+			['agent', 'terminal', 'one project, one window', false],
+		],
+	);
+	// Only a terminal has a session and a status.
+	assert.equal('sessionId' in general.panels[0], false);
+	assert.equal('status' in general.panels[0], false);
+	assert.equal(general.panels[1].sessionId, 's-dev');
+	// A file with no title is named by its path, as its tab is.
+	assert.equal(releases.panels[1].title, 'README.md');
+});
+
+test('a folder holding only a file is not empty', () => {
+	const input = workspace({
+		folders: {
+			window: { id: 'window', projectId: 'project-a', name: 'one-project-one-window', kind: 'linked', panelIds: ['readme'], worktree: { repositoryId: 'repo', path: '/repo/.worktrees/one-project-one-window' } },
+		},
+	});
+	const { window: folder } = byId(buildFolderTree(input));
+	assert.equal(folder.isEmpty, false);
+	assert.deepEqual(folder.panels.map((row) => row.kind), ['file']);
+});
+
+test('a linked folder shows its branch, pull request and checks; General shows the root checkout branch; a plain folder shows none', () => {
+	const tree = byId(buildFolderTree(workspace()));
+	assert.equal(tree.general.branch, 'main');
+	assert.equal(tree.general.pullRequest, undefined);
+	assert.equal(tree.general.worktreePath, undefined);
+	assert.equal(tree.releases.branch, 'fix/release-notes');
+	assert.equal(tree.releases.pullRequest.number, 351);
+	assert.equal(tree.releases.checks.passed, 26);
+	assert.equal(tree.releases.worktreePath, '/repo/.worktrees/release-notes');
+	assert.equal(tree.window.branch, 'feat/one-project-one-window');
+	assert.equal(tree.window.pullRequest, undefined);
+	assert.equal(tree.servers.branch, undefined);
+});
+
+test('a linked folder is labelled by its branch, by its directory when it has none, and by both when the branch is shared', () => {
+	const worktrees = [
+		{ path: '/repo', branch: 'main' },
+		{ path: '/repo/.worktrees/reorder-rows', branch: 'feat/reorder-rows' },
+		{ path: '/repo/.worktrees/bisect-crash', branch: '(detached)', isDetached: true, head: '16be2864aa' },
+		{ path: '/repo/.worktrees/hotfix-copy', branch: 'main' },
+		{ path: '/repo/.worktrees/pair-a', branch: 'feat/pair' },
+		{ path: '/repo/.worktrees/pair-b', branch: 'feat/pair' },
+		{ path: '/repo/.worktrees/also-detached', branch: '(detached)', isDetached: true, head: '16be2864aa' },
+	];
+	const label = (path) => linkedFolderLabel(path, worktrees);
+	assert.deepEqual(label('/repo/.worktrees/reorder-rows'), { text: 'feat/reorder-rows' });
+	// No branch to name it by: the directory does.
+	assert.deepEqual(label('/repo/.worktrees/bisect-crash'), { text: 'bisect-crash' });
+	// Not in the listing, or no listing at all.
+	assert.deepEqual(label('/repo/.worktrees/unlisted'), { text: 'unlisted' });
+	assert.deepEqual(linkedFolderLabel('/repo/.worktrees/reorder-rows', undefined), { text: 'reorder-rows' });
+	// Forced onto the root checkout's branch, and two linked worktrees on one.
+	assert.deepEqual(label('/repo/.worktrees/hotfix-copy'), { text: 'main', suffix: 'hotfix-copy' });
+	assert.deepEqual(label('/repo/.worktrees/pair-a'), { text: 'feat/pair', suffix: 'pair-a' });
+	assert.deepEqual(label('/repo/.worktrees/pair-b'), { text: 'feat/pair', suffix: 'pair-b' });
+	// Two detached worktrees share a detached label, not a branch.
+	assert.deepEqual(label('/repo/.worktrees/also-detached'), { text: 'also-detached' });
+
+	assert.equal(folderLabelText({ text: 'main', suffix: 'hotfix-copy' }), 'main (hotfix-copy)');
+	assert.equal(folderLabelText({ text: 'feat/reorder-rows' }), 'feat/reorder-rows');
+
+	const folder = (kind, name, path) => ({ kind, name, ...(path === undefined ? {} : { worktree: { repositoryId: 'repo', path } }) });
+	assert.equal(folderDisplayName(folder('linked', 'renamed by a user', '/repo/.worktrees/reorder-rows'), worktrees), 'feat/reorder-rows');
+	assert.equal(folderDisplayName(folder('linked', 'hotfix-copy', '/repo/.worktrees/hotfix-copy'), worktrees), 'main (hotfix-copy)');
+	assert.equal(folderDisplayName(folder('plain', 'Servers'), worktrees), 'Servers');
+	assert.equal(folderDisplayName(folder('general', 'General'), worktrees), 'General');
+});
+
+test('a linked row carries its label and what its details say; General and a plain folder carry neither', () => {
+	const tree = byId(buildFolderTree(workspace()));
+	assert.deepEqual(tree.releases.label, { text: 'fix/release-notes' });
+	assert.deepEqual(tree.releases.details, {
+		branch: 'fix/release-notes',
+		worktree: 'release-notes',
+		location: '/repo/.worktrees/release-notes',
+	});
+	assert.equal(tree.general.label, undefined);
+	assert.equal(tree.general.details, undefined);
+	assert.equal(tree.servers.label, undefined);
+	assert.equal(tree.servers.details, undefined);
+
+	const detached = byId(
+		buildFolderTree(
+			workspace({
+				input: {
+					worktrees: [
+						{ path: '/repo', branch: 'main' },
+						{ path: '/repo/.worktrees/release-notes', branch: '(detached)', isDetached: true, head: '16be2864aabbccdd' },
+						{ path: '/repo/.worktrees/one-project-one-window', branch: 'main' },
+					],
+				},
+			}),
+		),
+	);
+	assert.equal(detached.releases.name, 'release-notes');
+	assert.equal(detached.releases.details.branch, 'detached at 16be2864');
+	// On the root checkout's branch: the directory tells it from General.
+	assert.deepEqual(detached.window.label, { text: 'main', suffix: 'one-project-one-window' });
+	assert.equal(detached.window.name, 'main (one-project-one-window)');
+	assert.equal(detached.general.name, 'General');
+
+	// Before any listing arrives a linked folder is named by its directory.
+	const unlisted = byId(buildFolderTree(workspace({ input: { worktrees: undefined } })));
+	assert.equal(unlisted.window.name, 'one-project-one-window');
+	assert.equal(unlisted.window.details.branch, 'unknown');
+});
+
+test('a project that is not a repository shows no branch on any folder', () => {
+	const input = workspace({ input: { worktrees: undefined } });
+	input.project = { ...input.project, folderIds: ['general', 'servers'] };
+	const rows = buildFolderTree(input);
+	assert.deepEqual(rows.map((row) => [row.name, row.branch]), [['General', undefined], ['Servers', undefined]]);
+});
+
+test('General stands for the deepest checkout containing the project root', () => {
+	const input = workspace();
+	input.project = { ...input.project, root: '/repo/.worktrees/release-notes/' };
+	assert.equal(byId(buildFolderTree(input)).general.branch, 'fix/release-notes');
+	input.project = { ...input.project, root: '/repo/packages/app' };
+	assert.equal(byId(buildFolderTree(input)).general.branch, 'main');
+	input.project = { ...input.project, root: '/repository-elsewhere' };
+	assert.equal(byId(buildFolderTree(input)).general.branch, undefined);
+});
+
+test('status and titles come from what is known about each panel, and default quietly', () => {
+	const facts = { agent: { status: 'waiting', title: 'Reviewing the plan' }, dev: { status: 'working' } };
+	const tree = byId(buildFolderTree(workspace({ input: { panelFacts: (panelId) => facts[panelId] } })));
+	assert.deepEqual(tree.general.panels.map((row) => [row.title, row.status]), [['npm run dev', 'working'], ['Reviewing the plan', 'waiting']]);
+	assert.equal(tree.releases.panels[0].status, 'idle');
+});
+
+test('the selected folder and active terminal are marked, and only in the selected folder', () => {
+	const tree = byId(buildFolderTree(workspace({ input: { selectedFolderId: 'releases', activePanelId: 'release' } })));
+	assert.equal(tree.releases.isSelected, true);
+	assert.equal(tree.general.isSelected, false);
+	assert.equal(tree.releases.panels[0].isActive, true);
+	// The project's active panel is not marked when another folder is selected.
+	const other = byId(buildFolderTree(workspace({ input: { selectedFolderId: 'general', activePanelId: 'release' } })));
+	assert.equal(other.releases.panels[0].isActive, false);
+	assert.equal(other.general.isSelected, true);
+});
+
+test('a device with no remembered folder, or a folder that is gone, shows General', () => {
+	const { project, folders } = workspace();
+	assert.equal(resolveSelectedFolderId(project, folders, undefined), 'general');
+	assert.equal(resolveSelectedFolderId(project, folders, 'servers'), 'servers');
+	assert.equal(resolveSelectedFolderId(project, folders, 'folder-deleted'), 'general');
+	// A folder of another project is never selected here.
+	assert.equal(resolveSelectedFolderId(project, { ...folders, foreign: { id: 'foreign' } }, 'foreign'), 'general');
+	assert.equal(byId(buildFolderTree(workspace({ input: { selectedFolderId: 'folder-deleted' } }))).general.isSelected, true);
+});
+
+test('General is found by its kind, and is still what a device shows by default, wherever it is in the order', () => {
+	const { project, folders } = workspace();
+	for (const folderIds of [
+		['general', 'releases', 'window', 'servers'],
+		['releases', 'general', 'window', 'servers'],
+		['releases', 'window', 'servers', 'general'],
+	]) {
+		const moved = { ...project, folderIds };
+		assert.equal(generalFolderIdOf(moved, folders), 'general');
+		assert.equal(resolveSelectedFolderId(moved, folders, undefined), 'general');
+		assert.equal(resolveSelectedFolderId(moved, folders, 'folder-deleted'), 'general');
+		assert.equal(resolveSelectedFolderId(moved, folders, 'servers'), 'servers');
+		const input = workspace();
+		input.project = moved;
+		const rows = buildFolderTree(input);
+		assert.deepEqual(rows.map((row) => row.id), folderIds);
+		assert.deepEqual(rows.filter((row) => row.isSelected).map((row) => row.id), ['general']);
+		// General stands for the project root's checkout in any place.
+		assert.equal(byId(rows).general.branch, 'main');
+	}
+	assert.equal(generalFolderIdOf({ folderIds: ['servers'] }, folders), undefined);
+});
+
+test('a terminal that created a worktree is tagged until it is in that folder, and an offer names it', () => {
+	const offered = workspace({
+		folders: {
+			window: { id: 'window', projectId: 'project-a', name: 'one-project-one-window', kind: 'linked', panelIds: [], worktree: { repositoryId: 'repo', path: '/repo/.worktrees/one-project-one-window' }, createdByPanelId: 'agent', captureOffer: { panelId: 'agent' } },
+		},
+	});
+	const tree = byId(buildFolderTree(offered));
+	assert.equal(tree.general.panels[1].createdWorktree, 'one-project-one-window');
+	assert.equal(tree.general.panels[0].createdWorktree, undefined);
+	assert.deepEqual(tree.window.offer, { panelId: 'agent', title: 'one project, one window' });
+
+	// Once it has moved in, the tag goes.
+	const moved = structuredClone(offered);
+	moved.folders.general.panelIds = ['dev'];
+	moved.folders.window.panelIds = ['agent'];
+	delete moved.folders.window.captureOffer;
+	moved.panels.agent.folderId = 'window';
+	const after = byId(buildFolderTree(moved));
+	assert.equal(after.window.panels[0].createdWorktree, undefined);
+	assert.equal(after.window.offer, undefined);
+});
+
+test('the folder of a panel is read from the projection', () => {
+	const { panels } = workspace();
+	assert.equal(folderIdOfPanel(panels, 'release'), 'releases');
+	assert.equal(folderIdOfPanel(panels, 'missing'), undefined);
+});
+
+test('General carries the change of the root checkout, and never a pull request or checks', () => {
+	const input = workspace();
+	input.worktrees[0] = {
+		...input.worktrees[0],
+		change: { kind: 'delta', additions: 12, deletions: 3 },
+		pullRequest: { number: 9, state: 'open', title: 'Root' },
+		checks: { failed: 0, pending: 1, passed: 0, skipped: 0 },
+	};
+	const tree = byId(buildFolderTree(input));
+	assert.deepEqual(tree.general.change, { kind: 'delta', additions: 12, deletions: 3 });
+	assert.equal(tree.general.isDirty, true);
+	assert.equal(tree.general.pullRequest, undefined);
+	assert.equal(tree.general.checks, undefined);
+	// A plain folder has no checkout to measure.
+	assert.equal(tree.servers.change, undefined);
+	assert.equal(tree.servers.isDirty, false);
+});
+
+test('a checkout is dirty with a measured or unmeasured change, and not when clean, missing, or unknown', () => {
+	assert.equal(isChangeDirty({ kind: 'delta', additions: 1, deletions: 0 }), true);
+	assert.equal(isChangeDirty({ kind: 'changed' }), true);
+	assert.equal(isChangeDirty({ kind: 'clean' }), false);
+	assert.equal(isChangeDirty({ kind: 'missing' }), false);
+	assert.equal(isChangeDirty(undefined), false);
+	const withChange = (change) => {
+		const input = workspace();
+		input.worktrees[1] = { ...input.worktrees[1], change };
+		return byId(buildFolderTree(input)).releases.isDirty;
+	};
+	assert.equal(withChange({ kind: 'changed' }), true);
+	assert.equal(withChange({ kind: 'clean' }), false);
+	assert.equal(withChange({ kind: 'missing' }), false);
+	assert.equal(withChange(undefined), false);
+});
+
+test('a folder is unmerged when its worktree is, whether or not it is dirty', () => {
+	const input = workspace();
+	input.worktrees[1] = {
+		...input.worktrees[1],
+		change: { kind: 'clean' },
+		unmerged: { commits: 4 },
+	};
+	const tree = byId(buildFolderTree(input));
+	assert.deepEqual(tree.releases.unmerged, { commits: 4 });
+	assert.equal(tree.releases.isDirty, false);
+	assert.equal(tree.general.unmerged, undefined);
+});
+
+test('a linked folder is deleting while its worktree is being removed, and no other folder is', () => {
+	const none = byId(buildFolderTree(workspace()));
+	assert.equal(none.releases.isDeleting, false);
+	const tree = byId(
+		buildFolderTree(
+			workspace({
+				input: {
+					// The root checkout is never removed, whatever the set says.
+					deletingWorktreePaths: new Set(['/repo/.worktrees/release-notes', '/repo']),
+				},
+			}),
+		),
+	);
+	assert.equal(tree.releases.isDeleting, true);
+	assert.equal(tree.window.isDeleting, false);
+	assert.equal(tree.general.isDeleting, false);
+	assert.equal(tree.servers.isDeleting, false);
+});
+
+test('a folder is pulling while its worktree is pulled, General included, and a plain folder never is', () => {
+	const none = byId(buildFolderTree(workspace()));
+	assert.equal(none.releases.isPulling, false);
+	assert.equal(none.general.isPulling, false);
+	const tree = byId(
+		buildFolderTree(
+			workspace({
+				input: {
+					pullingWorktreePaths: new Set(['/repo/.worktrees/release-notes', '/repo']),
+				},
+			}),
+		),
+	);
+	assert.equal(tree.releases.isPulling, true);
+	// General stands for the root checkout.
+	assert.equal(tree.general.isPulling, true);
+	assert.equal(tree.window.isPulling, false);
+	assert.equal(tree.servers.isPulling, false);
+});
+
+test('a folder sums its terminals up as the most urgent state among them, and as nothing when all are idle', () => {
+	const row = (status) => ({ kind: 'terminal', panelId: status, sessionId: status, title: status, status, isActive: false });
+	const file = { kind: 'file', panelId: 'f', title: 'notes.txt', isActive: false };
+	assert.equal(folderAttentionState([]), undefined);
+	assert.equal(folderAttentionState([row('idle'), file]), undefined);
+	assert.equal(folderAttentionState([row('idle'), row('done')]), 'done');
+	assert.equal(folderAttentionState([row('done'), row('working')]), 'working');
+	assert.equal(folderAttentionState([row('working'), row('waiting'), row('done')]), 'waiting');
+	assert.equal(folderAttentionState([row('waiting'), row('blocked'), row('working')]), 'blocked');
+});

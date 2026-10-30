@@ -1,0 +1,329 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import { HELP_TEXT, parseCommandLine, UsageError } from '../dist/args.js';
+
+function parse(...argv) {
+	return parseCommandLine(argv);
+}
+
+function usage(...argv) {
+	return assert.throws(() => parseCommandLine(argv), UsageError);
+}
+
+test('every daemon command parses', () => {
+	for (const command of [
+		'install',
+		'uninstall',
+		'start',
+		'stop',
+		'status',
+		'upgrade',
+		'qr-code',
+		'approvals',
+		'reset-identity',
+	]) {
+		assert.equal(parse('daemon', command).command, command, command);
+	}
+	assert.equal(parse('daemon', 'approve', 'abc').command, 'approve');
+	assert.equal(parse('daemon', 'deny', 'abc').command, 'deny');
+});
+
+test('pairing-url is an alias for qr-code', () => {
+	assert.equal(parse('daemon', 'pairing-url').command, 'qr-code');
+	assert.equal(parse('daemon', 'pairing-url', '--no-wait').options.wait, false);
+});
+
+test('help is reachable with no arguments, `help`, and --help anywhere', () => {
+	assert.equal(parse().command, 'help');
+	assert.equal(parse('help').command, 'help');
+	assert.equal(parse('--help').command, 'help');
+	assert.equal(parse('daemon').command, 'help');
+	assert.equal(parse('daemon', 'install', '--help').command, 'help');
+	assert.match(HELP_TEXT, /npx terminay daemon <command>/u);
+});
+
+test('install takes an optional reference', () => {
+	assert.equal(parse('daemon', 'install').ref, undefined);
+	assert.equal(parse('daemon', 'install', 'v4.1.1').ref, 'v4.1.1');
+	assert.equal(parse('daemon', 'install', 'main').ref, 'main');
+	assert.equal(
+		parse('daemon', 'upgrade', 'feature/branch').ref,
+		'feature/branch',
+	);
+	usage('daemon', 'install', 'v4.1.1', 'extra');
+});
+
+test('approve and deny require exactly one valid approval id', () => {
+	assert.equal(parse('daemon', 'approve', 'device-7').approvalId, 'device-7');
+	usage('daemon', 'approve');
+	usage('daemon', 'deny');
+	usage('daemon', 'approve', 'a', 'b');
+	usage('daemon', 'approve', '../escape');
+});
+
+test('commands that take no arguments reject them', () => {
+	usage('daemon', 'status', 'extra');
+	usage('daemon', 'approvals', 'extra');
+});
+
+test('value flags accept both spellings and reject a missing value', () => {
+	assert.equal(
+		parse('daemon', 'install', '--run-as', 'ci').options.runAs,
+		'ci',
+	);
+	assert.equal(parse('daemon', 'install', '--run-as=ci').options.runAs, 'ci');
+	usage('daemon', 'install', '--run-as');
+	usage('daemon', 'install', '--run-as', '--system');
+	usage('daemon', 'install', '--run-as=');
+	usage('daemon', 'install', '--run-as', 'a', '--run-as', 'b');
+});
+
+test('unknown flags are rejected', () => {
+	usage('daemon', 'install', '--nope');
+	usage('daemon', 'install', '--force');
+});
+
+test('flags are rejected by commands that do not accept them', () => {
+	usage('daemon', 'upgrade', '--purge');
+	usage('daemon', 'status', '--mode', 'direct');
+	usage('daemon', 'install', '--allow-downgrade');
+	usage('daemon', 'start', '--no-wait');
+});
+
+test('unknown commands are rejected', () => {
+	usage('daemon', 'reinstall');
+	usage('service', 'install');
+});
+
+test('scope flags are exclusive', () => {
+	assert.equal(parse('daemon', 'install', '--system').options.scope, 'system');
+	assert.equal(parse('daemon', 'install', '--user').options.scope, 'user');
+	assert.equal(parse('daemon', 'install').options.scope, undefined);
+	usage('daemon', 'install', '--system', '--user');
+});
+
+test('boolean flags do not take values', () => {
+	usage('daemon', 'uninstall', '--purge=true');
+	assert.equal(
+		parse('daemon', 'uninstall', '--purge', '--yes').options.purge,
+		true,
+	);
+	assert.equal(
+		parse('daemon', 'uninstall', '--purge', '--yes').options.yes,
+		true,
+	);
+});
+
+test('port and mode are validated', () => {
+	assert.equal(parse('daemon', 'install', '--port', '8443').options.port, 8443);
+	usage('daemon', 'install', '--port', '0');
+	usage('daemon', 'install', '--port', '70000');
+	usage('daemon', 'install', '--port', 'https');
+	assert.equal(
+		parse('daemon', 'qr-code', '--mode', 'direct').options.mode,
+		'direct',
+	);
+	usage('daemon', 'qr-code', '--mode', 'sideways');
+});
+
+test('remaining install flags reach the options', () => {
+	const parsed = parse(
+		'daemon',
+		'install',
+		'--direct-origin',
+		'https://box.example.com:8443',
+		'--hosted-domain',
+		'terminay.com',
+		'--expose',
+		'hosted,direct',
+		'--project-root',
+		'/srv/projects',
+	);
+	assert.equal(parsed.options.directOrigin, 'https://box.example.com:8443');
+	assert.equal(parsed.options.hostedDomain, 'terminay.com');
+	assert.equal(parsed.options.expose, 'hosted,direct');
+	assert.equal(parsed.options.projectRoot, '/srv/projects');
+});
+
+test('install and upgrade accept an advertised address', () => {
+	assert.equal(
+		parse('daemon', 'install', '--advertise-address', '192.168.1.20:51000')
+			.options.advertiseAddress,
+		'192.168.1.20:51000',
+	);
+	assert.equal(
+		parse('daemon', 'upgrade', '--advertise-address=[2001:db8::20]:51000')
+			.options.advertiseAddress,
+		'[2001:db8::20]:51000',
+	);
+});
+
+test('a loopback advertised address is refused, and the message names the remedy', () => {
+	// The address is written here and the failure it causes arrives minutes
+	// later, in a browser, as a message about data channels. Refusing is the
+	// only place the two are close enough together to connect.
+	assert.throws(
+		() =>
+			parseCommandLine([
+				'daemon',
+				'install',
+				'--advertise-address',
+				'127.0.0.1:51000',
+			]),
+		(error) =>
+			error instanceof UsageError &&
+			/loopback/u.test(error.message) &&
+			/routable address/u.test(error.message),
+	);
+	for (const value of [
+		'127.0.0.1:51000',
+		'127.0.1.1:51000',
+		'127.255.255.254:51000',
+		'[::1]:51000',
+		'[0:0:0:0:0:0:0:1]:51000',
+		'[0::1]:51000',
+		'[::ffff:127.0.0.1]:51000',
+	]) {
+		usage('daemon', 'install', '--advertise-address', value);
+		usage('daemon', 'upgrade', '--advertise-address', value);
+	}
+});
+
+test('a routable address that merely looks loopback-adjacent is accepted', () => {
+	// The refusal is 127.0.0.0/8 and ::1, not everything with a 1 in it.
+	for (const value of [
+		'128.0.0.1:51000',
+		'10.0.0.1:51000',
+		'192.168.1.20:51000',
+		'[2001:db8::1]:51000',
+		'[fe80::1]:51000',
+	]) {
+		assert.equal(
+			parse('daemon', 'install', '--advertise-address', value).options
+				.advertiseAddress,
+			value,
+		);
+	}
+});
+
+test('an empty advertised address is the clearing form, not a usage error', () => {
+	// Every other value flag rejects an empty value; this one is how an operator
+	// removes an address they set earlier.
+	assert.equal(
+		parse('daemon', 'upgrade', '--advertise-address', '').options
+			.advertiseAddress,
+		'',
+	);
+	assert.equal(
+		parse('daemon', 'upgrade', '--advertise-address=').options.advertiseAddress,
+		'',
+	);
+	usage('daemon', 'install', '--run-as=');
+});
+
+test('a hostname is refused, and the message says why', () => {
+	assert.throws(
+		() =>
+			parseCommandLine([
+				'daemon',
+				'install',
+				'--advertise-address',
+				'box.example.com:51000',
+			]),
+		(error) =>
+			error instanceof UsageError &&
+			/literal address and port/u.test(error.message),
+	);
+	usage('daemon', 'install', '--advertise-address', 'localhost:51000');
+});
+
+test('a malformed or out-of-range advertised address is refused', () => {
+	for (const value of [
+		'192.168.1.20',
+		'51000',
+		'192.168.1.20:',
+		'192.168.1.20:0',
+		'192.168.1.20:70000',
+		'300.0.0.1:51000',
+	]) {
+		usage('daemon', 'install', '--advertise-address', value);
+	}
+});
+
+test('commands that do not configure the server reject the flag', () => {
+	usage('daemon', 'status', '--advertise-address', '192.168.1.20:51000');
+	usage('daemon', 'qr-code', '--advertise-address', '192.168.1.20:51000');
+	usage('daemon', 'uninstall', '--advertise-address', '192.168.1.20:51000');
+});
+
+test('the help text documents the flag and that the port must be forwarded', () => {
+	assert.match(HELP_TEXT, /--advertise-address/u);
+	assert.match(HELP_TEXT, /forwarded/u);
+	// The example an operator copies has to be a value the CLI accepts.
+	assert.doesNotMatch(HELP_TEXT, /127\.0\.0\.1|\[::1\]/u);
+	assert.match(HELP_TEXT, /loopback address is refused/u);
+});
+
+test('--public-host is one address or name, on install and upgrade', () => {
+	assert.equal(
+		parse('daemon', 'install', '--public-host', '192.168.2.218').options
+			.publicHost,
+		'192.168.2.218',
+	);
+	assert.equal(
+		parse('daemon', 'upgrade', '--public-host=box.example.com').options
+			.publicHost,
+		'box.example.com',
+	);
+	// An IPv6 literal is taken with or without brackets and kept without.
+	assert.equal(
+		parse('daemon', 'install', '--public-host', '[2001:DB8::20]').options
+			.publicHost,
+		'2001:db8::20',
+	);
+	assert.equal(
+		parse('daemon', 'install', '--public-host', '2001:db8::20').options
+			.publicHost,
+		'2001:db8::20',
+	);
+	// Loopback and `localhost` are accepted: they derive the direct origin only.
+	assert.equal(
+		parse('daemon', 'install', '--public-host', '127.0.0.1').options.publicHost,
+		'127.0.0.1',
+	);
+	assert.equal(
+		parse('daemon', 'install', '--public-host', 'localhost').options.publicHost,
+		'localhost',
+	);
+	assert.equal(parse('daemon', 'install').options.publicHost, undefined);
+});
+
+test('a public host that is not a bare host is refused before anything runs', () => {
+	for (const value of [
+		'https://box.example.com',
+		'box.example.com:8443',
+		'192.168.2.218:51000',
+		'box.example.com/path',
+		'300.1.1.1',
+		'192.168.2',
+		'0.0.0.0',
+		'::',
+		'box example',
+		'-box.example.com',
+		'fe80::1%eth0',
+	]) {
+		usage('daemon', 'install', `--public-host=${value}`);
+	}
+	usage('daemon', 'install', '--public-host=');
+	usage('daemon', 'status', '--public-host', '192.168.2.218');
+	usage('daemon', 'qr-code', '--public-host', '192.168.2.218');
+});
+
+test('the help text documents the public host and the foreground and container behaviour', () => {
+	assert.match(HELP_TEXT, /--public-host <host>/u);
+	assert.match(HELP_TEXT, /51000-51003/u);
+	assert.match(HELP_TEXT, /routable literal address/u);
+	assert.match(HELP_TEXT, /TERMINAY_DATA_ROOT/u);
+	assert.match(HELP_TEXT, /container runtime manages the server/u);
+});

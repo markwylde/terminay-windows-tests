@@ -1,0 +1,128 @@
+import path from 'node:path';
+import type { WorkspaceState } from '../packages/server-core/src/workspace';
+import {
+	FileWorkspaceStateBackend,
+	WorkspacePersistenceError,
+	type WorkspaceStateBackend,
+} from '../packages/server-core/src/workspaceRepository';
+
+export { WorkspacePersistenceError };
+
+export type EmbeddedWorkspacePersistenceFault =
+	| 'unreadable'
+	| 'invalid'
+	| 'uncommittable';
+
+export function embeddedBuiltInExtensionArtifactRoot(
+	options: Readonly<{
+		appRoot: string;
+		isPackaged: boolean;
+		resourcesPath: string;
+	}>,
+): string {
+	return options.isPackaged
+		? path.join(options.resourcesPath, 'built-in-extensions')
+		: path.join(options.appRoot, 'build', 'built-in-extensions');
+}
+
+export function isEmbeddedWorkspacePersistenceError(
+	error: unknown,
+): error is WorkspacePersistenceError {
+	return error instanceof WorkspacePersistenceError;
+}
+
+/** Resolve the deterministic E2E-only persistence fault. Merely setting the
+ * fault variable in a production process has no effect. */
+export function embeddedWorkspacePersistenceFault(
+	environment: Readonly<Record<string, string | undefined>>,
+): EmbeddedWorkspacePersistenceFault | undefined {
+	if (environment.TERMINAY_TEST !== '1') return undefined;
+	const value = environment.TERMINAY_TEST_WORKSPACE_PERSISTENCE_FAULT;
+	return value === 'unreadable' ||
+		value === 'invalid' ||
+		value === 'uncommittable'
+		? value
+		: undefined;
+}
+
+/** Production returns the ordinary atomic file backend. Tests may inject one
+ * closed failure phase without changing repository validation or recovery. */
+export function createEmbeddedWorkspaceStateBackend(
+	options: Readonly<{
+		filePath: string;
+		/** Compatibility transform applied and durably committed before the
+		 * canonical repository sees a restored snapshot. */
+		migrate?: (state: unknown) => unknown;
+		testFault?: EmbeddedWorkspacePersistenceFault;
+	}>,
+): WorkspaceStateBackend {
+	const fileBackend = new FileWorkspaceStateBackend(options.filePath);
+	const backend =
+		options.migrate === undefined
+			? fileBackend
+			: new MigratingWorkspaceStateBackend(fileBackend, options.migrate);
+	if (options.testFault === undefined) return backend;
+	return new FaultingWorkspaceStateBackend(backend, options.testFault);
+}
+
+class MigratingWorkspaceStateBackend implements WorkspaceStateBackend {
+	constructor(
+		private readonly backend: WorkspaceStateBackend,
+		private readonly migrate: (state: unknown) => unknown,
+	) {}
+
+	async load(): Promise<unknown | undefined> {
+		const state = await this.backend.load();
+		if (state === undefined) return undefined;
+		const migrated = this.migrate(state);
+		if (migrated !== state) {
+			await this.backend.commit(migrated as WorkspaceState);
+		}
+		return migrated;
+	}
+
+	commit(state: WorkspaceState): Promise<void> {
+		return this.backend.commit(state);
+	}
+
+	async preserveBeforeUpgrade(fromSchemaVersion: number): Promise<void> {
+		await this.backend.preserveBeforeUpgrade?.(fromSchemaVersion);
+	}
+
+	commitSync(state: WorkspaceState): void {
+		if (this.backend.commitSync === undefined)
+			throw new Error('embedded workspace backend lacks an atomic commit');
+		this.backend.commitSync(state);
+	}
+}
+
+class FaultingWorkspaceStateBackend implements WorkspaceStateBackend {
+	constructor(
+		private readonly backend: WorkspaceStateBackend,
+		private readonly fault: EmbeddedWorkspacePersistenceFault,
+	) {}
+
+	async load(): Promise<unknown | undefined> {
+		if (this.fault === 'unreadable') throw new Error('injected read failure');
+		if (this.fault === 'invalid') return { schemaVersion: 'invalid' };
+		return this.backend.load();
+	}
+
+	async commit(state: WorkspaceState): Promise<void> {
+		if (this.fault === 'uncommittable')
+			throw new Error('injected commit failure');
+		await this.backend.commit(state);
+	}
+
+	async preserveBeforeUpgrade(fromSchemaVersion: number): Promise<void> {
+		await this.backend.preserveBeforeUpgrade?.(fromSchemaVersion);
+	}
+
+	commitSync(state: WorkspaceState): void {
+		if (this.fault === 'uncommittable')
+			throw new Error('injected commit failure');
+		if (this.backend.commitSync === undefined)
+			throw new Error('embedded workspace backend lacks an atomic commit');
+		this.backend.commitSync(state);
+	}
+}

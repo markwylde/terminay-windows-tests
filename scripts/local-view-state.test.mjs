@@ -1,0 +1,790 @@
+import assert from 'node:assert/strict'
+import test, { after } from 'node:test'
+import { readFile } from 'node:fs/promises'
+import { build } from 'esbuild'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+
+/**
+ * Which terminal a device is looking at is that device's business.
+ *
+ * The workspace's contents are shared and must sync: a terminal existing, its
+ * name, its project, its output, its removal. The selection is not. A remote
+ * that jumps to a terminal the desktop just created has dragged its user off
+ * whatever they were reading, for a change they never asked for.
+ */
+/** Compiled once and shared. Each test resets the storage it observes, so a
+ * per-test rebuild bought nothing and cost an esbuild run apiece. */
+let compiled
+async function loadModule() {
+  compiled ??= (async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'terminay-local-view-state-'))
+    const outfile = join(directory, 'localViewState.mjs')
+    await build({
+      entryPoints: ['src/workspace/localViewState.ts'],
+      outfile,
+      bundle: true,
+      format: 'esm',
+      platform: 'neutral',
+      logLevel: 'silent',
+    })
+    return { module: await import(`file://${outfile}`), directory }
+  })()
+  const { module } = await compiled
+  return { module }
+}
+
+after(async () => {
+  if (compiled === undefined) return
+  const { directory } = await compiled
+  await rm(directory, { recursive: true, force: true })
+})
+
+function fakeStorage(initial = {}) {
+  const store = new Map(Object.entries(initial))
+  return {
+    getItem: (key) => (store.has(key) ? store.get(key) : null),
+    setItem: (key, value) => store.set(key, value),
+    removeItem: (key) => store.delete(key),
+    get size() { return store.size },
+    raw: store,
+  }
+}
+
+test('a terminal created on another device never steals this device\'s tab', async () => {
+  const { module } = await loadModule()
+  try {
+    assert.equal(
+      module.shouldActivateAdoptedTerminal({
+        requestedLocally: false,
+        hasActivePanel: true,
+        sessionId: 'session-3',
+      }),
+      false,
+    )
+  } finally {
+    /* the compiled module is shared; cleaned up by the process exit */
+  }
+})
+
+test('a terminal this device created or dragged in becomes active', async () => {
+  const { module } = await loadModule()
+  try {
+    assert.equal(
+      module.shouldActivateAdoptedTerminal({
+        requestedLocally: true,
+        hasActivePanel: true,
+        sessionId: 'session-3',
+      }),
+      true,
+    )
+  } finally {
+    /* the compiled module is shared; cleaned up by the process exit */
+  }
+})
+
+test('a device showing nothing adopts its first terminal rather than staying blank', async () => {
+  const { module } = await loadModule()
+  try {
+    assert.equal(
+      module.shouldActivateAdoptedTerminal({
+        requestedLocally: false,
+        hasActivePanel: false,
+        sessionId: 'session-1',
+      }),
+      true,
+      'a fresh device needs a default, taken from what it adopts first',
+    )
+    // ...and having taken one, it stops taking them.
+    assert.equal(
+      module.shouldActivateAdoptedTerminal({
+        requestedLocally: false,
+        hasActivePanel: true,
+        sessionId: 'session-2',
+      }),
+      false,
+    )
+  } finally {
+    /* the compiled module is shared; cleaned up by the process exit */
+  }
+})
+
+test('a reconnecting device restores its own remembered tab, not another device\'s', async () => {
+  const { module } = await loadModule()
+  try {
+    assert.equal(
+      module.shouldActivateAdoptedTerminal({
+        requestedLocally: false,
+        hasActivePanel: true,
+        rememberedSessionId: 'session-7',
+        sessionId: 'session-7',
+      }),
+      true,
+    )
+    assert.equal(
+      module.shouldActivateAdoptedTerminal({
+        requestedLocally: false,
+        hasActivePanel: true,
+        rememberedSessionId: 'session-7',
+        sessionId: 'session-9',
+      }),
+      false,
+      'other terminals adopted in the same pass must not take the tab',
+    )
+  } finally {
+    /* the compiled module is shared; cleaned up by the process exit */
+  }
+})
+
+test('a remembered tab is a hint: a workspace that changed entirely just falls back', async () => {
+  const { module } = await loadModule()
+  try {
+    globalThis.localStorage = fakeStorage()
+    module.rememberActiveSession('project-a', 'session-gone')
+    // Reconnected to a workspace whose terminals are all different.
+    assert.equal(
+      module.shouldActivateAdoptedTerminal({
+        requestedLocally: false,
+        hasActivePanel: false,
+        rememberedSessionId: module.recallActiveSession('project-a'),
+        sessionId: 'session-brand-new',
+      }),
+      true,
+      'the blank-device rule still supplies a default when the memory misses',
+    )
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('selection is remembered per project and per device', async () => {
+  const { module } = await loadModule()
+  try {
+    globalThis.localStorage = fakeStorage()
+    module.rememberActiveSession('project-a', 'session-1')
+    module.rememberActiveSession('project-b', 'session-2')
+    assert.equal(module.recallActiveSession('project-a'), 'session-1')
+    assert.equal(module.recallActiveSession('project-b'), 'session-2')
+    module.rememberActiveSession('project-a', 'session-3')
+    assert.equal(module.recallActiveSession('project-a'), 'session-3')
+    module.forgetActiveSession('project-a')
+    assert.equal(module.recallActiveSession('project-a'), undefined)
+    assert.equal(module.recallActiveSession('project-b'), 'session-2')
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('unavailable, corrupt, or throwing storage degrades to no memory', async () => {
+  const { module } = await loadModule()
+  try {
+    delete globalThis.localStorage
+    assert.equal(module.recallActiveSession('project-a'), undefined)
+    module.rememberActiveSession('project-a', 'session-1')
+
+    globalThis.localStorage = fakeStorage({ 'terminay.view.active-session.v1': '{not json' })
+    assert.equal(module.recallActiveSession('project-a'), undefined)
+
+    globalThis.localStorage = {
+      getItem: () => { throw new Error('storage disabled') },
+      setItem: () => { throw new Error('storage disabled') },
+    }
+    assert.equal(module.recallActiveSession('project-a'), undefined)
+    module.rememberActiveSession('project-a', 'session-1')
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('remembered projects are bounded so a long-lived profile cannot grow forever', async () => {
+  const { module } = await loadModule()
+  try {
+    globalThis.localStorage = fakeStorage()
+    for (let index = 0; index < 200; index += 1)
+      module.rememberActiveSession(`project-${index}`, `session-${index}`)
+    const stored = JSON.parse(globalThis.localStorage.getItem('terminay.view.active-session.v1'))
+    assert.ok(Object.keys(stored).length <= 64, `bounded, got ${Object.keys(stored).length}`)
+    assert.equal(module.recallActiveSession('project-199'), 'session-199', 'the most recent survives')
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+/**
+ * The reload regression.
+ *
+ * Restoring a workspace adopts terminals one at a time. The first one activates
+ * itself because nothing is selected yet, and that activation is recorded as
+ * this device's choice — which erases the memory of the terminal actually being
+ * restored, before its panel is adopted. The reload then landed on the first
+ * terminal instead of the one the user was on.
+ *
+ * The memory must be read once, before any adoption, and spent once.
+ */
+test('restoring a workspace does not let the first terminal erase the remembered one', async () => {
+  const { module } = await loadModule()
+  try {
+    globalThis.localStorage = fakeStorage()
+    // The user was on the second terminal when the window reloaded.
+    module.rememberActiveSession('default', 'desktop-abc:session:1')
+
+    // Read once, before anything is adopted. This is the fix: re-reading storage
+    // per adoption would observe the clobbering write below.
+    const snapshot = module.recallActiveSession('default')
+
+    const adopted = []
+    let hasActivePanel = false
+    for (const sessionId of ['default', 'desktop-abc:session:1']) {
+      const activate = module.shouldActivateAdoptedTerminal({
+        requestedLocally: false,
+        hasActivePanel,
+        rememberedSessionId: snapshot,
+        sessionId,
+      })
+      if (activate) {
+        hasActivePanel = true
+        adopted.push(sessionId)
+        // Activating records this device's choice, exactly as the panel
+        // lifecycle does. This is the write that used to destroy the memory.
+        module.rememberActiveSession('default', sessionId)
+      }
+    }
+
+    assert.deepEqual(
+      adopted,
+      ['default', 'desktop-abc:session:1'],
+      'the first terminal seeds the view, then the remembered one takes it back',
+    )
+    assert.equal(
+      module.recallActiveSession('default'),
+      'desktop-abc:session:1',
+      'the restored terminal is what this device remembers going forward',
+    )
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('a remembered selection is spent once and cannot pull focus back later', async () => {
+  const { module } = await loadModule()
+  try {
+    const snapshot = 'desktop-abc:session:1'
+    assert.equal(
+      module.shouldActivateAdoptedTerminal({
+        requestedLocally: false,
+        hasActivePanel: true,
+        rememberedSessionId: snapshot,
+        sessionId: snapshot,
+      }),
+      true,
+      'restored on first sight',
+    )
+    // Once consumed the caller drops the snapshot, so a later adoption of any
+    // terminal cannot steal focus from whatever the user has since chosen.
+    assert.equal(
+      module.shouldActivateAdoptedTerminal({
+        requestedLocally: false,
+        hasActivePanel: true,
+        rememberedSessionId: undefined,
+        sessionId: snapshot,
+      }),
+      false,
+    )
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+/**
+ * The test above simulates the adoption loop, so this ties that invariant to
+ * the controller that actually runs it: the remembered session must be read
+ * into a ref once, not re-read from storage on every adoption.
+ */
+test('the adoption controller reads the remembered session once, not per adoption', async () => {
+  const source = await readFile('src/workspace/useTerminalAdoptionController.ts', 'utf8')
+  const calls = source.match(/recallActiveSession\(/gu) ?? []
+  assert.equal(calls.length, 1, 'exactly one read of persisted storage')
+  assert.match(
+    source,
+    /rememberedSessionRef\.current === null\s*\)?\s*\n?\s*rememberedSessionRef\.current = recallActiveSession/u,
+    'the single read is guarded so it happens once per project view',
+  )
+  assert.match(
+    source,
+    /rememberedSessionRef\.current = undefined/u,
+    'and the restored selection is spent so it cannot pull focus back later',
+  )
+})
+
+/**
+ * Which view a device is showing is that device's business in exactly the way
+ * the selected terminal is. A device that was on the dashboard comes back to
+ * the dashboard; one that cannot remember comes back to a project without
+ * complaining about it.
+ */
+test('a device that was showing Home comes back to Home', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = fakeStorage()
+  try {
+    assert.equal(module.recallHomeSelected('server-a', 'view-1'), false)
+    module.rememberHomeSelected('server-a', 'view-1', true)
+    assert.equal(module.recallHomeSelected('server-a', 'view-1'), true)
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('Home is remembered per server and per workspace view', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = fakeStorage()
+  try {
+    module.rememberHomeSelected('server-a', 'view-1', true)
+    assert.equal(module.recallHomeSelected('server-a', 'view-2'), false)
+    assert.equal(module.recallHomeSelected('server-b', 'view-1'), false)
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('selecting a project forgets Home', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = fakeStorage()
+  try {
+    module.rememberHomeSelected('server-a', 'view-1', true)
+    module.rememberHomeSelected('server-a', 'view-1', false)
+    assert.equal(module.recallHomeSelected('server-a', 'view-1'), false)
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('an unrestorable remembered value falls back to a project', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = fakeStorage({
+    'terminay.view.home-selected.v1': 'not json at all',
+  })
+  try {
+    assert.equal(module.recallHomeSelected('server-a', 'view-1'), false)
+  } finally {
+    delete globalThis.localStorage
+  }
+  globalThis.localStorage = fakeStorage({
+    'terminay.view.home-selected.v1': JSON.stringify({ 'server-a:view-1': 'yes' }),
+  })
+  try {
+    assert.equal(module.recallHomeSelected('server-a', 'view-1'), false)
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('a device with no view bound has no Home to remember', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = fakeStorage()
+  try {
+    module.rememberHomeSelected('server-a', null, true)
+    assert.equal(globalThis.localStorage.size, 0)
+    assert.equal(module.recallHomeSelected('server-a', null), false)
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('storage that throws leaves the device on a project rather than failing', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = {
+    getItem() { throw new Error('storage disabled') },
+    setItem() { throw new Error('storage disabled') },
+  }
+  try {
+    assert.doesNotThrow(() => module.rememberHomeSelected('server-a', 'view-1', true))
+    assert.equal(module.recallHomeSelected('server-a', 'view-1'), false)
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('a device with no storage at all still works', async () => {
+  const { module } = await loadModule()
+  delete globalThis.localStorage
+  assert.doesNotThrow(() => module.rememberHomeSelected('server-a', 'view-1', true))
+  assert.equal(module.recallHomeSelected('server-a', 'view-1'), false)
+})
+
+/**
+ * Which shape a device shows the dashboard in is the same kind of fact as
+ * which tab it has selected: the person at the screen owns it, and a device
+ * that cannot remember simply starts on the List view.
+ */
+test('a device remembers the dashboard view it was last using', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = fakeStorage()
+  try {
+    assert.equal(module.recallDashboardViewMode(), 'list')
+    module.rememberDashboardViewMode('board')
+    assert.equal(module.recallDashboardViewMode(), 'board')
+    module.rememberDashboardViewMode('projects')
+    assert.equal(module.recallDashboardViewMode(), 'projects')
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('a stored dashboard view that is not one of the three is the List view', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = fakeStorage({
+    'terminay.view.dashboard-mode.v1': 'kanban',
+  })
+  try {
+    assert.equal(module.recallDashboardViewMode(), 'list')
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('storage that throws leaves the dashboard on the List view rather than failing', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = {
+    getItem() { throw new Error('storage disabled') },
+    setItem() { throw new Error('storage disabled') },
+  }
+  try {
+    assert.doesNotThrow(() => module.rememberDashboardViewMode('board'))
+    assert.equal(module.recallDashboardViewMode(), 'list')
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('a device with no storage at all still picks a dashboard view', async () => {
+  const { module } = await loadModule()
+  delete globalThis.localStorage
+  assert.doesNotThrow(() => module.rememberDashboardViewMode('projects'))
+  assert.equal(module.recallDashboardViewMode(), 'list')
+})
+
+test('a device remembers whether it groups the board by project', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = fakeStorage()
+  try {
+    assert.equal(module.recallDashboardBoardGrouped(), false)
+    module.rememberDashboardBoardGrouped(true)
+    assert.equal(module.recallDashboardBoardGrouped(), true)
+    module.rememberDashboardBoardGrouped(false)
+    assert.equal(module.recallDashboardBoardGrouped(), false)
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('a board grouping that cannot be read is the ungrouped board', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = fakeStorage({
+    'terminay.view.dashboard-board-grouped.v1': 'yes',
+  })
+  try {
+    assert.equal(module.recallDashboardBoardGrouped(), false)
+  } finally {
+    delete globalThis.localStorage
+  }
+  globalThis.localStorage = {
+    getItem() { throw new Error('storage disabled') },
+    setItem() { throw new Error('storage disabled') },
+  }
+  try {
+    assert.doesNotThrow(() => module.rememberDashboardBoardGrouped(true))
+    assert.equal(module.recallDashboardBoardGrouped(), false)
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('the untracked column starts collapsed and remembers being opened', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = fakeStorage()
+  try {
+    assert.equal(module.recallDashboardBoardUntrackedCollapsed(), true)
+    module.rememberDashboardBoardUntrackedCollapsed(false)
+    assert.equal(module.recallDashboardBoardUntrackedCollapsed(), false)
+    module.rememberDashboardBoardUntrackedCollapsed(true)
+    assert.equal(module.recallDashboardBoardUntrackedCollapsed(), true)
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('an untracked column preference that cannot be read is collapsed', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = fakeStorage({
+    'terminay.view.dashboard-board-untracked-collapsed.v1': 'nope',
+  })
+  try {
+    assert.equal(module.recallDashboardBoardUntrackedCollapsed(), true)
+  } finally {
+    delete globalThis.localStorage
+  }
+  globalThis.localStorage = {
+    getItem() { throw new Error('storage disabled') },
+    setItem() { throw new Error('storage disabled') },
+  }
+  try {
+    assert.doesNotThrow(() => module.rememberDashboardBoardUntrackedCollapsed(false))
+    assert.equal(module.recallDashboardBoardUntrackedCollapsed(), true)
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+/**
+ * Home's sidebar is this device's, and it is not any project's: its visibility
+ * and its selected section are hints like the rest of this module. A device that
+ * has never chosen sees it open on the Home overview.
+ */
+test('a device remembers whether Home shows its sidebar, open by default', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = fakeStorage()
+  try {
+    assert.equal(module.recallHomeSidebarVisible(), true)
+    module.rememberHomeSidebarVisible(false)
+    assert.equal(module.recallHomeSidebarVisible(), false)
+    module.rememberHomeSidebarVisible(true)
+    assert.equal(module.recallHomeSidebarVisible(), true)
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('a Home sidebar visibility that cannot be read is open', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = fakeStorage({
+    'terminay.view.home-sidebar-visible.v1': 'maybe',
+  })
+  try {
+    assert.equal(module.recallHomeSidebarVisible(), true)
+  } finally {
+    delete globalThis.localStorage
+  }
+  globalThis.localStorage = {
+    getItem() { throw new Error('storage disabled') },
+    setItem() { throw new Error('storage disabled') },
+  }
+  try {
+    assert.doesNotThrow(() => module.rememberHomeSidebarVisible(false))
+    assert.equal(module.recallHomeSidebarVisible(), true)
+  } finally {
+    delete globalThis.localStorage
+  }
+  assert.doesNotThrow(() => module.rememberHomeSidebarVisible(false))
+  assert.equal(module.recallHomeSidebarVisible(), true)
+})
+
+test('a device with no remembered Home tabs opens on the section it last showed', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = fakeStorage()
+  try {
+    assert.deepEqual(module.recallDefaultHomeTab(), { kind: 'section', section: 'home' })
+    assert.equal(module.recallHomeLayout(), undefined)
+  } finally {
+    delete globalThis.localStorage
+  }
+  globalThis.localStorage = fakeStorage({
+    'terminay.view.home-section.v1': 'automations',
+  })
+  try {
+    assert.deepEqual(module.recallDefaultHomeTab(), { kind: 'section', section: 'automations' })
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+function homeLayout(views, panels = {}) {
+  return {
+    grid: {
+      root: { type: 'branch', data: [{ type: 'leaf', data: { views, activeView: views[0], id: '1' }, size: 800 }], size: 600 },
+      width: 800,
+      height: 600,
+      orientation: 'HORIZONTAL',
+    },
+    panels,
+    activeGroup: '1',
+  }
+}
+
+test('a device remembers its Home tabs and how they were arranged', async () => {
+  const { module } = await loadModule()
+  const storage = fakeStorage()
+  globalThis.localStorage = storage
+  try {
+    module.rememberHomeLayout(homeLayout(['section:tabs', 'automation:server-a:auto-1']))
+    const recalled = module.recallHomeLayout()
+    assert.deepEqual(recalled.grid.root.data[0].data.views, ['section:tabs', 'automation:server-a:auto-1'])
+    assert.deepEqual(Object.keys(recalled.panels).sort(), ['automation:server-a:auto-1', 'section:tabs'])
+    assert.deepEqual([...storage.raw.keys()], ['terminay.view.home-layout.v1'])
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('remembered Home tabs are a hint: drafts, unknown tabs, and stored parameters are dropped', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = fakeStorage({
+    'terminay.view.home-layout.v1': JSON.stringify(
+      homeLayout(
+        ['automation-new:server-a:3', 'file:/etc/passwd', 'section:automations', 'automation-edit:server-a:auto-1'],
+        {
+          'section:automations': {
+            id: 'section:automations',
+            contentComponent: 'terminal',
+            title: 'Automations',
+            params: { sessionId: 'not-yours' },
+          },
+        },
+      ),
+    ),
+  })
+  try {
+    const recalled = module.recallHomeLayout()
+    const leaf = recalled.grid.root.data[0].data
+    assert.deepEqual(leaf.views, ['section:automations', 'automation-edit:server-a:auto-1'])
+    assert.equal(leaf.activeView, 'section:automations')
+    assert.deepEqual(recalled.panels['section:automations'], {
+      id: 'section:automations',
+      contentComponent: 'home',
+      tabComponent: 'homeTab',
+      renderer: 'always',
+      title: 'Automations',
+      params: { descriptor: { kind: 'section', section: 'automations' } },
+    })
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('Home tabs that cannot be read, or hold nothing restorable, are no arrangement and no error', async () => {
+  const { module } = await loadModule()
+  for (const stored of ['{not json', '[]', '{"grid":{}}', JSON.stringify(homeLayout(['automation-new:server-a:1']))]) {
+    globalThis.localStorage = fakeStorage({ 'terminay.view.home-layout.v1': stored })
+    try {
+      assert.equal(module.recallHomeLayout(), undefined)
+    } finally {
+      delete globalThis.localStorage
+    }
+  }
+  globalThis.localStorage = {
+    getItem() { throw new Error('storage disabled') },
+    setItem() { throw new Error('storage disabled') },
+  }
+  try {
+    assert.doesNotThrow(() => module.rememberHomeLayout(homeLayout(['section:tabs'])))
+    assert.equal(module.recallHomeLayout(), undefined)
+    assert.deepEqual(module.recallDefaultHomeTab(), { kind: 'section', section: 'home' })
+  } finally {
+    delete globalThis.localStorage
+  }
+  assert.doesNotThrow(() => module.rememberHomeLayout(homeLayout(['section:tabs'])))
+  assert.equal(module.recallHomeLayout(), undefined)
+})
+
+test('a Home section that is not one of the three, or cannot be read, is Home', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = fakeStorage({
+    'terminay.view.home-section.v1': 'explorer',
+  })
+  try {
+    assert.equal(module.recallHomeSection(), 'home')
+  } finally {
+    delete globalThis.localStorage
+  }
+  globalThis.localStorage = {
+    getItem() { throw new Error('storage disabled') },
+    setItem() { throw new Error('storage disabled') },
+  }
+  try {
+    assert.equal(module.recallHomeSection(), 'home')
+  } finally {
+    delete globalThis.localStorage
+  }
+  assert.equal(module.recallHomeSection(), 'home')
+})
+
+test('Home sidebar state never touches a project\'s remembered state', async () => {
+  const { module } = await loadModule()
+  const storage = fakeStorage()
+  globalThis.localStorage = storage
+  try {
+    module.rememberActiveSession('project-a', 'session-1')
+    module.rememberHomeSidebarVisible(false)
+    module.rememberHomeLayout(homeLayout(['section:tabs']))
+    assert.equal(module.recallActiveSession('project-a'), 'session-1')
+    assert.deepEqual(
+      [...storage.raw.keys()].sort(),
+      [
+        'terminay.view.active-session.v1',
+        'terminay.view.home-layout.v1',
+        'terminay.view.home-sidebar-visible.v1',
+      ],
+    )
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('a device with no remembered column widths uses each column default', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = fakeStorage()
+  try {
+    assert.equal(module.recallColumnWidth('folders'), 232)
+    assert.equal(module.recallColumnWidth('sidebar'), 280)
+    assert.equal(module.recallColumnWidth('home'), 220)
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('each column remembers its own width, rounded, without touching the others', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = fakeStorage()
+  try {
+    module.rememberColumnWidth('sidebar', 341.6)
+    module.rememberColumnWidth('home', 190)
+    assert.equal(module.recallColumnWidth('sidebar'), 342)
+    assert.equal(module.recallColumnWidth('home'), 190)
+    assert.equal(module.recallColumnWidth('folders'), 232)
+    module.rememberColumnWidth('folders', 300)
+    assert.equal(module.recallColumnWidth('sidebar'), 342)
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('a garbage or out-of-range stored width falls back to the default', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = fakeStorage({
+    'terminay.view.column-widths.v1': JSON.stringify({ folders: 'wide', sidebar: 5, home: 1e9 }),
+  })
+  try {
+    assert.equal(module.recallColumnWidth('folders'), 232)
+    assert.equal(module.recallColumnWidth('sidebar'), 280)
+    assert.equal(module.recallColumnWidth('home'), 220)
+    assert.deepEqual(module.parseColumnWidths('{not json'), {})
+    assert.deepEqual(module.parseColumnWidths(null), {})
+    assert.deepEqual(module.parseColumnWidths('{"sidebar":400,"other":3}'), { sidebar: 400 })
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('throwing storage leaves column widths at their defaults', async () => {
+  const { module } = await loadModule()
+  globalThis.localStorage = {
+    getItem: () => { throw new Error('denied') },
+    setItem: () => { throw new Error('denied') },
+  }
+  try {
+    assert.doesNotThrow(() => module.rememberColumnWidth('sidebar', 400))
+    assert.equal(module.recallColumnWidth('sidebar'), 280)
+  } finally {
+    delete globalThis.localStorage
+  }
+})

@@ -1,0 +1,654 @@
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+import { expect, test } from './fixtures';
+import {
+	advanceRendererClock,
+	holdRendererClock,
+	installRendererClock,
+	releaseRendererClock,
+} from './support/renderer-clock';
+import { openDocumentationSidebar, setProjectRoot } from './support/ui';
+
+test('Documentation groups Markdown by folder and opens the rich document surface', async ({
+	createWorkspace,
+	mainWindow,
+}) => {
+	const workspace = await createWorkspace({
+		name: 'documentation-sidebar-editor',
+		seed: {
+			directories: ['docs/guides'],
+			files: {
+				'README.md': '# Read me',
+				'docs/guides/getting-started.md':
+					'---\ntitle: Getting Started\n---\n\n# Hello\n\nA comfortable paragraph for checking documentation typography.\n\n- First item\n- Second item\n\n- [ ] An incomplete task\n- [x] A completed task',
+			},
+		},
+	});
+	await setProjectRoot(mainWindow, workspace.rootDir);
+	await openDocumentationSidebar(mainWindow);
+	await expect(
+		mainWindow.getByRole('treeitem', { name: /^Readme$/i }),
+	).toBeVisible();
+	await mainWindow.getByRole('treeitem', { name: /docs/i }).click();
+	await mainWindow.getByRole('treeitem', { name: /guides/i }).click();
+	await mainWindow.getByRole('treeitem', { name: /Getting Started/ }).click();
+	const editor = mainWindow.locator('.documentation-editor');
+	await expect(editor).toBeVisible();
+	await expect(editor.getByText('Hello', { exact: true })).toBeVisible();
+	const richText = editor.locator('.documentation-editor__content');
+	const typography = await richText.evaluate((element) => {
+		const style = getComputedStyle(element);
+		const root = getComputedStyle(
+			element.closest('.documentation-editor__surface')!,
+		);
+		return {
+			foreground: style.color,
+			background: root.backgroundColor,
+			fontFamily: style.fontFamily,
+			fontSize: style.fontSize,
+			lineHeight: style.lineHeight,
+		};
+	});
+	expect(typography.foreground).not.toBe(typography.background);
+	expect(typography.fontFamily).toContain('Open Sans');
+	expect(['16px', '17px']).toContain(typography.fontSize);
+	expect(Number.parseFloat(typography.lineHeight)).toBeGreaterThanOrEqual(27);
+	const taskListLayout = await richText
+		.locator("li[role='checkbox']")
+		.first()
+		.evaluate((element) => {
+			const before = getComputedStyle(element, '::before');
+			return {
+				markerWidth: Number.parseFloat(before.width),
+				markerTop: Number.parseFloat(before.top),
+				labelPadding: Number.parseFloat(
+					getComputedStyle(element).paddingInlineStart,
+				),
+			};
+		});
+	expect(taskListLayout.markerWidth).toBeGreaterThan(0);
+	expect(taskListLayout.markerTop).toBeGreaterThan(0);
+	expect(taskListLayout.labelPadding).toBeGreaterThan(
+		taskListLayout.markerWidth,
+	);
+	const trailingReadingSpace = await richText.evaluate((element) => ({
+		padding: Number.parseFloat(getComputedStyle(element).paddingBlockEnd),
+		tabHeight: element.closest('.documentation-editor')!.clientHeight,
+	}));
+	expect(trailingReadingSpace.padding).toBeGreaterThanOrEqual(
+		trailingReadingSpace.tabHeight * 0.75,
+	);
+	const widths = await richText.evaluate((element) => ({
+		content: element.clientWidth,
+		surface: element.closest('.documentation-editor__surface')!.clientWidth,
+	}));
+	expect(
+		Math.abs(widths.content - Math.min(widths.surface, 1080)),
+	).toBeLessThan(2);
+	await expect
+		.poll(() =>
+			mainWindow.evaluate(() => document.fonts.check('16px "Open Sans"')),
+		)
+		.toBe(true);
+	await richText.focus();
+	await mainWindow.keyboard.press('End');
+	await mainWindow.keyboard.type(' Focus stays here.');
+	await expect(richText).toBeFocused();
+	// The autosave has written the edit and the editor has taken in its
+	// answer, and the focus is still where the user left it.
+	await expect
+		.poll(() =>
+			readFile(
+				path.join(workspace.rootDir, 'docs/guides/getting-started.md'),
+				'utf8',
+			),
+		)
+		.toContain('Focus stays here.');
+	await expect(mainWindow.locator('.file-panel')).toHaveAttribute('data-dirty', 'false');
+	await expect(richText).toBeFocused();
+	await expect(editor.locator('.documentation-editor__status')).toHaveCount(0);
+	await expect(mainWindow.locator('.file-panel')).toHaveAttribute('data-dirty', 'false');
+
+	await editor.getByRole('combobox').first().click();
+	const blockTypeMenu = mainWindow.getByRole('listbox').last();
+	await expect(blockTypeMenu).toBeVisible();
+	await expect(blockTypeMenu).toHaveCSS('background-color', 'rgb(17, 21, 27)');
+	await mainWindow.keyboard.press('Escape');
+	const selectedToolbarButton = editor
+		.locator('.mdxeditor-toolbar button[data-state="on"]')
+		.first();
+	if (await selectedToolbarButton.count()) {
+		const background = await selectedToolbarButton.evaluate(
+			(element) => getComputedStyle(element).backgroundColor,
+		);
+		expect(background).not.toBe('rgb(255, 255, 255)');
+	}
+	await editor.getByRole('combobox', { name: 'Insert Admonition' }).click();
+	await mainWindow.getByText('Info', { exact: true }).click();
+	const infoAdmonition = editor.locator(
+		'.documentation-editor__admonition--info',
+	);
+	await expect(infoAdmonition).toBeVisible();
+	await expect(infoAdmonition).toHaveCSS(
+		'background-color',
+		'rgba(59, 130, 246, 0.12)',
+	);
+	await expect(infoAdmonition).toHaveCSS(
+		'border-left-color',
+		'rgb(96, 165, 250)',
+	);
+	await expect(infoAdmonition.locator('[contenteditable="true"]')).toHaveCSS(
+		'background-color',
+		'rgba(0, 0, 0, 0)',
+	);
+	await expect(editor).toBeVisible();
+	await expect(mainWindow.locator('.project-workspace--active')).toBeVisible();
+	const onDisk = () =>
+		readFile(
+			path.join(workspace.rootDir, 'docs/guides/getting-started.md'),
+			'utf8',
+		);
+	await expect.poll(onDisk).toContain(':::info');
+	// An admonition's body reaches the document when the views change, so the
+	// change of views that carries these words is saving an edit.
+	await infoAdmonition.locator('[contenteditable="true"]').click();
+	await mainWindow.keyboard.type('Noted before views');
+	await editor.getByRole('radio', { name: 'Source mode' }).click();
+	await expect(editor.getByText('Source mode', { exact: true })).toBeVisible();
+	await expect(editor.locator('.cm-sourceView')).toHaveCSS(
+		'background-color',
+		'rgb(13, 16, 20)',
+	);
+	await editor.getByRole('radio', { name: 'Diff mode' }).click();
+	await expect(editor.getByText('Diff mode', { exact: true })).toBeVisible();
+	for (const pane of await editor
+		.locator('.cm-mergeViewEditor .cm-editor')
+		.all()) {
+		await expect(pane).toHaveCSS('background-color', 'rgb(13, 16, 20)');
+	}
+	// Whether the changes of views kept the admonition and its words is read
+	// off the next save, below, which comes after anything they saved.
+
+	await editor.getByRole('radio', { name: 'Rich text', exact: true }).click();
+	// Typing straight after a change of views is an edit like any other.
+	await richText.locator('h1').first().click();
+	await mainWindow.keyboard.press('End');
+	await mainWindow.keyboard.type(' after-views');
+	// Saves are made one after another, so the one that carries this edit
+	// comes after any the change of views made, and the admonition is in it.
+	await expect
+		.poll(async () => {
+			const text = await onDisk();
+			return {
+				info: text.includes(':::info\nNoted before views\n:::'),
+				edit: text.includes('# Hello after-views'),
+			};
+		})
+		.toEqual({ info: true, edit: true });
+	await editor.getByRole('button', { name: 'Insert Table' }).click();
+	const richTable = editor.locator('table[class*="_tableEditor_"]');
+	await expect(richTable).toBeVisible();
+	await expect(
+		richTable
+			.locator('tbody tr')
+			.first()
+			.locator(
+				':is(td, th):not([data-tool-cell="true"]):not([class*="_toolCell_"])',
+			)
+			.first(),
+	).toHaveCSS('background-color', 'rgb(23, 28, 36)');
+
+	await editor.getByRole('button', { name: 'Insert Code Block' }).click();
+	await expect(editor.locator('.cm-editor')).toBeVisible();
+	await expect(editor.getByRole('alert')).toHaveCount(0);
+});
+
+test('Documentation autosave does not report its own root-file write as an external conflict', async ({
+	createWorkspace,
+	mainWindow,
+}) => {
+	const workspace = await createWorkspace({
+		name: 'documentation-autosave-self-watch',
+		seed: {
+			files: {
+				'AGENTS.md':
+					'# AGENTS\n\n## Editing instructions\n\nOriginal guidance.\n',
+			},
+		},
+	});
+	await setProjectRoot(mainWindow, workspace.rootDir);
+	await openDocumentationSidebar(mainWindow);
+	await mainWindow.getByRole('treeitem', { name: /^Agents$/i }).click();
+
+	const editor = mainWindow.locator('.documentation-editor');
+	const heading = editor.getByText('Editing instructions', { exact: true });
+	await heading.click();
+	await mainWindow.keyboard.press('End');
+	await mainWindow.keyboard.type(' updated');
+	await expect(mainWindow.locator('.file-panel')).toHaveAttribute('data-dirty', 'true');
+	await expect
+		.poll(() => workspace.readText('AGENTS.md'))
+		.toContain('## Editing instructions updated');
+	await expect(mainWindow.locator('.file-panel')).toHaveAttribute('data-dirty', 'false');
+
+	await expect(
+		mainWindow.getByText(
+			'This file changed on disk while you had unsaved edits.',
+			{ exact: true },
+		),
+	).toHaveCount(0);
+	await expect(editor.locator('.documentation-editor__status')).toHaveCount(0);
+});
+
+test('repeated AGENTS.md autosaves do not conflict with their own filesystem events', { tag: '@heavy' }, async ({
+	createWorkspace,
+	mainWindow,
+}) => {
+	// This scenario intentionally waits for twelve one-second autosave cycles.
+	// Keep its timeout independent from the suite default so Docker build/load
+	// variance cannot cancel the final pending save before it is observed.
+	test.setTimeout(60_000);
+	const workspace = await createWorkspace({
+		name: 'documentation-repeated-autosave-self-watch',
+		seed: {
+			files: {
+				'AGENTS.md': [
+					'# AGENTS — Terminay',
+					'',
+					'Terminay is a local-first Electron terminal workspace.',
+					'',
+					':::info',
+					'**Amazing right?** Well it could be better',
+					':::',
+					'',
+				].join('\n'),
+			},
+		},
+	});
+	await setProjectRoot(mainWindow, workspace.rootDir);
+	await openDocumentationSidebar(mainWindow);
+	await mainWindow.getByRole('treeitem', { name: /^Agents$/i }).click();
+
+	const editor = mainWindow.locator('.documentation-editor');
+	const paragraph = editor.getByText(
+		'Terminay is a local-first Electron terminal workspace.',
+		{ exact: true },
+	);
+	await paragraph.click();
+	await mainWindow.keyboard.press('End');
+
+	for (let revision = 1; revision <= 12; revision += 1) {
+		const marker = ` ${revision}`;
+		await mainWindow.keyboard.type(marker);
+		await expect(mainWindow.locator('.file-panel')).toHaveAttribute('data-dirty', 'true');
+		await expect
+			.poll(() => workspace.readText('AGENTS.md'))
+			.toContain(
+				`workspace.${Array.from({ length: revision }, (_, index) => ` ${index + 1}`).join('')}`,
+			);
+		await expect(mainWindow.locator('.file-panel')).toHaveAttribute('data-dirty', 'false');
+		await expect(
+			mainWindow.getByText(
+				'This file changed on disk while you had unsaved edits.',
+				{ exact: true },
+			),
+		).toHaveCount(0);
+		await expect(editor.locator('.documentation-editor__status')).toHaveCount(
+			0,
+		);
+	}
+});
+
+test('a task checkbox autosave does not conflict with the next document edit', async ({
+	createWorkspace,
+	mainWindow,
+}) => {
+	const workspace = await createWorkspace({
+		name: 'documentation-checkbox-autosave-self-watch',
+		seed: {
+			files: {
+				'AGENTS.md': '# AGENTS\n\n- [ ] Item one\n\nWrite here.\n',
+			},
+		},
+	});
+	await setProjectRoot(mainWindow, workspace.rootDir);
+	await openDocumentationSidebar(mainWindow);
+	await mainWindow.getByRole('treeitem', { name: /^Agents$/i }).click();
+	const editor = mainWindow.locator('.documentation-editor');
+	const taskCheckbox = editor.getByRole('checkbox').first();
+	await taskCheckbox.click({ position: { x: 8, y: 8 } });
+	await expect(taskCheckbox).toHaveAttribute('aria-checked', 'true');
+	await expect
+		.poll(() => workspace.readText('AGENTS.md'))
+		.toContain('* [x] Item one');
+	await expect(mainWindow.locator('.file-panel')).toHaveAttribute('data-dirty', 'false');
+
+	const paragraph = editor.getByText('Write here.', { exact: true });
+	await paragraph.click();
+	await mainWindow.keyboard.press('End');
+	await mainWindow.keyboard.type(' Again.');
+	await expect(mainWindow.locator('.file-panel')).toHaveAttribute('data-dirty', 'true');
+	await expect(
+		mainWindow.getByText(
+			'This file changed on disk while you had unsaved edits.',
+			{ exact: true },
+		),
+	).toHaveCount(0);
+	await expect(editor.locator('.documentation-editor__status')).toHaveCount(0);
+});
+
+test('a Documentation panel without a preview fills the panel at a phone viewport', async ({
+	createWorkspace,
+	mainWindow,
+}) => {
+	const workspace = await createWorkspace({
+		name: 'documentation-phone-viewport',
+		seed: {
+			files: {
+				'AGENTS.md':
+					'# Phone heading\n\nA paragraph that must remain readable on a phone.\n',
+			},
+		},
+	});
+	await setProjectRoot(mainWindow, workspace.rootDir);
+	await openDocumentationSidebar(mainWindow);
+	await mainWindow.getByRole('treeitem', { name: /^Agents$/i }).click();
+	const editor = mainWindow.locator('.documentation-editor');
+	await expect(editor).toBeVisible();
+
+	// A phone-sized viewport crosses the narrow Documentation breakpoint. With
+	// no live preview the editing surface is the panel's only child, so it must
+	// receive the panel's full height rather than whatever remains after rows
+	// reserved for surfaces that are not rendered.
+	await mainWindow.setViewportSize({ width: 390, height: 660 });
+	const surface = editor.locator('.documentation-editor__surface');
+	await expect
+		.poll(() =>
+			editor.evaluate((element) => {
+				const panel = element.getBoundingClientRect().height;
+				const inner =
+					element
+						.querySelector('.documentation-editor__surface')
+						?.getBoundingClientRect().height ?? 0;
+				return panel > 0 ? inner / panel : 0;
+			}),
+		)
+		.toBeGreaterThan(0.8);
+
+	await expect(editor.locator('.mdxeditor-toolbar')).toBeVisible();
+	await expect(
+		editor.getByText('Phone heading', { exact: true }),
+	).toBeVisible();
+	await expect(surface).toHaveCSS('border-bottom-width', '0px');
+});
+
+test('Documentation renders an HTML image with a relative source', async ({
+	createWorkspace,
+	mainWindow,
+}) => {
+	const svg =
+		'<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20" fill="red"/></svg>';
+	const workspace = await createWorkspace({
+		name: 'documentation-relative-image',
+		seed: {
+			directories: ['docs/images'],
+			files: {
+				'README.md': `# Images\n\n<img src="docs/images/matrix.svg" alt="Matrix" width="40">\n`,
+				'docs/images/matrix.svg': svg,
+			},
+		},
+	});
+	await setProjectRoot(mainWindow, workspace.rootDir);
+	await openDocumentationSidebar(mainWindow);
+	await mainWindow.getByRole('treeitem', { name: /^Readme$/i }).click();
+	const image = mainWindow.locator('.documentation-editor img[alt="Matrix"]');
+	await expect(image).toBeVisible();
+	await expect
+		.poll(() =>
+			image.evaluate((element) => ({
+				src: (element as HTMLImageElement).src.slice(0, 5),
+				loaded: (element as HTMLImageElement).naturalWidth > 0,
+			})),
+		)
+		.toEqual({ src: 'blob:', loaded: true });
+});
+
+// A hand-wrapped document: paragraphs, a list item, and a quote broken over
+// source lines the way people keep raw Markdown readable, plus a blank-line
+// paragraph break and a real hard break to prove the correction is precise.
+const handWrappedDocument = [
+	'# Soft line breaks',
+	'',
+	'Short wrapped',
+	'paragraph.',
+	'',
+	'Another wrapped',
+	'paragraph stays.',
+	'',
+	'Hard break here\\',
+	'and the next line.',
+	'',
+	'- List item',
+	'  continues here.',
+	'',
+	'> Quote line',
+	'> continues here.',
+	'',
+].join('\n');
+
+/**
+ * The number of visual lines a node occupies, counted as the distinct tops of
+ * the client rects its contents produce. One row of rects is one rendered line.
+ */
+function visualLines(
+	target: import('@playwright/test').Locator,
+): Promise<number> {
+	return target.evaluate((element) => {
+		const range = document.createRange();
+		range.selectNodeContents(element);
+		const tops = new Set<number>();
+		for (const rect of Array.from(range.getClientRects())) {
+			if (rect.width < 1 || rect.height < 1) continue;
+			tops.add(Math.round(rect.top));
+		}
+		return tops.size;
+	});
+}
+
+test('Documentation renders a Markdown soft line break as a space', async ({
+	createWorkspace,
+	mainWindow,
+}) => {
+	const workspace = await createWorkspace({
+		name: 'documentation-soft-line-breaks',
+		seed: { files: { 'README.md': handWrappedDocument } },
+	});
+	await setProjectRoot(mainWindow, workspace.rootDir);
+	await openDocumentationSidebar(mainWindow);
+	await mainWindow.getByRole('treeitem', { name: /^Readme$/i }).click();
+	const editor = mainWindow.locator('.documentation-editor');
+	await expect(editor).toBeVisible();
+	const richText = editor.locator('.documentation-editor__content');
+	await expect(
+		richText.getByText('Short wrapped paragraph.', { exact: true }),
+	).toBeVisible();
+
+	// The wrapped paragraph is far shorter than the reading canvas, so a second
+	// line could only come from the source newline rendering as a break.
+	const wrapped = richText.locator('p', { hasText: 'Short wrapped' }).first();
+	expect(await visualLines(wrapped)).toBe(1);
+
+	// A blank line is still a paragraph boundary.
+	await expect(
+		richText.locator('p', { hasText: 'Another wrapped' }),
+	).toHaveCount(1);
+	expect(
+		await wrapped.evaluate((element) => element.nextElementSibling?.tagName),
+	).toBe('P');
+
+	// A hard break still breaks.
+	const hardBreak = richText
+		.locator('p', { hasText: 'Hard break here' })
+		.first();
+	await expect(hardBreak.locator('br')).toHaveCount(1);
+	expect(await visualLines(hardBreak)).toBe(2);
+
+	// List items and block quotes wrap in source too.
+	expect(
+		await visualLines(richText.locator('li', { hasText: 'List item' }).first()),
+	).toBe(1);
+	expect(await visualLines(richText.locator('blockquote p').first())).toBe(1);
+
+	// Source mode still shows the file as it is written, newlines and all.
+	await editor.getByRole('radio', { name: 'Source mode' }).click();
+	await expect(editor.locator('.cm-sourceView')).toBeVisible();
+	await expect(editor.locator('.cm-content')).toContainText('Short wrapped');
+	expect(
+		await editor
+			.locator('.cm-content .cm-line')
+			.filter({ hasText: 'Short wrapped' })
+			.count(),
+	).toBe(1);
+});
+
+test('Documentation does not rewrite a document that was only read', async ({
+	createWorkspace,
+	mainWindow,
+}) => {
+	const workspace = await createWorkspace({
+		name: 'documentation-soft-line-breaks-read-only',
+		seed: { files: { 'README.md': handWrappedDocument } },
+	});
+	await setProjectRoot(mainWindow, workspace.rootDir);
+	await openDocumentationSidebar(mainWindow);
+	// The autosave delay is the renderer's time: the test's clock is on it
+	// from before the document opens.
+	await installRendererClock(mainWindow);
+	await mainWindow.getByRole('treeitem', { name: /^Readme$/i }).click();
+	const editor = mainWindow.locator('.documentation-editor');
+	await expect(
+		editor
+			.locator('.documentation-editor__content')
+			.getByText('Short wrapped paragraph.', { exact: true }),
+	).toBeVisible();
+
+	// Collapsing a soft line break changes what the editor holds, and the editor
+	// reports that normalization the moment it parses the document. Opening a
+	// file must not be an edit: well past the one-second autosave delay, the
+	// bytes on disk are still the author's. A save that delay set off would
+	// still be under way, the panel dirty, or done, the file rewritten.
+	await holdRendererClock(mainWindow);
+	await advanceRendererClock(mainWindow, 2_500);
+	await releaseRendererClock(mainWindow);
+	expect(
+		await mainWindow.locator('.file-panel').getAttribute('data-dirty'),
+	).toBe('false');
+	expect(await workspace.readText('README.md')).toBe(handWrappedDocument);
+});
+
+test('Documentation does not rewrite a document whose views were only changed', async ({
+	createWorkspace,
+	mainWindow,
+}) => {
+	// Changing views makes an empty admonition's editor write its blank
+	// paragraph back, and the editor reports the document spelled anew.
+	const document = '# Views\n\n:::info\n:::\n';
+	const workspace = await createWorkspace({
+		name: 'documentation-view-changes-read-only',
+		seed: { files: { 'README.md': document } },
+	});
+	await setProjectRoot(mainWindow, workspace.rootDir);
+	await openDocumentationSidebar(mainWindow);
+	// The autosave delay is the renderer's time: the test's clock is on it
+	// from before the views change.
+	await installRendererClock(mainWindow);
+	await mainWindow.getByRole('treeitem', { name: /^Readme$/i }).click();
+	const editor = mainWindow.locator('.documentation-editor');
+	const admonition = editor.locator(
+		'.documentation-editor__admonition--info [contenteditable="true"]',
+	);
+	await admonition.click();
+	await editor.getByRole('radio', { name: 'Source mode' }).click();
+	await expect(editor.locator('.cm-sourceView')).toBeVisible();
+	await editor.getByRole('radio', { name: 'Diff mode' }).click();
+	await expect(editor.locator('.cm-mergeViewEditor').first()).toBeVisible();
+	await editor.getByRole('radio', { name: 'Rich text', exact: true }).click();
+	await expect(admonition).toBeVisible();
+
+	// Well past the one-second autosave delay, nothing is unsaved and the bytes
+	// on disk are still the author's.
+	await holdRendererClock(mainWindow);
+	await advanceRendererClock(mainWindow, 2_500);
+	await releaseRendererClock(mainWindow);
+	expect(
+		await mainWindow.locator('.file-panel').getAttribute('data-dirty'),
+	).toBe('false');
+	expect(await workspace.readText('README.md')).toBe(document);
+});
+
+test('Documentation keeps typed whitespace and the wrapping of untouched prose', async ({
+	createWorkspace,
+	mainWindow,
+}) => {
+	const workspace = await createWorkspace({
+		name: 'documentation-soft-line-break-editing',
+		seed: { files: { 'README.md': handWrappedDocument } },
+	});
+	await setProjectRoot(mainWindow, workspace.rootDir);
+	await openDocumentationSidebar(mainWindow);
+	await mainWindow.getByRole('treeitem', { name: /^Readme$/i }).click();
+	const editor = mainWindow.locator('.documentation-editor');
+	const richText = editor.locator('.documentation-editor__content');
+	const wrapped = richText.getByText('Short wrapped paragraph.', {
+		exact: true,
+	});
+	await expect(wrapped).toBeVisible();
+
+	// End reaches the end of the whole paragraph rather than stopping at the
+	// source newline, so the wrap behaves as one continuous line.
+	await wrapped.click();
+	await mainWindow.keyboard.press('Home');
+	await mainWindow.keyboard.press('End');
+	expect(
+		await mainWindow.evaluate(() => {
+			const selection = window.getSelection();
+			return {
+				offset: selection?.focusOffset ?? -1,
+				length: selection?.focusNode?.textContent?.length ?? -1,
+			};
+		}),
+	).toEqual({ offset: 24, length: 24 });
+
+	// Typed whitespace stays significant: a trailing space takes up room.
+	const width = () =>
+		wrapped.evaluate((element) => {
+			const range = document.createRange();
+			range.selectNodeContents(element);
+			return range.getBoundingClientRect().width;
+		});
+	const beforeSpace = await width();
+	await mainWindow.keyboard.type(' ');
+	expect(await width()).toBeGreaterThan(beforeSpace);
+	await mainWindow.keyboard.type(' edited.');
+	await expect(
+		richText.getByText('Short wrapped paragraph.  edited.', { exact: true }),
+	).toBeVisible();
+
+	// Deleting runs straight through the wrap point: 20 strokes remove
+	// ' edited.', the extra space, and 'paragraph.', leaving no seam behind.
+	for (let stroke = 0; stroke < 20; stroke += 1) {
+		await mainWindow.keyboard.press('Backspace');
+	}
+	await expect(
+		richText.getByText('Short wrapped', { exact: true }),
+	).toBeVisible();
+
+	// Saving writes the document the editor holds, where a wrapped paragraph is
+	// one paragraph. The prose is unchanged; only its line breaks are.
+	await expect
+		.poll(() => workspace.readText('README.md'))
+		.toContain('Another wrapped paragraph stays.');
+	const saved = await workspace.readText('README.md');
+	expect(saved).toContain('Short wrapped');
+	expect(saved).not.toContain('Another wrapped\nparagraph stays.');
+});

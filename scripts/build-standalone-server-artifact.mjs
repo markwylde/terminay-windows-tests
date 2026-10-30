@@ -1,0 +1,290 @@
+#!/usr/bin/env node
+import { execFile } from 'node:child_process';
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { basename, join, resolve } from 'node:path';
+import { promisify } from 'node:util';
+import {
+	assertElfArchitecture,
+	assertSha256,
+	createDeterministicTarGz,
+	describeArtifactFiles,
+	normalizeArtifactModes,
+	sha256File,
+	walkRegularTree,
+} from './artifact-determinism.mjs';
+import {
+	getPtyRuntimePlatform,
+	PTY_RUNTIME_NODE_VERSION,
+} from './pty-runtime-platforms.mjs';
+import { assertHostedUiEntry } from './hosted-ui-entry.mjs';
+import { normalizeArtifactRelease } from './standalone-artifact.mjs';
+import {
+	ARCHIVE_CLI_LAUNCHER,
+	stageArchiveCli,
+} from './standalone-cli-bundle.mjs';
+import { stageProductionDependencyClosure } from './standalone-runtime-dependencies.mjs';
+
+const execFileAsync = promisify(execFile);
+const args = parseArgs(process.argv.slice(2));
+const target = required(args, 'target');
+const platform = getPtyRuntimePlatform(target);
+const nodeArchive = resolve(required(args, 'node-archive'));
+const runtimeModules = resolve(required(args, 'runtime-modules'));
+const outputDirectory = resolve(required(args, 'output-dir'));
+const serverRoot = resolve(args['server-root'] ?? 'apps/terminay-server');
+// The server-served workspace UI, not the Desktop renderer bundle. They are
+// different builds with different entries: `dist-web` carries `server.html`,
+// which is what the hosted UI archive loader reads and what an embedded server
+// passes as its renderer directory; `dist` carries `remote.html`. Staging the
+// wrong one produces an archive that pairs successfully and then serves no
+// workspace.
+const uiBundle = resolve(args['ui-bundle'] ?? 'dist-web');
+const serverCoreRoot = resolve(
+	args['server-core-root'] ?? 'packages/server-core',
+);
+const protocolRoot = resolve(args['protocol-root'] ?? 'packages/protocol');
+const webrtcRuntime = resolve(required(args, 'webrtc-runtime'));
+const release = normalizeArtifactRelease({
+	channel: args.channel ?? 'tag',
+	revision: args.revision,
+	architecture: platform.architecture,
+});
+// The ELF machine checks below are the authoritative architecture gate: they
+// read the bytes that ship. Requiring a same-architecture runner is a weaker,
+// environmental proxy, kept available for release jobs that want it but off by
+// default so arm64 can be staged wherever a runner is free.
+const requireNativeRunner = parseBoolean(args['require-native-runner'] ?? 'false');
+
+if (process.platform !== 'linux')
+	throw new Error(
+		'Standalone server archives must be assembled on native Linux release runners.',
+	);
+if (requireNativeRunner && process.arch !== platform.architecture)
+	throw new Error(
+		`${target} requires native ${platform.architecture}; this runner is ${process.arch}.`,
+	);
+
+const temporary = await mkdtemp(join(tmpdir(), 'terminay-standalone-server-'));
+try {
+	await assertSha256(
+		nodeArchive,
+		platform.nodeArchiveSha256,
+		'pinned Node archive',
+	);
+	await assertSafeTree(serverRoot, 'server runtime');
+	await assertSafeTree(serverCoreRoot, 'server core runtime');
+	await assertSafeTree(protocolRoot, 'protocol runtime');
+	await assertSafeTree(uiBundle, 'web UI bundle');
+	await assertHostedUiEntry(uiBundle);
+	await assertSafeTree(webrtcRuntime, 'selected WebRTC runtime');
+
+	const nodeSource = join(temporary, 'node-source');
+	await mkdir(nodeSource);
+	await execFileAsync('tar', [
+		'-xJf',
+		nodeArchive,
+		'--strip-components=1',
+		'-C',
+		nodeSource,
+	]);
+	const nodeBinary = join(nodeSource, 'bin', 'node');
+	const nativePty = join(
+		runtimeModules,
+		'node-pty',
+		'build',
+		'Release',
+		'pty.node',
+	);
+	await assertElfArchitecture(nodeBinary, platform.elfMachine, 'bundled Node');
+	await assertElfArchitecture(
+		nativePty,
+		platform.elfMachine,
+		'bundled node-pty',
+	);
+
+	const serverPackage = JSON.parse(
+		await readFile(join(serverRoot, 'package.json'), 'utf8'),
+	);
+	if (
+		serverPackage.name !== '@terminay/server' ||
+		serverPackage.engines?.node !== PTY_RUNTIME_NODE_VERSION
+	)
+		throw new Error('server package metadata is not release-compatible');
+	const nodePtyPackage = JSON.parse(
+		await readFile(join(runtimeModules, 'node-pty', 'package.json'), 'utf8'),
+	);
+	if (nodePtyPackage.version !== '1.1.0')
+		throw new Error(
+			`expected node-pty 1.1.0, received ${nodePtyPackage.version}`,
+		);
+
+	const rootName = `terminay-server-node${PTY_RUNTIME_NODE_VERSION}-${target}`;
+	const stagingParent = join(temporary, 'staging');
+	const root = join(stagingParent, rootName);
+	await mkdir(join(root, 'bin'), { recursive: true });
+	await cp(nodeBinary, join(root, 'bin', 'node'));
+	await cp(join(nodeSource, 'LICENSE'), join(root, 'NODE-LICENSE'));
+	await stageCompiledWorkspacePackage(serverRoot, join(root, 'server'));
+	const compiledWorkspaceRoot = join(temporary, 'compiled-workspaces');
+	const compiledServerCore = join(compiledWorkspaceRoot, 'server-core');
+	const compiledProtocol = join(compiledWorkspaceRoot, 'protocol');
+	await stageCompiledWorkspacePackage(serverCoreRoot, compiledServerCore);
+	await stageCompiledWorkspacePackage(protocolRoot, compiledProtocol);
+	const productionDependencies = await stageProductionDependencyClosure({
+		destinationModules: join(root, 'node_modules'),
+		runtimeModules,
+		workspacePackages: {
+			'@terminay/server-core': compiledServerCore,
+			'@terminay/protocol': compiledProtocol,
+		},
+		rootPackages: Object.keys(serverPackage.dependencies ?? {}),
+	});
+	await cp(uiBundle, join(root, 'ui'), { recursive: true, dereference: false });
+	await cp(webrtcRuntime, join(root, 'webrtc-runtime'), {
+		recursive: true,
+		dereference: false,
+	});
+	await writeLaunchers(root, serverPackage.version);
+	// The upgrader ships with the server it upgrades, bundled from the same
+	// source the npm package is built from and checked to embed the same
+	// release key, so an installed server needs no npm to move forward.
+	await stageArchiveCli({ archiveRoot: root });
+	await assertSafeTree(root, 'staged artifact');
+	await assertNoElectron(root);
+	const executables = new Set([
+		join(root, 'bin', 'node'),
+		join(root, 'bin', 'terminay-server'),
+		join(root, ARCHIVE_CLI_LAUNCHER),
+	]);
+	await normalizeArtifactModes(root, executables);
+
+	const manifest = {
+		schemaVersion: 1,
+		artifact: 'terminay-server',
+		target,
+		channel: release.channel,
+		revision: release.revision,
+		architecture: release.architecture,
+		version: serverPackage.version,
+		node: {
+			version: PTY_RUNTIME_NODE_VERSION,
+			archive: basename(nodeArchive),
+			archiveSha256: platform.nodeArchiveSha256,
+		},
+		nodePty: {
+			version: nodePtyPackage.version,
+			nativePath: 'node_modules/node-pty/build/Release/pty.node',
+		},
+		entrypoints: { server: 'bin/terminay-server', cli: ARCHIVE_CLI_LAUNCHER },
+		webrtcRuntime: {
+			root: 'webrtc-runtime',
+			selection: JSON.parse(
+				await readFile(join(webrtcRuntime, 'selection.json'), 'utf8'),
+			),
+		},
+		dependencies: productionDependencies,
+		files: await describeArtifactFiles(root),
+	};
+	await writeFile(
+		join(root, 'artifact-manifest.json'),
+		`${JSON.stringify(manifest, null, 2)}\n`,
+	);
+	await normalizeArtifactModes(root, executables);
+	await mkdir(outputDirectory, { recursive: true });
+	const archivePath = await createDeterministicTarGz({
+		archivePath: join(outputDirectory, `${rootName}.tar.gz`),
+		rootName,
+		stagingDirectory: stagingParent,
+	});
+	process.stdout.write(
+		`${JSON.stringify({ archivePath, archiveSha256: await sha256File(archivePath), target, channel: release.channel, revision: release.revision, architecture: release.architecture }, null, 2)}\n`,
+	);
+} finally {
+	await rm(temporary, { force: true, recursive: true });
+}
+
+async function writeLaunchers(root, version) {
+	// The version is baked in rather than left to the environment: an installed
+	// archive has to be able to say which release it is. Without it the server
+	// reports the workspace placeholder, so an operator checking the version
+	// output before staging an upgrade is told 0.0.0 for every release.
+	if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/u.test(version)) {
+		throw new Error(`staged server version is not a release version: ${version}`);
+	}
+	const server =
+		'#!/bin/sh\nset -eu\nROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)\n' +
+		': "$' +
+		`{TERMINAY_SERVER_VERSION:=${version}}"\n: "$` +
+		// The commit is baked in beside the version for the same reason: a
+		// release started from a data volume, rather than from the image whose
+		// environment names a commit, must still report its own.
+		`{TERMINAY_SERVER_REVISION:=${release.revision}}"\n: "$` +
+		'{TERMINAY_UI_BUNDLE:=$ROOT/ui}"\n: "$' +
+		'{TERMINAY_WEBRTC_RUNTIME_ROOT:=$ROOT/webrtc-runtime}"\n' +
+		// The upgrader this release ships. A server started from the archive can
+		// ask it whether a newer release exists and have it carry out the
+		// upgrade; one started any other way has none and offers no upgrade.
+		': "$' +
+		`{TERMINAY_UPGRADER:=$ROOT/${ARCHIVE_CLI_LAUNCHER}}"\n` +
+		'export TERMINAY_SERVER_VERSION TERMINAY_SERVER_REVISION TERMINAY_UI_BUNDLE TERMINAY_WEBRTC_RUNTIME_ROOT TERMINAY_UPGRADER\nexec "$ROOT/bin/node" "$ROOT/server/dist/cli.js" "$@"\n';
+	await writeFile(join(root, 'bin', 'terminay-server'), server, {
+		mode: 0o755,
+	});
+}
+
+async function stageCompiledWorkspacePackage(sourceRoot, destination) {
+	const packageJson = join(sourceRoot, 'package.json');
+	const dist = join(sourceRoot, 'dist');
+	await mkdir(destination, { recursive: true });
+	await cp(packageJson, join(destination, 'package.json'));
+	await cp(dist, join(destination, 'dist'), {
+		recursive: true,
+		dereference: true,
+	});
+}
+
+async function assertSafeTree(root, label) {
+	try {
+		await walkRegularTree(root);
+	} catch (error) {
+		throw new Error(
+			`${label} is unsafe: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+}
+
+async function assertNoElectron(root) {
+	for (const entry of await walkRegularTree(root)) {
+		if (entry.kind !== 'file' || !/\.(?:[cm]?js|json)$/u.test(entry.path))
+			continue;
+		const content = await readFile(entry.path, 'utf8').catch(() => '');
+		if (
+			/(?:from\s+|import\s*\()["']electron["']|require\(["']electron["']\)/u.test(
+				content,
+			)
+		)
+			throw new Error(`staged artifact imports Electron: ${entry.path}`);
+	}
+}
+
+function parseArgs(values) {
+	const parsed = {};
+	for (let index = 0; index < values.length; index += 2) {
+		const key = values[index];
+		const value = values[index + 1];
+		if (!key?.startsWith('--') || value === undefined)
+			throw new Error('expected --name value arguments');
+		parsed[key.slice(2)] = value;
+	}
+	return parsed;
+}
+function parseBoolean(value) {
+	if (value === 'true') return true;
+	if (value === 'false') return false;
+	throw new Error(`expected true or false, received ${JSON.stringify(value)}`);
+}
+function required(args, name) {
+	if (!args[name]) throw new Error(`missing required --${name}`);
+	return args[name];
+}

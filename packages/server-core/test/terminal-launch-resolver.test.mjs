@@ -1,0 +1,319 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  FolderRootError,
+  TerminalLaunchResolver,
+  TerminalService,
+  TerminalServiceError,
+} from "../dist/index.js";
+
+const GENERAL = { "project-a": "folder-a", "project-b": "folder-b" };
+
+function workspace(overrides = {}) {
+  // Every panel belongs to a folder; tests that do not care get General.
+  const panels = Object.fromEntries(Object.entries(overrides.panels ?? {}).map(([id, panel]) => [id, { folderId: GENERAL[panel.projectId], ...panel }]));
+  const general = (projectId) => ({ id: GENERAL[projectId], projectId, name: "General", kind: "general", panelIds: [], layout: { kind: "stack", panelIds: [] } });
+  return {
+    schemaVersion: 1,
+    serverId: "server-a",
+    revision: 7,
+    cursor: "7",
+    viewOrder: ["view-a"],
+    views: { "view-a": { id: "view-a", serverId: "server-a", name: "Workspace", projectIds: ["project-a", "project-b"] } },
+    projects: {
+      "project-a": { id: "project-a", serverId: "server-a", viewId: "view-a", root: "/project", rootOrigin: "explicit", name: "Project", folderIds: ["folder-a", ...Object.keys(overrides.folders ?? {})], panelIds: [], layout: { kind: "stack", panelIds: [] }, ...overrides.project },
+      "project-b": { id: "project-b", serverId: "server-a", viewId: "view-a", root: "/other", rootOrigin: "explicit", name: "Other", folderIds: ["folder-b"], panelIds: [], layout: { kind: "stack", panelIds: [] } },
+    },
+    folders: { "folder-a": general("project-a"), "folder-b": general("project-b"), ...overrides.folders },
+    panels,
+    terminalSessions: {},
+  };
+}
+
+function profile(id, overrides = {}) {
+  return {
+    id,
+    name: id === "system" ? "System default" : id,
+    target: { kind: "executable", executable: `/shell/${id}` },
+    args: [],
+    startupMode: "default",
+    environment: {},
+    kind: id === "system" ? "system" : "custom",
+    readOnly: id === "system",
+    source: id === "system" ? "system" : "custom",
+    availability: { available: true },
+    ...overrides,
+  };
+}
+
+function profiles(entries, options = {}) {
+  const byId = new Map(entries.map((entry) => [entry.id, entry]));
+  return {
+    catalogue: async () => ({
+      settingsRevision: 11,
+      defaultProfileId: options.defaultProfileId ?? "system",
+      cwdPolicy: options.cwdPolicy ?? "current",
+      entries,
+      projectReferences: {},
+    }),
+    resolveProfile: async (id, catalogue) => {
+      const selected = byId.get(id);
+      if (selected === undefined) throw new Error("not found");
+      if (!selected.availability.available) throw new Error("unavailable");
+      const target = options.resolvedTargets?.[id] ?? (selected.target.kind === "wsl"
+        ? { ...selected.target, executable: "C:\\Windows\\System32\\wsl.exe" }
+        : selected.target);
+      return { profile: selected, definition: selected, settingsRevision: catalogue.settingsRevision, target };
+    },
+  };
+}
+
+function paths(available = ["/project", "/other", "/home", "/live", "/explicit", "/"]) {
+  const set = new Set(available);
+  return {
+    canonicalDirectory: async (value) => set.has(value) ? value : null,
+    homeDirectory: async () => set.has("/home") ? "/home" : null,
+    isRoot: (value) => value === "/",
+  };
+}
+
+function resolver({ state = workspace(), entries = [profile("system")], catalogue = {}, observe, environmentCaseInsensitive = false, systemDefaultStartupMode, defaultEnvironment, environmentFor, folderWorktreeRoot, available } = {}) {
+  return new TerminalLaunchResolver({
+    serverId: "server-a",
+    profiles: profiles(entries, catalogue),
+    workspaceSnapshot: () => state,
+    pathAuthority: paths(available),
+    folderWorktreeRoot,
+    defaultEnvironment: defaultEnvironment ?? { BASE: "host", REMOVE: "host", TERMINAY_SERVER: "trusted", TERM: "dumb", COLORTERM: "false" },
+    observeTerminalCwd: observe,
+    now: () => 123,
+    environmentCaseInsensitive,
+    systemDefaultStartupMode,
+    environmentFor,
+  });
+}
+
+function intent(overrides = {}) {
+  return { identity: { serverId: "server-a", projectId: "project-a", sessionId: "session-a" }, cols: 80, rows: 24, ...overrides };
+}
+
+test("launch resolver selects explicit, project, server, then System profile and snapshots revisions", async () => {
+  const entries = [profile("system"), profile("server"), profile("project"), profile("explicit")];
+  const state = workspace({ project: { defaultShellProfileId: "project" } });
+  const explicit = await resolver({ state, entries, catalogue: { defaultProfileId: "server" } }).resolve(intent({ explicitProfileId: "explicit" }));
+  const projectDefault = await resolver({ state, entries, catalogue: { defaultProfileId: "server" } }).resolve(intent());
+  const serverDefault = await resolver({ entries, catalogue: { defaultProfileId: "server" } }).resolve(intent());
+  const systemDefault = await resolver({ entries }).resolve(intent());
+  assert.deepEqual([explicit.profile.id, projectDefault.profile.id, serverDefault.profile.id, systemDefault.profile.id], ["explicit", "project", "server", "system"]);
+  assert.deepEqual({ workspaceRevision: explicit.workspaceRevision, settingsRevision: explicit.settingsRevision, createdAt: explicit.createdAt }, { workspaceRevision: 7, settingsRevision: 11, createdAt: 123 });
+});
+
+test("launch resolver preserves argv boundaries, translates login mode, and layers profile environment", async () => {
+  const selected = profile("zsh", {
+    target: { kind: "executable", executable: "/bin/zsh" },
+    startupMode: "login",
+    args: ["--no-globalrcs", "two words"],
+    environment: { BASE: "profile", REMOVE: null, ADDED: "$NOT_EXPANDED" },
+  });
+  const launch = await resolver({ entries: [profile("system"), selected] }).resolve(intent({ explicitProfileId: "zsh" }));
+  assert.equal(launch.shellPath, "/bin/zsh");
+  assert.deepEqual(launch.args, ["-l", "--no-globalrcs", "two words"]);
+  assert.deepEqual(launch.env, { BASE: "profile", TERMINAY_SERVER: "trusted", TERM: "xterm-256color", COLORTERM: "truecolor", ADDED: "$NOT_EXPANDED" });
+});
+
+test("host per-session environment overrides profile values without entering profile policy", async () => {
+  const selected = profile("zsh", {
+    environment: { HOST_EPHEMERAL_TOKEN: "profile-token", REMOVE: "profile" },
+  });
+  const launch = await resolver({
+    entries: [profile("system"), selected],
+    environmentFor: (received) => {
+      assert.equal(received.identity.sessionId, "session-a");
+      return { HOST_EPHEMERAL_TOKEN: "capability-token", REMOVE: undefined };
+    },
+  }).resolve(intent({ explicitProfileId: "zsh" }));
+  assert.equal(launch.env.HOST_EPHEMERAL_TOKEN, "capability-token");
+  assert.equal("REMOVE" in launch.env, false);
+});
+
+test("host policy launches only the reserved System default as a login shell", async () => {
+  const system = profile("system", {
+    target: { kind: "system" },
+  });
+  const custom = profile("custom", {
+    target: { kind: "executable", executable: "/bin/zsh" },
+  });
+  const catalogue = {
+    resolvedTargets: {
+      system: { kind: "executable", executable: "/bin/zsh" },
+    },
+  };
+  const options = { entries: [system, custom], catalogue, systemDefaultStartupMode: "login" };
+
+  const systemLaunch = await resolver(options).resolve(intent());
+  const customLaunch = await resolver(options).resolve(intent({ explicitProfileId: "custom" }));
+
+  assert.deepEqual(systemLaunch.args, ["-l"]);
+  assert.deepEqual(customLaunch.args, []);
+});
+
+test("launch resolver supports login and non-login startup modes for POSIX sh implementations", async () => {
+  const dash = profile("dash", {
+    target: { kind: "executable", executable: "/usr/bin/dash" },
+    startupMode: "login",
+  });
+  const sh = profile("sh", {
+    target: { kind: "executable", executable: "/bin/sh" },
+    startupMode: "non-login",
+    args: ["-i"],
+  });
+  const entries = [profile("system"), dash, sh];
+
+  const login = await resolver({ entries }).resolve(intent({ explicitProfileId: "dash" }));
+  const nonLogin = await resolver({
+    entries,
+    catalogue: { resolvedTargets: { sh: { kind: "executable", executable: "/usr/bin/dash" } } },
+  }).resolve(intent({ explicitProfileId: "sh" }));
+
+  assert.deepEqual(login.args, ["-l"]);
+  assert.deepEqual(nonLogin.args, ["-i"]);
+});
+
+test("Windows environment layering is case-insensitive and protected aliases are rejected", async () => {
+  const selected = profile("windows", { environment: { base: "profile" } });
+  const launch = await resolver({
+    entries: [profile("system"), selected],
+    environmentCaseInsensitive: true,
+    defaultEnvironment: { BASE: "host", term: "dumb", ColorTerm: "false" },
+  }).resolve(intent({ explicitProfileId: "windows" }));
+  assert.equal(launch.env.base, "profile");
+  assert.equal("BASE" in launch.env, false);
+  assert.equal(launch.env.TERM, "xterm-256color");
+  assert.equal(launch.env.COLORTERM, "truecolor");
+  assert.equal("term" in launch.env, false);
+  assert.equal("ColorTerm" in launch.env, false);
+  const protectedProfile = profile("bad", { environment: { TERM: "spoofed" } });
+  await assert.rejects(
+    resolver({ entries: [profile("system"), protectedProfile] }).resolve(intent({ explicitProfileId: "bad" })),
+    (error) => error instanceof TerminalServiceError && error.code === "invalid_environment",
+  );
+});
+
+test("WSL launch keeps distribution structured, requires an explicit shell for args, and generates WSLENV", async () => {
+  const wsl = profile("wsl-zsh", {
+    target: { kind: "wsl", distribution: "Ubuntu Dev", shellPath: "/bin/zsh" },
+    startupMode: "login",
+    args: ["--no-rcs"],
+    environment: { DEV_MODE: "1" },
+  });
+  const launch = await resolver({
+    entries: [profile("system"), wsl],
+    environmentCaseInsensitive: true,
+    defaultEnvironment: { wslenv: "EXISTING/u", TERM: "dumb", COLORTERM: "false" },
+  }).resolve(intent({ explicitProfileId: "wsl-zsh" }));
+  assert.equal(launch.shellPath, "C:\\Windows\\System32\\wsl.exe");
+  assert.deepEqual(launch.args, ["--distribution", "Ubuntu Dev", "--exec", "/bin/zsh", "-l", "--no-rcs"]);
+  assert.equal(launch.env.WSLENV, "EXISTING/u:DEV_MODE:TERM:COLORTERM");
+  assert.equal("wslenv" in launch.env, false);
+  assert.equal(launch.env.TERM, "xterm-256color");
+  assert.equal(launch.env.COLORTERM, "truecolor");
+  const missingShell = profile("wsl-default", { target: { kind: "wsl", distribution: "Ubuntu Dev" }, args: ["--login"] });
+  await assert.rejects(
+    resolver({ entries: [profile("system"), missingShell] }).resolve(intent({ explicitProfileId: "wsl-default" })),
+    (error) => error instanceof TerminalServiceError && error.code === "unsupported_startup_mode",
+  );
+});
+
+test("current cwd uses same-project observed cwd, stale cwd falls back, and cross-project panel intent is forbidden", async () => {
+  const terminalPanel = { id: "panel-a", projectId: "project-a", type: "terminal", sessionId: "old-session", cwd: "/stale", createdAt: 1 };
+  const otherPanel = { ...terminalPanel, id: "panel-b", projectId: "project-b" };
+  const state = workspace({ panels: { "panel-a": terminalPanel, "panel-b": otherPanel } });
+  assert.equal((await resolver({ state, observe: async () => "/live" }).resolve(intent({ activePanelId: "panel-a" }))).cwd, "/live");
+  assert.equal((await resolver({ state, observe: async () => "/missing" }).resolve(intent({ activePanelId: "panel-a" }))).cwd, "/project");
+  await assert.rejects(
+    resolver({ state, observe: async () => "/live" }).resolve(intent({ activePanelId: "panel-b" })),
+    (error) => error instanceof TerminalServiceError && error.code === "forbidden",
+  );
+});
+
+test("explicit and project roots remain valid while observed or home roots are never implicit fallbacks", async () => {
+  assert.equal((await resolver().resolve(intent({ explicitCwd: "/" }))).cwd, "/");
+  assert.equal((await resolver({ state: workspace({ project: { root: "/" } }) }).resolve(intent())).cwd, "/");
+  const panel = { id: "panel-a", projectId: "project-a", type: "terminal", sessionId: "old", cwd: "/", createdAt: 1 };
+  assert.equal((await resolver({ state: workspace({ panels: { "panel-a": panel } }), observe: async () => "/" }).resolve(intent({ activePanelId: "panel-a" }))).cwd, "/project");
+  const unsafeHome = new TerminalLaunchResolver({
+    serverId: "server-a", profiles: profiles([profile("system")], { cwdPolicy: "home" }), workspaceSnapshot: () => workspace(),
+    pathAuthority: { canonicalDirectory: async (value) => value, homeDirectory: async () => "/", isRoot: (value) => value === "/" },
+  });
+  await assert.rejects(unsafeHome.resolve(intent()), (error) => error instanceof TerminalServiceError && error.code === "unsafe_cwd");
+});
+
+test("unverified legacy filesystem roots fail until the project root is explicitly confirmed", async () => {
+  await assert.rejects(
+    resolver({ state: workspace({ project: { root: "/", rootOrigin: "legacy-unverified" } }) }).resolve(intent()),
+    (error) => error instanceof TerminalServiceError && error.code === "unsafe_legacy_root",
+  );
+});
+
+test("missing explicit cwd and missing project root have distinct bounded failures", async () => {
+  await assert.rejects(resolver().resolve(intent({ explicitCwd: "/missing" })), (error) => error instanceof TerminalServiceError && error.code === "invalid_cwd");
+  await assert.rejects(resolver({ state: workspace({ project: { root: "/missing" } }) }).resolve(intent()), (error) => error instanceof TerminalServiceError && error.code === "missing_project_root");
+});
+
+test("resolved spawn failure leaves no session and exposes no provider output", async () => {
+  const service = new TerminalService({ serverId: "server-a", ptyFactory: { spawn() { throw new Error("provider secret output"); } } });
+  const launch = await resolver().resolve(intent());
+  await assert.rejects(service.createResolvedSession(launch), (error) => error instanceof TerminalServiceError && error.code === "spawn_failed" && !error.message.includes("provider secret"));
+  assert.equal(service.size, 0);
+});
+
+const LINKED = { "folder-wt": { id: "folder-wt", projectId: "project-a", name: "feature", kind: "linked", worktree: { repositoryId: "repo", path: "/worktree" }, panelIds: [], layout: { kind: "stack", panelIds: [] } } };
+const DIRECTORIES = ["/project", "/other", "/home", "/live", "/worktree", "/worktree/src", "/"];
+/** The host's answer for a folder: a linked folder's worktree, else null. */
+const worktreeRoot = async (_projectId, folderId) => (folderId === "folder-wt" ? "/worktree" : null);
+
+test("a terminal created in a linked folder starts in that folder's worktree", async () => {
+  const state = workspace({ folders: LINKED });
+  const make = (overrides, options = {}) => resolver({ state, folderWorktreeRoot: worktreeRoot, available: DIRECTORIES, ...options }).resolve(intent(overrides));
+  assert.equal((await make({ folderId: "folder-wt" })).cwd, "/worktree");
+  // General, and a request that names no folder, still start at the project root.
+  assert.equal((await make({ folderId: "folder-a" })).cwd, "/project");
+  assert.equal((await make({})).cwd, "/project");
+  // The Project folder policy means the folder's root too.
+  assert.equal((await make({ folderId: "folder-wt" }, { catalogue: { cwdPolicy: "project" } })).cwd, "/worktree");
+  assert.equal((await make({ folderId: "folder-wt" }, { catalogue: { cwdPolicy: "home" } })).cwd, "/home");
+  // An explicit directory from an authorized action still wins.
+  assert.equal((await make({ folderId: "folder-wt", explicitCwd: "/live" })).cwd, "/live");
+});
+
+test("a directory is inherited only from a panel of the folder the terminal is created in", async () => {
+  const inWorktree = { id: "panel-wt", projectId: "project-a", folderId: "folder-wt", type: "terminal", sessionId: "s-wt", cwd: "/worktree/src", createdAt: 1 };
+  const inGeneral = { id: "panel-g", projectId: "project-a", type: "terminal", sessionId: "s-g", cwd: "/live", createdAt: 2 };
+  const state = workspace({ folders: LINKED, panels: { "panel-wt": inWorktree, "panel-g": inGeneral } });
+  const observe = async (sessionId) => (sessionId === "s-wt" ? "/worktree/src" : "/live");
+  const make = (overrides) => resolver({ state, observe, folderWorktreeRoot: worktreeRoot, available: DIRECTORIES }).resolve(intent(overrides));
+  assert.equal((await make({ folderId: "folder-wt", activePanelId: "panel-wt" })).cwd, "/worktree/src");
+  // The device's last active panel is in General: its directory is not inherited.
+  assert.equal((await make({ folderId: "folder-wt", activePanelId: "panel-g" })).cwd, "/worktree");
+  assert.equal((await make({ folderId: "folder-a", activePanelId: "panel-wt" })).cwd, "/project");
+  assert.equal((await make({ activePanelId: "panel-g" })).cwd, "/live");
+});
+
+test("a folder of another project is refused, and a missing worktree falls back to the project root", async () => {
+  const state = workspace({ folders: LINKED });
+  const forbidden = (error) => error instanceof TerminalServiceError && error.code === "forbidden";
+  await assert.rejects(resolver({ state, folderWorktreeRoot: worktreeRoot }).resolve(intent({ folderId: "folder-b" })), forbidden);
+  await assert.rejects(resolver({ state, folderWorktreeRoot: worktreeRoot }).resolve(intent({ folderId: "folder-missing" })), forbidden);
+
+  for (const code of ["folder_worktree_unregistered", "folder_root_unavailable"]) {
+    const gone = async () => { throw new FolderRootError(code, "gone"); };
+    assert.equal((await resolver({ state, folderWorktreeRoot: gone, available: DIRECTORIES }).resolve(intent({ folderId: "folder-wt" }))).cwd, "/project");
+  }
+  // The worktree is registered but its directory cannot be entered.
+  assert.equal((await resolver({ state, folderWorktreeRoot: worktreeRoot }).resolve(intent({ folderId: "folder-wt" }))).cwd, "/project");
+  // Any other failure is not swallowed.
+  const broken = async () => { throw new Error("listing exploded"); };
+  await assert.rejects(resolver({ state, folderWorktreeRoot: broken }).resolve(intent({ folderId: "folder-wt" })), /listing exploded/);
+  // A host that does not resolve folders starts everything at the project root.
+  assert.equal((await resolver({ state }).resolve(intent({ folderId: "folder-wt" }))).cwd, "/project");
+});

@@ -1,0 +1,1573 @@
+import {
+	FEATURE_CAPABILITIES,
+	type JsonValue,
+	parseWorkspaceDeltaDto,
+	parseWorkspaceRecordsDeltaDto,
+	parseBrowseRootFoldersRequest,
+	parseProjectStartRequest,
+	parseRecentForgetRequest,
+	parseWorkspaceSnapshotDto,
+	PROJECT_START_OPERATIONS,
+	PROJECT_START_REFUSALS,
+	protocolError,
+	WORKSPACE_DELTA_VERSION,
+	WORKSPACE_RECORDS_DELTA_VERSION,
+	type WorkspaceChangeRecordDto,
+	type WorkspaceDeltaDto,
+	type WorkspaceRecordsDeltaDto,
+} from '@terminay/protocol';
+import type {
+	AuthenticatedClient,
+	CommandRequest,
+	OperationRegistries,
+	OrderedEvent,
+	OrderedEventJournalLike,
+	QueryRequest,
+} from './types.js';
+import { TerminalServiceError } from './terminalService/errors.js';
+import { RootFolderError, type RootFolderBrowser } from './rootFolderBrowser.js';
+import {
+	AUTOMATION_SPACE_TERMINAL_LIMIT,
+	PROJECT_AWAITING_START_CHOICE,
+	PROJECT_START_CONFLICT_MESSAGE,
+	automationSpaceRefusal,
+	canSeeAutomationSpace,
+	isAutomationSpace,
+	type WorkspaceCommand,
+	type WorkspaceCommittedChange,
+	type WorkspaceState,
+	WorkspaceStore,
+	withholdAutomationSpace,
+	workspaceStateDifference,
+} from './workspace.js';
+
+/** Protocol operation names for the server-owned workspace boundary. */
+export const WORKSPACE_OPERATIONS = Object.freeze({
+	snapshot: 'workspace.snapshot',
+	delta: 'workspace.delta',
+	command: 'workspace.command',
+	projectMove: 'project.move',
+	projectRootUpdate: 'project.root.update',
+	projectShellProfileSet: 'project.shell-profile.set',
+	projectShellProfileClear: 'project.shell-profile.clear',
+	projectShellProfileReplace: 'project.shell-profile.replace',
+	projectStart: PROJECT_START_OPERATIONS.start,
+} as const);
+export const WORKSPACE_EVENT = 'workspace.changed';
+/** Typed project lifecycle facts, emitted once per `project.create` /
+ * `project.close` command that actually opens or closes a project. The
+ * automation space is never reported. */
+export const PROJECT_OPENED_EVENT = 'project.opened';
+export const PROJECT_CLOSED_EVENT = 'project.closed';
+/** The server moved a terminal into the folder of a worktree it created. The
+ * payload names the project, the folder, the panel, and the folder it left, so
+ * a client can offer to put it back. */
+export const FOLDER_TERMINAL_CAPTURED_EVENT = 'folder.terminal-captured';
+
+export interface ProjectLifecycleEventPayload {
+	readonly serverId: string;
+	readonly projectId: string;
+	readonly name: string;
+	readonly revision: number;
+}
+
+export interface PreparedProjectRootUpdate {
+	readonly canonicalRoot: string;
+	/** Commit runs only after the workspace revision accepts the canonical root,
+	 * so dependent services observe the same project root as the workspace. */
+	readonly commit: () => Promise<void> | void;
+}
+
+/** A live terminal following its panel from one project to another. */
+export interface TerminalSessionRehome {
+	readonly sessionId: string;
+	readonly sourceProjectId: string;
+	readonly targetProjectId: string;
+}
+
+export interface WorkspaceOperationRegistryOptions {
+	/**
+	 * The server's default project folder. A `project.create` that names no
+	 * root — a window creating its first project while it holds none, so it has
+	 * no project whose folder to reuse — is created here, with a
+	 * `server-default` origin.
+	 */
+	readonly defaultProjectRoot?: () => Promise<string | null>;
+	readonly prepareProjectRootUpdate?: (
+		projectId: string,
+		root: string,
+	) => Promise<PreparedProjectRootUpdate>;
+	readonly closeTerminalSessions?: (
+		sessionIds: readonly string[],
+	) => Promise<void> | void;
+	readonly closeProjectTerminalSessions?: (
+		sessionIds: readonly string[],
+	) => Promise<void> | void;
+	/**
+	 * Runs after `project.close` is applied, whether or not the project had
+	 * terminals, so every server-held resource keyed by the project is released
+	 * with it. A project move is not a close and does not call this.
+	 */
+	readonly releaseProject?: (projectId: string) => Promise<void> | void;
+	/**
+	 * Runs when a `panel.move` of a terminal panel has committed and before the
+	 * new revision is published, so the terminal already answers to its target
+	 * project when any client sees the move. It must not throw: the workspace
+	 * commit is the only point at which a move can fail.
+	 */
+	readonly rehomeTerminalSession?: (move: TerminalSessionRehome) => void;
+	readonly eventJournal?: OrderedEventJournalLike;
+	readonly shellProfileExists?: (
+		profileId: string,
+	) => boolean | Promise<boolean>;
+	/**
+	 * The server's own folders, read to start a project and to choose a root
+	 * (ADR-0066). Without it no start-choice, recent-folder, or browse
+	 * operation is registered, and every created project starts at once.
+	 */
+	readonly rootFolders?: RootFolderBrowser;
+	/** Clock for recent-folder times. */
+	readonly now?: () => number;
+}
+
+export interface WorkspaceOperationRegistry {
+	readonly workspace: WorkspaceStore;
+	readonly operations: OperationRegistries;
+	readonly applyHostCommand: (
+		commandId: string,
+		command: WorkspaceCommand,
+		expectedRevision?: number,
+	) => ReturnType<WorkspaceStore['apply']>;
+	/** Server-internal: the automation terminal space's project id, created and
+	 * published on first use. Never reachable as a client operation. */
+	readonly ensureAutomationSpace: (root: string) => string;
+}
+
+/**
+ * Expose the canonical workspace reducer through the authenticated server
+ * dispatcher. The legacy renderer may still carry its project/tab payload for
+ * the drag animation and PTY reattachment, but project ownership changes are
+ * committed here first and are never authorized by that payload.
+ */
+export function createWorkspaceOperationRegistry(
+	workspace: WorkspaceStore,
+	options: WorkspaceOperationRegistryOptions = {},
+): WorkspaceOperationRegistry {
+	const queries = {
+		[WORKSPACE_OPERATIONS.snapshot]: (request: QueryRequest) =>
+			parseWorkspaceSnapshotDto(
+				projectScopedState(
+					connectionVisibleState(workspace.state, request),
+					projectClaim(request),
+				),
+			) as unknown as JsonValue,
+		[WORKSPACE_OPERATIONS.delta]: (request: QueryRequest) => {
+			const payload = objectPayload(request.envelope.payload);
+			const revision = uint(payload.revision, 'revision');
+			const cursor = stringField(payload.cursor, 'cursor');
+			if (cursor !== String(revision))
+				throw protocolError(
+					'validation',
+					'workspace cursor does not match revision',
+				);
+			if (speaksChangeRecords(request.context.clientCapabilities))
+				return recordsDelta(workspace, request, revision, cursor);
+			const delta = projectScopedDelta(
+				connectionVisibleDelta(workspace.delta(revision), request),
+				projectClaim(request),
+			);
+			const response: WorkspaceDeltaDto = {
+				deltaVersion: WORKSPACE_DELTA_VERSION,
+				serverId: delta.state.serverId,
+				fromRevision: revision,
+				fromCursor: cursor,
+				revision: delta.state.revision,
+				cursor: delta.state.cursor,
+				state: delta.state as unknown as WorkspaceDeltaDto['state'],
+				events: delta.events,
+			};
+			return parseWorkspaceDeltaDto(response, {
+				serverId: delta.state.serverId,
+				revision,
+				cursor,
+			}) as unknown as JsonValue;
+		},
+		...(options.rootFolders === undefined
+			? {}
+			: {
+					[PROJECT_START_OPERATIONS.recentList]: (request: QueryRequest) =>
+						listRecentProjectFolders(workspace, rootFoldersOf(options), request),
+					[PROJECT_START_OPERATIONS.browseRootFolders]: (request: QueryRequest) =>
+						browseRootFolders(rootFoldersOf(options), request),
+				}),
+	};
+	const startsInFlight = new Map<string, Promise<unknown>>();
+
+	const commands = {
+		[WORKSPACE_OPERATIONS.command]: (request: CommandRequest) =>
+			applyCommand(
+				workspace,
+				options,
+				request,
+				commandPayload(request.envelope.payload),
+			),
+		[WORKSPACE_OPERATIONS.projectMove]: (request: CommandRequest) =>
+			applyCommand(workspace, options, request, {
+				type: 'project.move',
+				projectId: stringField(
+					objectPayload(request.envelope.payload).projectId,
+					'projectId',
+				),
+				targetViewId: stringField(
+					objectPayload(request.envelope.payload).targetViewId,
+					'targetViewId',
+				),
+				...(optionalUInt(objectPayload(request.envelope.payload).index) ===
+				undefined
+					? {}
+					: {
+							index: optionalUInt(
+								objectPayload(request.envelope.payload).index,
+							),
+						}),
+			}),
+		[WORKSPACE_OPERATIONS.projectRootUpdate]: (request: CommandRequest) =>
+			updateProjectRoot(workspace, options, request),
+		[WORKSPACE_OPERATIONS.projectShellProfileSet]: (request: CommandRequest) =>
+			updateProjectShellProfile(workspace, options, request, 'set'),
+		[WORKSPACE_OPERATIONS.projectShellProfileClear]: (
+			request: CommandRequest,
+		) => updateProjectShellProfile(workspace, options, request, 'clear'),
+		[WORKSPACE_OPERATIONS.projectShellProfileReplace]: (
+			request: CommandRequest,
+		) => replaceProjectShellProfiles(workspace, options, request),
+		...(options.rootFolders === undefined
+			? {}
+			: {
+					[WORKSPACE_OPERATIONS.projectStart]: (request: CommandRequest) =>
+						startProject(workspace, options, request, startsInFlight),
+					[PROJECT_START_OPERATIONS.recentForget]: (request: CommandRequest) =>
+						forgetRecentProjectFolder(workspace, options, request),
+				}),
+	};
+
+	const policies = {
+		[WORKSPACE_OPERATIONS.snapshot]: { scope: 'read' as const },
+		[WORKSPACE_OPERATIONS.delta]: { scope: 'read' as const },
+		[WORKSPACE_OPERATIONS.command]: { scope: 'write' as const },
+		[WORKSPACE_OPERATIONS.projectMove]: { scope: 'write' as const },
+		[WORKSPACE_OPERATIONS.projectRootUpdate]: { scope: 'write' as const },
+		[WORKSPACE_OPERATIONS.projectShellProfileSet]: { scope: 'write' as const },
+		[WORKSPACE_OPERATIONS.projectShellProfileClear]: {
+			scope: 'write' as const,
+		},
+		[WORKSPACE_OPERATIONS.projectShellProfileReplace]: {
+			scope: 'write' as const,
+		},
+		...(options.rootFolders === undefined
+			? {}
+			: {
+					[WORKSPACE_OPERATIONS.projectStart]: { scope: 'write' as const },
+					[PROJECT_START_OPERATIONS.recentList]: { scope: 'read' as const },
+					[PROJECT_START_OPERATIONS.recentForget]: { scope: 'write' as const },
+					// Browsing for a root takes the authority to change one.
+					[PROJECT_START_OPERATIONS.browseRootFolders]: {
+						scope: 'write' as const,
+					},
+				}),
+	};
+
+	return {
+		workspace,
+		operations: { queries, commands, policies },
+		applyHostCommand: (commandId, command, expectedRevision) => {
+			const lifecycle = observeProjectLifecycle(workspace, command);
+			const rehome = terminalSessionRehomedBy(workspace.state, command);
+			const applied = workspace.apply({
+				commandId,
+				command,
+				...(expectedRevision === undefined ? {} : { expectedRevision }),
+			});
+			if (applied.ok) {
+				if (rehome !== undefined) options.rehomeTerminalSession?.(rehome);
+				publishWorkspaceChange(
+					options.eventJournal,
+					workspace,
+					commandProjectId(command),
+				);
+				lifecycle.publish(options.eventJournal);
+			}
+			return applied;
+		},
+		ensureAutomationSpace: (root) => {
+			const before = workspace.state.revision;
+			const projectId = workspace.ensureAutomationSpace({ root });
+			if (workspace.state.revision !== before)
+				publishWorkspaceChange(options.eventJournal, workspace, projectId);
+			return projectId;
+		},
+	};
+}
+
+/** Terminal-creation guard for the automation space, checked before any PTY
+ * is spawned: a connection that cannot see the space cannot target it, and the
+ * space refuses a terminal beyond its live-terminal limit. */
+export function automationSpaceSessionGuard(
+	workspace: WorkspaceStore,
+): (request: CommandRequest, projectId: string) => void {
+	return (request, projectId) => {
+		const state = workspace.state;
+		if (!isAutomationSpace(state.projects[projectId])) return;
+		if (!canSeeAutomationSpace(request.context.clientCapabilities))
+			throw new TerminalServiceError('forbidden', 'project not found');
+		const refusal = automationSpaceRefusal(state, {
+			type: 'terminal.create',
+			sessionId: 'automation-space-guard',
+			projectId,
+		});
+		if (refusal !== undefined)
+			throw new TerminalServiceError('session_limit', refusal, {
+				projectId,
+				max: AUTOMATION_SPACE_TERMINAL_LIMIT,
+			});
+	};
+}
+
+/** Whether an exited session is still retained for viewing: a terminal in
+ * the automation space whose panel is still open (a kept run terminal, or one
+ * a run opened through MCP). It stays viewable, read-only, until a person
+ * closes it. Sessions in ordinary projects are never retained this way. */
+export function automationSpaceRetainsExitedSession(
+	workspace: WorkspaceStore,
+): (identity: {
+	readonly projectId: string;
+	readonly sessionId: string;
+}) => boolean {
+	return (identity) => {
+		const state = workspace.state;
+		if (!isAutomationSpace(state.projects[identity.projectId])) return false;
+		return Object.values(state.panels).some(
+			(panel) =>
+				panel.type === 'terminal' &&
+				panel.projectId === identity.projectId &&
+				panel.sessionId === identity.sessionId,
+		);
+	};
+}
+
+/** Whether a connection negotiated change records (ADR-0059). */
+function speaksChangeRecords(
+	capabilities: readonly string[] | undefined,
+): boolean {
+	return capabilities?.includes(FEATURE_CAPABILITIES.workspaceChanges) === true;
+}
+
+/**
+ * What a connection may read of a state, as a function of the state: all of
+ * it less the automation space it did not negotiate, within the project it is
+ * claimed to. `undefined` means the connection reads the state as it is.
+ * The same function scopes a snapshot and both sides of a change, which is
+ * what makes a scoped record exact.
+ */
+function readScopeOf(
+	capabilities: readonly string[] | undefined,
+	claimedProjectId: string | undefined,
+): ((state: WorkspaceState) => WorkspaceState) | undefined {
+	const seesAutomationSpace = canSeeAutomationSpace(capabilities);
+	const seesStartChoice = speaksStartChoice(capabilities);
+	if (seesAutomationSpace && seesStartChoice && claimedProjectId === undefined)
+		return undefined;
+	return (state) =>
+		projectScopedState(
+			startStateFor(
+				seesAutomationSpace ? state : withholdAutomationSpace(state),
+				capabilities,
+			),
+			claimedProjectId,
+		);
+}
+
+/** Whether a connection negotiated the start choice (ADR-0066). */
+export function speaksStartChoice(
+	capabilities: readonly string[] | undefined,
+): boolean {
+	return (
+		capabilities?.includes(FEATURE_CAPABILITIES.projectStartChoice) === true
+	);
+}
+
+/**
+ * A connection that did not negotiate the start choice cannot present a
+ * project waiting for one. It is shown such a project as one with no root
+ * folder, which it can still give a root.
+ */
+function startStateFor(
+	state: WorkspaceState,
+	capabilities: readonly string[] | undefined,
+): WorkspaceState {
+	if (speaksStartChoice(capabilities)) return state;
+	let projects: Record<string, WorkspaceState['projects'][string]> | undefined;
+	for (const [id, project] of Object.entries(state.projects)) {
+		if (project.start === undefined) continue;
+		projects ??= { ...state.projects };
+		const { start: _start, ...started } = project;
+		projects[id] = started;
+	}
+	return projects === undefined ? state : { ...state, projects };
+}
+
+/**
+ * One commit as a connection may see it. An unscoped connection is given the
+ * commit's own record. A scoped one is given the difference between what it
+ * could read before and after, so an object that entered its scope arrives in
+ * full, one that left is named as removed, and nothing outside it is named at
+ * all, the command's type included.
+ */
+function changeRecordFor(
+	change: WorkspaceCommittedChange,
+	scope: ((state: WorkspaceState) => WorkspaceState) | undefined,
+): WorkspaceChangeRecordDto {
+	if (scope === undefined)
+		return change.record as unknown as WorkspaceChangeRecordDto;
+	const { fromRevision, revision, cursor } = change.record;
+	return {
+		fromRevision,
+		revision,
+		cursor,
+		...workspaceStateDifference(scope(change.previous), scope(change.state)),
+	} as unknown as WorkspaceChangeRecordDto;
+}
+
+function recordsDelta(
+	workspace: WorkspaceStore,
+	request: QueryRequest,
+	revision: number,
+	cursor: string,
+): JsonValue {
+	const delta = workspace.delta(revision);
+	const scope = readScopeOf(
+		request.context.clientCapabilities,
+		projectClaim(request),
+	);
+	const envelope = {
+		deltaVersion: WORKSPACE_RECORDS_DELTA_VERSION,
+		serverId: delta.state.serverId,
+		fromRevision: revision,
+		fromCursor: cursor,
+		revision: delta.state.revision,
+		cursor: delta.state.cursor,
+	};
+	const response: WorkspaceRecordsDeltaDto =
+		delta.changes === undefined
+			? {
+					...envelope,
+					state: (scope === undefined
+						? delta.state
+						: scope(delta.state)) as unknown as WorkspaceDeltaDto['state'],
+				}
+			: {
+					...envelope,
+					records: delta.changes.map((change) =>
+						changeRecordFor(change, scope),
+					),
+				};
+	return parseWorkspaceRecordsDeltaDto(response, {
+		serverId: delta.state.serverId,
+		revision,
+		cursor,
+	}) as unknown as JsonValue;
+}
+
+/**
+ * Attach a commit's change record to its `workspace.changed` event, for a
+ * connection that negotiated change records, immediately before delivery. The
+ * journal holds the event once and small; the record is derived per connection
+ * because what a connection may read is. A commit the store no longer retains
+ * is delivered without one, and the client asks for a delta.
+ */
+export function createWorkspaceChangeEventProjector(
+	workspace: WorkspaceStore,
+): (
+	event: OrderedEvent,
+	client: AuthenticatedClient | undefined,
+	connection?: { readonly clientCapabilities?: readonly string[] },
+) => OrderedEvent | undefined {
+	return (event, client, connection) => {
+		if (event.event !== WORKSPACE_EVENT) return event;
+		const capabilities = connection?.clientCapabilities;
+		if (!speaksChangeRecords(capabilities)) return event;
+		const payload = event.payload;
+		if (
+			typeof payload !== 'object' ||
+			payload === null ||
+			Array.isArray(payload) ||
+			typeof payload.revision !== 'number'
+		)
+			return event;
+		const change = workspace.changeAt(payload.revision);
+		if (change === undefined) return event;
+		try {
+			const record = changeRecordFor(
+				change,
+				readScopeOf(capabilities, claimedProjectOf(client?.claims)),
+			);
+			return {
+				...event,
+				payload: { ...payload, record: record as unknown as JsonValue },
+			};
+		} catch {
+			// A state that cannot be scoped for this connection is fetched, where
+			// the same failure is reported as the query's own error.
+			return event;
+		}
+	};
+}
+
+function claimedProjectOf(claims: unknown): string | undefined {
+	return typeof claims === 'object' &&
+		claims !== null &&
+		!Array.isArray(claims) &&
+		typeof (claims as Record<string, unknown>).projectId === 'string'
+		? ((claims as Record<string, unknown>).projectId as string)
+		: undefined;
+}
+
+/** A connection that did not negotiate `automations.v1` never learns of the
+ * automation space, its panels, or its terminals (ADR-0030). */
+function connectionVisibleState(
+	state: WorkspaceState,
+	request: QueryRequest | CommandRequest,
+): WorkspaceState {
+	const capabilities = request.context.clientCapabilities;
+	return startStateFor(
+		canSeeAutomationSpace(capabilities) ? state : withholdAutomationSpace(state),
+		capabilities,
+	);
+}
+
+function connectionVisibleDelta(
+	delta: ReturnType<WorkspaceStore['delta']>,
+	request: QueryRequest,
+): ReturnType<WorkspaceStore['delta']> {
+	const capabilities = request.context.clientCapabilities;
+	if (canSeeAutomationSpace(capabilities))
+		return { ...delta, state: startStateFor(delta.state, capabilities) };
+	const hiddenIds = automationSpaceIds(delta.state);
+	if (hiddenIds.size === 0)
+		return { ...delta, state: startStateFor(delta.state, capabilities) };
+	return {
+		state: startStateFor(withholdAutomationSpace(delta.state), capabilities),
+		events: delta.events.filter(
+			(event) => !event.changedIds.some((id) => hiddenIds.has(id)),
+		),
+	};
+}
+
+function automationSpaceIds(state: WorkspaceState): ReadonlySet<string> {
+	const ids = new Set<string>();
+	for (const project of Object.values(state.projects))
+		if (isAutomationSpace(project)) ids.add(project.id);
+	for (const folder of Object.values(state.folders))
+		if (ids.has(folder.projectId)) ids.add(folder.id);
+	for (const panel of Object.values(state.panels))
+		if (ids.has(panel.projectId)) ids.add(panel.id);
+	for (const session of Object.values(state.terminalSessions))
+		if (ids.has(session.projectId)) ids.add(session.id);
+	return ids;
+}
+
+/** Refuse, with a bounded non-retryable error, a command the automation space
+ * never accepts, and hide the space from a connection that cannot see it. */
+function enforceAutomationSpace(
+	state: WorkspaceState,
+	request: CommandRequest,
+	command: WorkspaceCommand,
+): void {
+	if (
+		!canSeeAutomationSpace(request.context.clientCapabilities) &&
+		commandProjectIds(state, command).some((projectId) =>
+			isAutomationSpace(state.projects[projectId]),
+		)
+	)
+		throw protocolError('conflict', 'project not found');
+	const refusal = automationSpaceRefusal(state, command);
+	if (refusal !== undefined) throw protocolError('forbidden', refusal);
+}
+
+async function updateProjectShellProfile(
+	workspace: WorkspaceStore,
+	options: WorkspaceOperationRegistryOptions,
+	request: CommandRequest,
+	action: 'set' | 'clear',
+): Promise<{ readonly result: JsonValue; readonly revision: number }> {
+	const payload = objectPayload(request.envelope.payload);
+	const projectId = stringField(payload.projectId, 'projectId');
+	const claim = projectClaim(request);
+	if (claim !== undefined && claim !== projectId)
+		throw protocolError(
+			'forbidden',
+			'project shell profile update is outside the authenticated project scope',
+		);
+	let command: WorkspaceCommand;
+	if (action === 'set') {
+		const profileId = stringField(payload.profileId, 'profileId');
+		if (
+			options.shellProfileExists === undefined ||
+			!(await options.shellProfileExists(profileId))
+		) {
+			throw protocolError(
+				'validation',
+				'shell profile does not exist on this server',
+			);
+		}
+		command = { type: 'project.shellProfile.set', projectId, profileId };
+	} else command = { type: 'project.shellProfile.clear', projectId };
+	return applyCommand(workspace, options, request, command);
+}
+
+async function replaceProjectShellProfiles(
+	workspace: WorkspaceStore,
+	options: WorkspaceOperationRegistryOptions,
+	request: CommandRequest,
+): Promise<{ readonly result: JsonValue; readonly revision: number }> {
+	if (projectClaim(request) !== undefined)
+		throw protocolError(
+			'forbidden',
+			'bulk profile replacement requires server scope',
+		);
+	const payload = objectPayload(request.envelope.payload);
+	const fromProfileId = stringField(payload.fromProfileId, 'fromProfileId');
+	const toProfileId =
+		payload.toProfileId === null || payload.toProfileId === undefined
+			? undefined
+			: stringField(payload.toProfileId, 'toProfileId');
+	if (
+		toProfileId !== undefined &&
+		(options.shellProfileExists === undefined ||
+			!(await options.shellProfileExists(toProfileId)))
+	) {
+		throw protocolError(
+			'validation',
+			'replacement shell profile does not exist on this server',
+		);
+	}
+	return applyCommand(workspace, options, request, {
+		type: 'project.shellProfile.replace',
+		fromProfileId,
+		...(toProfileId === undefined ? {} : { toProfileId }),
+	});
+}
+
+async function updateProjectRoot(
+	workspace: WorkspaceStore,
+	options: WorkspaceOperationRegistryOptions,
+	request: CommandRequest,
+): Promise<{ readonly result: JsonValue; readonly revision: number }> {
+	if (options.prepareProjectRootUpdate === undefined)
+		throw protocolError('unavailable', 'project root updates are unavailable');
+	const payload = objectPayload(request.envelope.payload);
+	const projectId = stringField(payload.projectId, 'projectId');
+	const root = await expandRootHome(options, rootField(payload.root));
+	const expectedRevision =
+		payload.expectedRevision === undefined
+			? request.envelope.expectedRevision
+			: uint(payload.expectedRevision, 'expectedRevision');
+	if (
+		request.envelope.expectedRevision !== undefined &&
+		expectedRevision !== request.envelope.expectedRevision
+	) {
+		throw protocolError(
+			'validation',
+			'project root expected revision is ambiguous',
+		);
+	}
+	const claimedProjectId = projectClaim(request);
+	if (claimedProjectId !== undefined && claimedProjectId !== projectId) {
+		throw protocolError(
+			'forbidden',
+			'project root update is outside the authenticated project scope',
+		);
+	}
+	if (workspace.state.projects[projectId] === undefined)
+		throw protocolError('conflict', 'project not found');
+	enforceAutomationSpace(workspace.state, request, {
+		type: 'project.root.update',
+		projectId,
+		root,
+	});
+	if (
+		expectedRevision !== undefined &&
+		expectedRevision !== workspace.state.revision
+	) {
+		throw staleWorkspace(workspace);
+	}
+	let prepared: PreparedProjectRootUpdate;
+	try {
+		prepared = await options.prepareProjectRootUpdate(projectId, root);
+	} catch {
+		throw protocolError(
+			'validation',
+			'project root is not an accessible directory',
+		);
+	}
+	if (
+		typeof prepared.canonicalRoot !== 'string' ||
+		prepared.canonicalRoot.length === 0 ||
+		prepared.canonicalRoot.length > 4096 ||
+		prepared.canonicalRoot.includes('\0') ||
+		typeof prepared.commit !== 'function'
+	) {
+		throw protocolError(
+			'internal',
+			'project root preparation returned an invalid result',
+		);
+	}
+	const applied = workspace.apply({
+		commandId: request.envelope.commandId,
+		...(expectedRevision === undefined ? {} : { expectedRevision }),
+		command: {
+			type: 'project.root.update',
+			projectId,
+			root: prepared.canonicalRoot,
+			usedAt: (options.now ?? Date.now)(),
+		},
+	});
+	if (!applied.ok) throw staleWorkspace(workspace, applied.conflict.message);
+	await prepared.commit();
+	publishWorkspaceChange(options.eventJournal, workspace, projectId);
+	return {
+		result: {
+			projectId,
+			root: prepared.canonicalRoot,
+			revision: applied.revision,
+			cursor: applied.cursor,
+		},
+		revision: applied.revision,
+	};
+}
+
+async function applyCommand(
+	workspace: WorkspaceStore,
+	options: WorkspaceOperationRegistryOptions,
+	request: CommandRequest,
+	requested: WorkspaceCommand,
+): Promise<{ readonly result: JsonValue; readonly revision: number }> {
+	const command = await withDefaultProjectRoot(
+		options,
+		requested,
+		options.rootFolders !== undefined &&
+			speaksStartChoice(request.context.clientCapabilities),
+	);
+	enforceProjectClaim(workspace.state, request, command);
+	enforceAutomationSpace(workspace.state, request, command);
+	enforceFolderRules(workspace.state, command);
+	if (
+		command.type === 'project.create' &&
+		command.rootOrigin !== 'none' &&
+		options.prepareProjectRootUpdate !== undefined
+	) {
+		let prepared: PreparedProjectRootUpdate;
+		try {
+			prepared = await options.prepareProjectRootUpdate(
+				command.projectId,
+				command.root,
+			);
+		} catch {
+			throw protocolError(
+				'validation',
+				'project root is not an accessible directory',
+			);
+		}
+		if (
+			typeof prepared.canonicalRoot !== 'string' ||
+			prepared.canonicalRoot.length === 0 ||
+			prepared.canonicalRoot.length > 4096 ||
+			prepared.canonicalRoot.includes('\0') ||
+			typeof prepared.commit !== 'function'
+		) {
+			throw protocolError(
+				'internal',
+				'project root preparation returned an invalid result',
+			);
+		}
+		const lifecycle = observeProjectLifecycle(workspace, command);
+		const applied = workspace.apply({
+			commandId: request.envelope.commandId,
+			expectedRevision: request.envelope.expectedRevision,
+			command: { ...command, root: prepared.canonicalRoot },
+		});
+		if (!applied.ok)
+			throw protocolError('conflict', applied.conflict.message, {
+				retryable: true,
+				details: {
+					currentRevision: applied.conflict.currentRevision,
+					currentCursor: applied.conflict.currentCursor,
+				},
+			});
+		await prepared.commit();
+		publishWorkspaceChange(options.eventJournal, workspace, command.projectId);
+		lifecycle.publish(options.eventJournal);
+		return {
+			result: {
+				revision: applied.revision,
+				cursor: applied.cursor,
+				projectId: command.projectId,
+			},
+			revision: applied.revision,
+		};
+	}
+	const sessionIdsToClose = terminalSessionIdsClosedBy(
+		workspace.state,
+		command,
+	);
+	if (sessionIdsToClose.length > 0) {
+		await options.closeTerminalSessions?.(sessionIdsToClose);
+		if (command.type === 'project.close')
+			await options.closeProjectTerminalSessions?.(sessionIdsToClose);
+	}
+	const lifecycle = observeProjectLifecycle(workspace, command);
+	const rehome = terminalSessionRehomedBy(workspace.state, command);
+	const applied = workspace.apply({
+		commandId: request.envelope.commandId,
+		expectedRevision: request.envelope.expectedRevision,
+		command,
+	});
+	if (!applied.ok)
+		throw protocolError('conflict', applied.conflict.message, {
+			retryable: true,
+			details: {
+				currentRevision: applied.conflict.currentRevision,
+				currentCursor: applied.conflict.currentCursor,
+			},
+		});
+	if (command.type === 'project.close')
+		await options.releaseProject?.(command.projectId);
+	if (rehome !== undefined) options.rehomeTerminalSession?.(rehome);
+	publishWorkspaceChange(
+		options.eventJournal,
+		workspace,
+		commandProjectId(command),
+	);
+	lifecycle.publish(options.eventJournal);
+	return {
+		result: {
+			revision: applied.revision,
+			cursor: applied.cursor,
+			projectId: command.type === 'project.move' ? command.projectId : null,
+		},
+		revision: applied.revision,
+	};
+}
+
+function terminalSessionIdsClosedBy(
+	state: WorkspaceState,
+	command: WorkspaceCommand,
+): readonly string[] {
+	if (command.type === 'project.close') {
+		return Object.values(state.terminalSessions)
+			.filter((session) => session.projectId === command.projectId)
+			.map((session) => session.id);
+	}
+	if (command.type === 'panel.close') {
+		const panel = state.panels[command.panelId];
+		return panel?.type === 'terminal' ? [panel.sessionId] : [];
+	}
+	return [];
+}
+
+/**
+ * The terminal a `panel.move` is about to carry to another project, read
+ * before the command is applied. A move within one project, of a panel that
+ * is not a terminal, or replayed after it already committed carries none.
+ */
+function terminalSessionRehomedBy(
+	state: WorkspaceState,
+	command: WorkspaceCommand,
+): TerminalSessionRehome | undefined {
+	if (command.type !== 'panel.move') return undefined;
+	const panel = state.panels[command.panelId];
+	if (panel?.type !== 'terminal' || panel.projectId === command.targetProjectId)
+		return undefined;
+	return {
+		sessionId: panel.sessionId,
+		sourceProjectId: panel.projectId,
+		targetProjectId: command.targetProjectId,
+	};
+}
+
+function enforceProjectClaim(
+	state: WorkspaceState,
+	request: CommandRequest,
+	command: WorkspaceCommand,
+): void {
+	const claimedProjectId = projectClaim(request);
+	if (claimedProjectId === undefined) return;
+	const projectIds = commandProjectIds(state, command);
+	if (
+		projectIds.length === 0 ||
+		projectIds.some((projectId) => projectId !== claimedProjectId)
+	) {
+		throw protocolError(
+			'forbidden',
+			'project command is outside the authenticated project scope',
+		);
+	}
+}
+
+/** Resolve authorization from canonical objects, never merely from ids chosen
+ * by the caller. Object-derived panel/session commands are security boundaries
+ * because their wire payloads do not carry a source project id. */
+function commandProjectIds(
+	state: WorkspaceState,
+	command: WorkspaceCommand,
+): readonly string[] {
+	switch (command.type) {
+		case 'project.create':
+		case 'project.activate':
+		case 'project.rename':
+		case 'project.update':
+		case 'project.sidebar.update':
+		case 'project.move':
+		case 'project.close':
+		case 'project.root.update':
+		case 'project.shellProfile.set':
+		case 'project.shellProfile.clear':
+		case 'project.start':
+		case 'terminal.create':
+		case 'terminal.createPanel':
+		case 'panel.reorder':
+		case 'panel.split':
+		case 'panel.activate':
+		case 'folder.create':
+		case 'folder.reorder':
+			return [command.projectId];
+		case 'folder.rename':
+		case 'folder.delete':
+		case 'folder.link.update':
+		case 'folder.offer.set':
+		case 'folder.offer.accept':
+		case 'folder.offer.decline': {
+			const folder = state.folders[command.folderId];
+			return folder === undefined ? [] : [folder.projectId];
+		}
+		case 'panel.moveToFolder': {
+			// A folder move stays inside one project; naming a folder of another
+			// project puts both in scope so a project claim refuses it.
+			const panel = state.panels[command.panelId];
+			const folder = state.folders[command.folderId];
+			return panel === undefined || folder === undefined
+				? []
+				: [panel.projectId, folder.projectId];
+		}
+		case 'panel.create':
+			return [command.panel.projectId];
+		case 'panel.update':
+		case 'panel.close': {
+			const panel = state.panels[command.panelId];
+			return panel === undefined ? [] : [panel.projectId];
+		}
+		case 'panel.move': {
+			const panel = state.panels[command.panelId];
+			return panel === undefined
+				? []
+				: [panel.projectId, command.targetProjectId];
+		}
+		case 'terminal.markInterrupted':
+		case 'terminal.markExited': {
+			const session = state.terminalSessions[command.sessionId];
+			return session === undefined ? [] : [session.projectId];
+		}
+		case 'project.shellProfile.replace':
+		case 'recent.forget':
+		case 'view.create':
+		case 'view.rename':
+		case 'view.close':
+			return [];
+	}
+}
+
+/** A project claim is a read boundary as well as a command boundary. Never
+ * hand another project's paths, panel identifiers, or terminal identities to
+ * a scoped client merely because the state reducer is shared. */
+function projectScopedState(
+	state: WorkspaceState,
+	projectId: string | undefined,
+): WorkspaceState {
+	if (projectId === undefined) return state;
+	const project = state.projects[projectId];
+	if (project === undefined) {
+		return {
+			...state,
+			viewOrder: [],
+			views: {},
+			projects: {},
+			folders: {},
+			panels: {},
+			terminalSessions: {},
+			recentProjectFolders: NO_RECENT_PROJECT_FOLDERS,
+		};
+	}
+	const folders = Object.fromEntries(
+		project.folderIds
+			.map((id) => [id, state.folders[id]])
+			.filter(([, folder]) => folder !== undefined),
+	);
+	const view = state.views[project.viewId];
+	if (view === undefined) throw new Error('workspace project view is missing');
+	const panels = Object.fromEntries(
+		project.panelIds
+			.map((id) => [id, state.panels[id]])
+			.filter(([, panel]) => panel !== undefined),
+	);
+	const terminalSessions = Object.fromEntries(
+		Object.entries(state.terminalSessions).filter(
+			([, session]) => session.projectId === projectId,
+		),
+	);
+	return {
+		...state,
+		viewOrder: [view.id],
+		views: {
+			[view.id]: {
+				...view,
+				projectIds: [project.id],
+				activeProjectId: project.id,
+			},
+		},
+		projects: { [project.id]: project },
+		folders,
+		panels,
+		terminalSessions,
+		// Recent folders are the server's, not the project's: they name other
+		// projects' roots.
+		recentProjectFolders: NO_RECENT_PROJECT_FOLDERS,
+	};
+}
+
+/** Shared, so two scoped states compare equal by identity. */
+const NO_RECENT_PROJECT_FOLDERS: WorkspaceState['recentProjectFolders'] =
+	Object.freeze([]);
+
+function projectScopedDelta(
+	delta: ReturnType<WorkspaceStore['delta']>,
+	projectId: string | undefined,
+): ReturnType<WorkspaceStore['delta']> {
+	if (projectId === undefined) return delta;
+	const state = projectScopedState(delta.state, projectId);
+	const visibleIds = new Set([
+		...Object.keys(state.views),
+		...Object.keys(state.projects),
+		...Object.keys(state.folders),
+		...Object.keys(state.panels),
+		...Object.keys(state.terminalSessions),
+	]);
+	const events = delta.events.flatMap((event) => {
+		// Command ids and revisions are also metadata. Do not retain a mixed
+		// event by stripping only its IDs: its command id can still name another
+		// project. Scoped clients receive only wholly-owned change records.
+		return event.changedIds.every((id) => visibleIds.has(id)) ? [event] : [];
+	});
+	return { state, events };
+}
+
+function projectClaim(
+	request: QueryRequest | CommandRequest,
+): string | undefined {
+	const claims = request.context.claims;
+	return claims !== undefined &&
+		typeof claims === 'object' &&
+		claims !== null &&
+		!Array.isArray(claims) &&
+		typeof claims.projectId === 'string'
+		? claims.projectId
+		: undefined;
+}
+
+/**
+ * A project a client creates without a root waits for its start choice when
+ * the connection negotiated it, and is otherwise created in the server's
+ * default folder. Only the server decides that a project waits, or has no
+ * root: a client never asks for either.
+ */
+async function withDefaultProjectRoot(
+	options: WorkspaceOperationRegistryOptions,
+	command: WorkspaceCommand,
+	awaitsStartChoice: boolean,
+): Promise<WorkspaceCommand> {
+	if (command.type !== 'project.create') return command;
+	if (
+		(command as { start?: unknown }).start !== undefined ||
+		(command as { rootOrigin?: unknown }).rootOrigin === 'none'
+	)
+		throw protocolError(
+			'validation',
+			'a project waits for a start choice only when created without a root',
+		);
+	const root = (command as { root?: unknown }).root;
+	if (root !== undefined && root !== '') return command;
+	if (awaitsStartChoice)
+		return {
+			...command,
+			root: '',
+			rootOrigin: 'none',
+			start: PROJECT_AWAITING_START_CHOICE,
+		};
+	const fallback = await options.defaultProjectRoot?.().catch(() => null);
+	if (typeof fallback !== 'string' || fallback.length === 0)
+		throw protocolError('validation', 'project root is required');
+	return { ...command, root: fallback, rootOrigin: 'server-default' };
+}
+
+function rootFoldersOf(
+	options: WorkspaceOperationRegistryOptions,
+): RootFolderBrowser {
+	if (options.rootFolders === undefined)
+		throw protocolError('unavailable', 'project start choices are unavailable');
+	return options.rootFolders;
+}
+
+/** A refused start choice: the project already started. */
+function startConflict(workspace: WorkspaceStore) {
+	return protocolError('conflict', PROJECT_START_CONFLICT_MESSAGE, {
+		retryable: false,
+		details: {
+			reason: PROJECT_START_REFUSALS.startConflict,
+			currentRevision: workspace.state.revision,
+			currentCursor: workspace.state.cursor,
+		},
+	});
+}
+
+/** Recent folders and root browsing are the server's, not any project's, so
+ * a connection claimed to one project reaches neither. */
+function refuseProjectClaim(
+	request: QueryRequest | CommandRequest,
+	what: string,
+): void {
+	if (projectClaim(request) !== undefined)
+		throw protocolError('forbidden', `${what} requires server scope`);
+}
+
+/**
+ * The first start choice for a project awaiting one (ADR-0066). Choices for
+ * one project are taken one at a time, so a losing choice never touches the
+ * project's bindings: it waits, sees the project started, and is refused.
+ */
+async function startProject(
+	workspace: WorkspaceStore,
+	options: WorkspaceOperationRegistryOptions,
+	request: CommandRequest,
+	inFlight: Map<string, Promise<unknown>>,
+): Promise<{ readonly result: JsonValue; readonly revision: number }> {
+	let parsed: ReturnType<typeof parseProjectStartRequest>;
+	try {
+		parsed = parseProjectStartRequest(request.envelope.payload);
+	} catch (error) {
+		throw protocolError(
+			'validation',
+			error instanceof Error ? error.message : 'project start request is invalid',
+		);
+	}
+	const { projectId, choice } = parsed;
+	const claim = projectClaim(request);
+	if (claim !== undefined && claim !== projectId)
+		throw protocolError(
+			'forbidden',
+			'project start is outside the authenticated project scope',
+		);
+	const previous = inFlight.get(projectId) ?? Promise.resolve();
+	const run = previous
+		.catch(() => undefined)
+		.then(() =>
+			commitStartChoice(workspace, options, request, projectId, choice),
+		);
+	inFlight.set(projectId, run);
+	try {
+		return await run;
+	} finally {
+		if (inFlight.get(projectId) === run) inFlight.delete(projectId);
+	}
+}
+
+async function commitStartChoice(
+	workspace: WorkspaceStore,
+	options: WorkspaceOperationRegistryOptions,
+	request: CommandRequest,
+	projectId: string,
+	choice: ReturnType<typeof parseProjectStartRequest>['choice'],
+): Promise<{ readonly result: JsonValue; readonly revision: number }> {
+	const project = workspace.state.projects[projectId];
+	if (project === undefined) throw protocolError('conflict', 'project not found');
+	enforceAutomationSpace(workspace.state, request, {
+		type: 'project.start',
+		projectId,
+		choice,
+	});
+	if (project.start !== PROJECT_AWAITING_START_CHOICE)
+		throw startConflict(workspace);
+	let root = '';
+	let commit: (() => Promise<void> | void) | undefined;
+	if (choice.kind === 'folder') {
+		// Resolved on this server for this request alone (ADR-0020).
+		try {
+			root = await rootFoldersOf(options).canonicalDirectory(choice.path);
+		} catch (error) {
+			if (error instanceof RootFolderError) throw error.toProtocolError();
+			throw error;
+		}
+		if (options.prepareProjectRootUpdate !== undefined) {
+			let prepared: PreparedProjectRootUpdate;
+			try {
+				prepared = await options.prepareProjectRootUpdate(projectId, root);
+			} catch {
+				throw protocolError(
+					'validation',
+					'project root is not an accessible directory',
+					{ details: { reason: PROJECT_START_REFUSALS.unreadable } },
+				);
+			}
+			if (
+				typeof prepared.canonicalRoot !== 'string' ||
+				prepared.canonicalRoot.length === 0 ||
+				prepared.canonicalRoot.length > 4096 ||
+				prepared.canonicalRoot.includes('\0') ||
+				typeof prepared.commit !== 'function'
+			)
+				throw protocolError(
+					'internal',
+					'project root preparation returned an invalid result',
+				);
+			root = prepared.canonicalRoot;
+			commit = prepared.commit;
+		}
+	}
+	const applied = workspace.apply({
+		commandId: request.envelope.commandId,
+		...(request.envelope.expectedRevision === undefined
+			? {}
+			: { expectedRevision: request.envelope.expectedRevision }),
+		command: {
+			type: 'project.start',
+			projectId,
+			choice: choice.kind === 'folder' ? { kind: 'folder', path: root } : { kind: 'home' },
+			usedAt: (options.now ?? Date.now)(),
+		},
+	});
+	if (!applied.ok) {
+		if (workspace.state.projects[projectId]?.start === undefined)
+			throw startConflict(workspace);
+		throw staleWorkspace(workspace, applied.conflict.message);
+	}
+	await commit?.();
+	publishWorkspaceChange(options.eventJournal, workspace, projectId);
+	const started = workspace.state.projects[projectId];
+	return {
+		result: {
+			projectId,
+			root: started?.root ?? root,
+			rootOrigin: started?.rootOrigin === 'none' ? 'none' : 'explicit',
+			revision: applied.revision,
+			cursor: applied.cursor,
+		},
+		revision: applied.revision,
+	};
+}
+
+/** The server's recent project folders, each checked now with one stat. */
+async function listRecentProjectFolders(
+	workspace: WorkspaceStore,
+	rootFolders: RootFolderBrowser,
+	request: QueryRequest,
+): Promise<JsonValue> {
+	refuseProjectClaim(request, 'recent project folders');
+	const state = workspace.state;
+	const entries = await Promise.all(
+		state.recentProjectFolders.map(async (entry) => ({
+			path: entry.path,
+			usedAt: entry.usedAt,
+			available: await rootFolders.isAvailable(entry.path),
+		})),
+	);
+	return { revision: state.revision, entries };
+}
+
+async function forgetRecentProjectFolder(
+	workspace: WorkspaceStore,
+	options: WorkspaceOperationRegistryOptions,
+	request: CommandRequest,
+): Promise<{ readonly result: JsonValue; readonly revision: number }> {
+	refuseProjectClaim(request, 'recent project folders');
+	let path: string;
+	try {
+		path = parseRecentForgetRequest(request.envelope.payload).path;
+	} catch (error) {
+		throw protocolError(
+			'validation',
+			error instanceof Error ? error.message : 'recent folder request is invalid',
+		);
+	}
+	// Forgetting a folder the list does not hold changes nothing.
+	if (!workspace.state.recentProjectFolders.some((entry) => entry.path === path))
+		return {
+			result: {
+				forgotten: false,
+				revision: workspace.state.revision,
+				cursor: workspace.state.cursor,
+			},
+			revision: workspace.state.revision,
+		};
+	const applied = workspace.apply({
+		commandId: request.envelope.commandId,
+		command: { type: 'recent.forget', path },
+	});
+	if (!applied.ok) throw staleWorkspace(workspace, applied.conflict.message);
+	publishWorkspaceChange(options.eventJournal, workspace, null);
+	return {
+		result: { forgotten: true, revision: applied.revision, cursor: applied.cursor },
+		revision: applied.revision,
+	};
+}
+
+/** Directory names of one folder on this server (ADR-0066). The dispatcher
+ * has already required root-change authority; nothing here runs before it. */
+async function browseRootFolders(
+	rootFolders: RootFolderBrowser,
+	request: QueryRequest,
+): Promise<JsonValue> {
+	refuseProjectClaim(request, 'browsing server folders');
+	let path: string | undefined;
+	try {
+		path = parseBrowseRootFoldersRequest(request.envelope.payload).path;
+	} catch (error) {
+		throw protocolError(
+			'validation',
+			error instanceof Error ? error.message : 'folder browse request is invalid',
+			{ details: { reason: PROJECT_START_REFUSALS.invalidPath } },
+		);
+	}
+	try {
+		return (await rootFolders.browse(path)) as unknown as JsonValue;
+	} catch (error) {
+		if (error instanceof RootFolderError) throw error.toProtocolError();
+		throw error;
+	}
+}
+
+function commandPayload(value: JsonValue): WorkspaceCommand {
+	const payload = objectPayload(value);
+	if (payload.command === undefined)
+		throw protocolError('validation', 'workspace command is required');
+	const command = objectPayload(payload.command);
+	if (typeof command.type !== 'string')
+		throw protocolError('validation', 'workspace command type is required');
+	if (command.type === WORKSPACE_OPERATIONS.projectRootUpdate) {
+		throw protocolError(
+			'validation',
+			'project root updates require the named operation',
+		);
+	}
+	if (
+		command.type === 'project.shellProfile.set' ||
+		command.type === 'project.shellProfile.clear' ||
+		command.type === 'project.shellProfile.replace'
+	) {
+		throw protocolError(
+			'validation',
+			'project shell profile defaults require the named operations',
+		);
+	}
+	if (command.type === 'terminal.markExited') {
+		throw protocolError('forbidden', 'terminal exit marks are host-owned');
+	}
+	if (command.type === 'project.start' || command.type === 'recent.forget') {
+		throw protocolError(
+			'validation',
+			'project start choices and recent folders require the named operations',
+		);
+	}
+	// Only the server links a folder to a worktree or records who created one:
+	// both come from its own worktree listing, never from a client (ADR-0050).
+	if (
+		command.type === 'folder.link.update' ||
+		command.type === 'folder.offer.set' ||
+		(command.type === 'folder.create' &&
+			(command.worktree !== undefined ||
+				command.createdByPanelId !== undefined))
+	) {
+		throw protocolError('forbidden', 'folder worktree links are host-owned');
+	}
+	return command as unknown as WorkspaceCommand;
+}
+
+/** A linked folder stands for a worktree that exists. A client removes it by
+ * deleting the worktree; only the server removes the folder itself, once the
+ * worktree is gone. */
+function enforceFolderRules(
+	state: WorkspaceState,
+	command: WorkspaceCommand,
+): void {
+	if (
+		command.type === 'folder.delete' &&
+		state.folders[command.folderId]?.kind === 'linked'
+	)
+		throw protocolError(
+			'forbidden',
+			'a linked folder is removed by deleting its worktree',
+		);
+}
+
+function objectPayload(value: JsonValue): Record<string, JsonValue> {
+	if (typeof value !== 'object' || value === null || Array.isArray(value))
+		throw protocolError('validation', 'workspace payload must be an object');
+	return value as Record<string, JsonValue>;
+}
+
+function stringField(value: JsonValue | undefined, name: string): string {
+	if (typeof value !== 'string' || value.length === 0 || value.length > 128)
+		throw protocolError('validation', `${name} is invalid`);
+	return value;
+}
+
+/**
+ * A typed `~` or `~/…` root names the verified account home of this server,
+ * expanded here and never by the client (the same rule the root browser uses).
+ */
+async function expandRootHome(
+	options: WorkspaceOperationRegistryOptions,
+	root: string,
+): Promise<string> {
+	if (options.rootFolders === undefined) return root;
+	try {
+		return await options.rootFolders.expandHome(root);
+	} catch (error) {
+		if (error instanceof RootFolderError) throw error.toProtocolError();
+		throw error;
+	}
+}
+
+function rootField(value: JsonValue | undefined): string {
+	if (
+		typeof value !== 'string' ||
+		value.length === 0 ||
+		value.length > 4096 ||
+		value.includes('\0')
+	) {
+		throw protocolError('validation', 'project root is invalid');
+	}
+	return value;
+}
+
+function staleWorkspace(
+	workspace: WorkspaceStore,
+	message = 'workspace revision is stale',
+) {
+	return protocolError('conflict', message, {
+		retryable: true,
+		details: {
+			currentRevision: workspace.state.revision,
+			currentCursor: workspace.state.cursor,
+		},
+	});
+}
+
+function uint(value: JsonValue | undefined, name: string): number {
+	if (!Number.isSafeInteger(value) || (value as number) < 0)
+		throw protocolError('validation', `${name} is invalid`);
+	return value as number;
+}
+
+function optionalUInt(value: JsonValue | undefined): number | undefined {
+	return value === undefined ? undefined : uint(value, 'index');
+}
+
+function commandProjectId(command: WorkspaceCommand): string | null {
+	return 'projectId' in command && typeof command.projectId === 'string'
+		? command.projectId
+		: null;
+}
+
+/** A project-claimed client only learns of its own project's lifecycle. */
+export function projectLifecycleEventProjector(
+	event: OrderedEvent,
+	client: AuthenticatedClient | undefined,
+): OrderedEvent | undefined {
+	if (
+		event.event !== PROJECT_OPENED_EVENT &&
+		event.event !== PROJECT_CLOSED_EVENT &&
+		event.event !== FOLDER_TERMINAL_CAPTURED_EVENT
+	)
+		return event;
+	const claims = client?.claims as unknown;
+	const claimed =
+		typeof claims === 'object' &&
+		claims !== null &&
+		!Array.isArray(claims) &&
+		typeof (claims as Record<string, unknown>).projectId === 'string'
+			? ((claims as Record<string, unknown>).projectId as string)
+			: undefined;
+	if (claimed === undefined) return event;
+	const payload = event.payload;
+	return typeof payload === 'object' &&
+		payload !== null &&
+		!Array.isArray(payload) &&
+		payload.projectId === claimed
+		? event
+		: undefined;
+}
+
+/**
+ * Capture a project's presence before a `project.create` / `project.close`
+ * command so the typed lifecycle event is published only when the command
+ * actually opened or closed it — never for an idempotent replay, a refused
+ * command, or the reserved automation space.
+ */
+function observeProjectLifecycle(
+	workspace: WorkspaceStore,
+	command: WorkspaceCommand,
+): { readonly publish: (journal: OrderedEventJournalLike | undefined) => void } {
+	if (command.type !== 'project.create' && command.type !== 'project.close')
+		return { publish: () => undefined };
+	const before = workspace.state.projects[command.projectId];
+	return {
+		publish: (journal) => {
+			if (journal === undefined) return;
+			const state = workspace.state;
+			const after = state.projects[command.projectId];
+			const project =
+				command.type === 'project.create'
+					? before === undefined
+						? after
+						: undefined
+					: after === undefined
+						? before
+						: undefined;
+			if (project === undefined || isAutomationSpace(project)) return;
+			const payload: ProjectLifecycleEventPayload = {
+				serverId: state.serverId,
+				projectId: project.id,
+				name: project.name,
+				revision: state.revision,
+			};
+			journal.append(
+				command.type === 'project.create'
+					? PROJECT_OPENED_EVENT
+					: PROJECT_CLOSED_EVENT,
+				payload as unknown as JsonValue,
+			);
+		},
+	};
+}
+
+function publishWorkspaceChange(
+	eventJournal: OrderedEventJournalLike | undefined,
+	workspace: WorkspaceStore,
+	projectId: string | null,
+): void {
+	if (eventJournal === undefined) return;
+	eventJournal.append(WORKSPACE_EVENT, {
+		serverId: workspace.state.serverId,
+		revision: workspace.state.revision,
+		cursor: workspace.state.cursor,
+		projectId,
+	});
+}

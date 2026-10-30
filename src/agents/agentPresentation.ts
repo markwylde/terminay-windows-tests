@@ -1,0 +1,247 @@
+/**
+ * How an agent is named, wherever it is shown.
+ *
+ * A snapshot entry carries several candidate names — a provider title, a
+ * terminal title, a prompt, a provider display name — and no surface should be
+ * choosing between them on its own. An agent called `Claude Code` in the
+ * project sidebar and `Isolate *.paged.net tenants` on the dashboard is one
+ * agent that looks like two.
+ *
+ * So the rule lives here and every surface reads it: the Agents pane, which
+ * shows one project's agents, and the dashboard, which shows every project's.
+ * Nothing here reaches a server or a snapshot store — it is a pure function of
+ * one entry plus what the surface happens to know about that entry's terminal.
+ */
+
+import type { AgentStatusEntry, AgentStatusSnapshot } from '../types/agentStatus';
+
+/** What the surface knows about an entry beyond the entry itself. */
+export type AgentPresentationContext = {
+	/** Resolved model name for the entry, when the surface has one. */
+	model?: string;
+	/** Provider-reported prompt text. */
+	prompt?: string;
+	/** Title of the terminal the agent was activated in. */
+	terminalTitle?: string;
+};
+
+export type AgentPresentation = {
+	/** Provider · model, with anything already said by the name left out. */
+	metadata?: string;
+	name: string;
+	prompt?: string;
+	/** The provider's display name on its own, for surfaces that show it alone. */
+	provider: string;
+};
+
+/**
+ * The harness a session runs, as its session source declared it (`Claude
+ * Code`, `Codex`). One source reports several harnesses, so the source id says
+ * nothing a reader wants; there is no hardcoded map of ids either.
+ */
+export function providerLabel(entry: AgentStatusEntry): string {
+	if (entry.harnessDisplayName?.trim()) return entry.harnessDisplayName.trim();
+	if (entry.providerDisplayName?.trim()) return entry.providerDisplayName.trim();
+	const name =
+		entry.harness?.trim() ||
+		(entry.provider.split('/').at(-1) ?? entry.provider);
+	return name
+		.replace(/[-_.]+/gu, ' ')
+		.replace(/\b\w/gu, (value) => value.toUpperCase());
+}
+
+export function cleanText(value: string | undefined): string | undefined {
+	const cleaned = value?.replace(/\s+/g, ' ').trim();
+	return cleaned || undefined;
+}
+
+/**
+ * The entry's own display name, unless it says nothing a reader could not have
+ * guessed. `default`, `agent`, `subagent`, and the provider's own name are all
+ * placeholders wearing a title's clothes.
+ */
+export function meaningfulDisplayName(
+	entry: AgentStatusEntry,
+): string | undefined {
+	const displayName = cleanText(entry.displayName);
+	if (!displayName) {
+		return undefined;
+	}
+	const normalized = displayName.toLowerCase();
+	const provider = providerLabel(entry).toLowerCase();
+	return normalized === 'default' ||
+		normalized === 'agent' ||
+		normalized === 'subagent' ||
+		normalized === provider
+		? undefined
+		: displayName;
+}
+
+/** `Terminal`, `Terminal 3` — a name the workspace gave, not one a person did. */
+export function isGenericTerminalTitle(value: string | undefined): boolean {
+	return /^terminal(?:\s+\d+)?$/i.test(value ?? '');
+}
+
+/** Join the parts that are present and not already said, case-insensitively. */
+export function joinMetadata(parts: Array<string | undefined>): string {
+	const seen = new Set<string>();
+	const result: string[] = [];
+	for (const part of parts) {
+		const cleaned = cleanText(part);
+		if (!cleaned) {
+			continue;
+		}
+		const key = cleaned.toLowerCase();
+		if (seen.has(key)) {
+			continue;
+		}
+		seen.add(key);
+		result.push(cleaned);
+	}
+	return result.join(' · ');
+}
+
+/** The name an entry falls back to when nothing better was recorded. */
+export function fallbackEntryName(entry: AgentStatusEntry): string {
+	if (entry.displayName?.trim()) {
+		return entry.displayName.trim();
+	}
+	if (entry.kind === 'subagent') {
+		return 'Subagent';
+	}
+	return providerLabel(entry);
+}
+
+/**
+ * A root is named by the most specific thing anyone recorded for it: the
+ * provider's title, else a terminal name a person chose, else the prompt it is
+ * working on, else the provider. A subagent has no terminal of its own, so it
+ * is named by its title, its prompt, or its position among its siblings.
+ */
+export type AgentPresentationOptions = {
+	/** The parent's resolved model, so a subagent does not repeat it. */
+	parentModel?: string;
+	/** The parent's provider label, so a subagent does not repeat it. */
+	parentProvider?: string;
+	/** Position among its siblings, for a subagent with nothing else to go on. */
+	siblingIndex?: number;
+};
+
+export function resolveAgentPresentation(
+	entry: AgentStatusEntry,
+	context: AgentPresentationContext = {},
+	options: AgentPresentationOptions = {},
+): AgentPresentation {
+	const provider = providerLabel(entry);
+	const displayName = meaningfulDisplayName(entry);
+	const prompt = cleanText(context.prompt);
+	const terminalTitle = cleanText(context.terminalTitle);
+
+	if (entry.kind === 'root') {
+		const customTerminalTitle =
+			terminalTitle && !isGenericTerminalTitle(terminalTitle)
+				? terminalTitle
+				: undefined;
+		const name =
+			displayName ?? customTerminalTitle ?? prompt ?? fallbackEntryName(entry);
+		const metadata = joinMetadata([
+			name === terminalTitle ? undefined : terminalTitle,
+			name.toLowerCase() === provider.toLowerCase() ? undefined : provider,
+			name.toLowerCase() === context.model?.toLowerCase()
+				? undefined
+				: context.model,
+		]);
+		return {
+			name,
+			provider,
+			...(metadata ? { metadata } : {}),
+			...(prompt && prompt !== name ? { prompt } : {}),
+		};
+	}
+
+	const name =
+		displayName ?? prompt ?? `Subagent ${(options.siblingIndex ?? 0) + 1}`;
+	const metadata = joinMetadata([
+		options.parentProvider !== entry.provider &&
+		options.parentProvider !== provider
+			? provider
+			: undefined,
+		context.model && context.model !== options.parentModel
+			? context.model
+			: undefined,
+	]);
+	return {
+		name,
+		provider,
+		...(metadata ? { metadata } : {}),
+		...(prompt && prompt !== name ? { prompt } : {}),
+	};
+}
+
+/** The model name a surface shows for an entry: display name, else the id. */
+export function agentModelLabel(entry: AgentStatusEntry): string | undefined {
+	return cleanText(entry.model?.displayName ?? entry.model?.id);
+}
+
+/**
+ * An agent as a surface may show it when its terminal might be untracked. The
+ * agent is still listed and named, but reads idle and unread-free, so no
+ * surface shows the state of an agent the person chose not to track. The
+ * server's entry is unchanged; this is presentation only.
+ */
+export function presentAgentForTracking<T extends AgentStatusEntry>(
+	entry: T,
+	untrackedSessionIds: ReadonlySet<string>,
+): T & UntrackedAgentMark {
+	if (
+		entry.activationTerminalSessionId === null ||
+		!untrackedSessionIds.has(entry.activationTerminalSessionId)
+	)
+		return entry;
+	return {
+		...entry,
+		state: 'idle',
+		unread: false,
+		untracked: true,
+	} as T & UntrackedAgentMark;
+}
+
+/** Set on an entry `presentAgentForTracking` silenced, so the Board can place it. */
+export type UntrackedAgentMark = { readonly untracked?: true };
+
+export function isUntrackedAgent(entry: AgentStatusEntry): boolean {
+	return (entry as AgentStatusEntry & UntrackedAgentMark).untracked === true;
+}
+
+/** A whole projection presented through `presentAgentForTracking`. */
+export function presentAgentSnapshotForTracking(
+	snapshot: AgentStatusSnapshot,
+	untrackedSessionIds: ReadonlySet<string>,
+): AgentStatusSnapshot {
+	if (untrackedSessionIds.size === 0) return snapshot;
+	const entries: Record<string, AgentStatusEntry> = {};
+	for (const [id, entry] of Object.entries(snapshot.entries))
+		entries[id] = presentAgentForTracking(entry, untrackedSessionIds);
+	return { ...snapshot, entries };
+}
+
+/**
+ * The terminal sessions whose panels have Track activity off, read from a
+ * server's workspace projection.
+ */
+export function untrackedSessionIdsFromPanels(
+	panels:
+		| Readonly<
+				Record<
+					string,
+					{ activityIndicatorsEnabled?: boolean; sessionId?: string }
+				>
+		  >
+		| undefined,
+): Set<string> {
+	const ids = new Set<string>();
+	for (const panel of Object.values(panels ?? {}))
+		if (panel.activityIndicatorsEnabled === false && panel.sessionId)
+			ids.add(panel.sessionId);
+	return ids;
+}

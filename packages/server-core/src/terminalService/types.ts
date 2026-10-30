@@ -1,0 +1,464 @@
+/**
+ * Transport and host neutral terminal service contracts.
+ *
+ * The service deliberately talks to a very small PTY adapter.  A Node
+ * `node-pty` adapter, an embedded child-process host, and a test double can
+ * all implement this interface without making server-core aware of Electron
+ * or of a particular client transport.
+ */
+
+type TerminalMaybePromise<T> = T | PromiseLike<T>;
+
+import type { TerminalPresentationCheckpointAuthority } from './presentationCheckpoint.js';
+
+export type TerminalBytes = Uint8Array;
+
+export interface TerminalDimensions {
+	readonly cols: number;
+	readonly rows: number;
+}
+
+export interface PtySpawnOptions extends TerminalDimensions {
+	readonly projectId?: string;
+	/** Server-issued session id, for a factory that holds PTYs by identity. */
+	readonly sessionId?: string;
+	/** Canonical shell executable. */
+	readonly shellPath: string;
+	/** Alias retained for adapters which call this field `shell`. */
+	readonly shell: string;
+	readonly args: readonly string[];
+	readonly cwd: string;
+	readonly env?: Readonly<Record<string, string | undefined>>;
+	readonly name?: string;
+}
+
+export interface PtyExit {
+	readonly exitCode?: number | null;
+	readonly signal?: number | null;
+}
+
+export type PtyDataListener = (bytes: Uint8Array) => void;
+export type PtyExitListener = (exit: PtyExit) => void;
+/**
+ * Host-observed foreground process state. This is intentionally a
+ * server-internal PTY signal: it is not terminal output and is not exposed to
+ * terminal stream subscribers.
+ */
+export type TerminalForegroundObservationState = 'available' | 'limited';
+export type TerminalForegroundObservationError =
+	| 'unavailable'
+	| 'failed'
+	| 'timeout';
+
+export interface PtyForegroundProcess {
+	readonly processName: string;
+	readonly shellForeground: boolean;
+	/** Absent events from older adapters are treated as a successful sample. */
+	readonly observation?: TerminalForegroundObservationState;
+}
+
+/** Bounded close-time observation of one exact terminal session. */
+export interface TerminalForegroundObservation {
+	readonly sessionId: string;
+	readonly projectId: string;
+	readonly observation: TerminalForegroundObservationState;
+	readonly foregroundBusy: boolean;
+	readonly observationError?: TerminalForegroundObservationError;
+}
+
+/** Close-time host observation must settle within this named deadline. */
+export const TERMINAL_CLOSE_OBSERVATION_TIMEOUT_MS = 1_000;
+
+export type PtyForegroundProcessListener = (
+	event: PtyForegroundProcess,
+) => void;
+export type Unsubscribe = () => void;
+
+/** The only process API required by TerminalService. */
+export interface PtyProcess {
+	readonly pid?: number;
+	readonly write: (bytes: Uint8Array) => TerminalMaybePromise<void>;
+	readonly resize: (
+		dimensions: TerminalDimensions,
+	) => TerminalMaybePromise<void>;
+	readonly kill: (signal?: number | string) => TerminalMaybePromise<void>;
+	/** Optional host backpressure used to keep canonical parser work bounded. */
+	readonly pause?: () => void;
+	readonly resume?: () => void;
+	readonly onData: (listener: PtyDataListener) => Unsubscribe | undefined;
+	readonly onExit: (listener: PtyExitListener) => Unsubscribe | undefined;
+	/** Optional trusted host observation of the process' current directory. */
+	readonly getCwd?: (
+		signal?: AbortSignal,
+	) => TerminalMaybePromise<string | null>;
+	/** Optional host capability for trusted foreground-process observation. */
+	readonly onForegroundProcess?: (
+		listener: PtyForegroundProcessListener,
+	) => Unsubscribe | undefined;
+	/** Await one fresh host foreground sample. Output cannot extend this into
+	 * an unbounded catch-up loop; at most the current sample and one latest
+	 * pending replacement run. */
+	readonly refreshForegroundProcess?: (
+		signal?: AbortSignal,
+	) => TerminalMaybePromise<void>;
+	readonly dispose?: () => TerminalMaybePromise<void>;
+}
+
+export interface TerminalCurrentCwd {
+	readonly cwd: string;
+	readonly source: 'observed' | 'spawn';
+	readonly observationError?: 'unavailable' | 'failed' | 'timeout';
+}
+
+export type PtyFactory =
+	| {
+			readonly spawn: (
+				options: PtySpawnOptions,
+			) => TerminalMaybePromise<PtyProcess>;
+	  }
+	| ((options: PtySpawnOptions) => TerminalMaybePromise<PtyProcess>);
+
+export interface TerminalIdentity {
+	readonly serverId: string;
+	readonly projectId: string;
+	readonly sessionId: string;
+}
+
+/**
+ * Optional server-owned lifecycle boundary for services attached to a PTY.
+ *
+ * The returned environment is merged after caller-provided values so a client
+ * cannot spoof identity or replace credentials reserved by the authority.
+ */
+export interface TerminalSessionLifecycle {
+	readonly prepareTerminalSession: (
+		identity: TerminalIdentity,
+	) => Readonly<Record<string, string | undefined>>;
+	/** Called only after the host has obtained the real PTY shell PID. */
+	readonly terminalStarted?: (
+		identity: TerminalIdentity,
+		shellPid: number,
+	) => void;
+	readonly terminalExited: (
+		identity: TerminalIdentity,
+		options?: { readonly exitCode?: number; readonly signal?: string },
+	) => void;
+	/** Optional server-owned observer for input accepted by the PTY. */
+	readonly terminalInput?: (identity: TerminalIdentity) => void;
+	/** Optional server-owned observer for trusted PTY foreground changes. */
+	readonly foregroundProcessChanged?: (
+		identity: TerminalIdentity,
+		event: PtyForegroundProcess,
+	) => void;
+}
+
+/**
+ * An authorization assertion is scoped to one exact server/project/session.
+ * `clientId` identifies the caller for auditing only; it is never PTY
+ * ownership and is not used to keep a process alive.
+ */
+export interface TerminalAuthorization {
+	readonly serverId: string;
+	readonly projectId: string;
+	readonly sessionId?: string;
+	readonly clientId?: string;
+	readonly scope?: 'none' | 'read' | 'write' | 'admin';
+}
+
+/** Options for a server-owned terminal quiet-period wait. */
+export interface TerminalInactivityOptions {
+	/** Read access is sufficient: this operation never writes to the PTY. */
+	readonly authorization?: TerminalAuthorization;
+	/** Cancels only this wait; it never affects the terminal or other waiters. */
+	readonly signal?: AbortSignal;
+}
+
+/**
+ * Narrow timer boundary for deterministic service tests.  It is deliberately
+ * private to terminal supervision: no timer state is exposed to clients or
+ * terminal event streams.
+ */
+export interface TerminalInactivityTimer {
+	readonly setTimeout: (callback: () => void, delayMs: number) => unknown;
+	readonly clearTimeout: (timer: unknown) => void;
+}
+
+/**
+ * Server-owned reason to keep a quiet terminal's inactivity wait open, such as
+ * a bound agent that is working without printing. The terminal service asks
+ * only about the waiting session's own identity.
+ */
+export interface TerminalInactivityHold {
+	readonly isHeld: (identity: TerminalIdentity) => boolean;
+	/** Reports the session whose held answer may have changed. */
+	readonly subscribe: (listener: (sessionId: string) => void) => () => void;
+}
+
+export type TerminalSessionStatus = 'running' | 'exited' | 'interrupted';
+export type TerminalExitReason =
+	| 'exit'
+	| 'killed'
+	| 'interrupted'
+	| 'shutdown'
+	| 'spawn_error';
+
+export interface TerminalExitMetadata {
+	readonly exitCode: number;
+	readonly signal: number | null;
+	readonly reason: TerminalExitReason;
+	readonly at: number;
+}
+
+export interface TerminalSessionSnapshot extends TerminalIdentity {
+	/** Canonical server-owned working directory selected at process creation. */
+	readonly cwd: string;
+	/** Safe immutable launch metadata. Environment values are intentionally not
+	 * retained in this snapshot. */
+	readonly launch?: Readonly<{
+		profileId: string;
+		profileRevision: number;
+		profileName: string;
+		targetSummary: string;
+		icon?: string;
+		color?: string;
+		workspaceRevision: number;
+		settingsRevision: number;
+	}>;
+	readonly status: TerminalSessionStatus;
+	readonly createdAt: number;
+	readonly outputPosition: number;
+	/** First output position still retained in the replay buffer. */
+	readonly replayFrom: number;
+	readonly pid?: number;
+	readonly dimensions: TerminalDimensions;
+	readonly exit?: TerminalExitMetadata;
+}
+
+export interface TerminalOutputEvent {
+	readonly type: 'output';
+	readonly serverId: string;
+	readonly projectId: string;
+	readonly sessionId: string;
+	/** Byte offset of `bytes` in the session's output stream. */
+	readonly position: number;
+	readonly nextPosition: number;
+	readonly bytes: Uint8Array;
+	/** Alias useful to stream adapters which call the payload `data`. */
+	readonly data: Uint8Array;
+	readonly replay: boolean;
+}
+
+export interface TerminalExitEvent extends TerminalIdentity {
+	readonly type: 'exit';
+	readonly metadata: TerminalExitMetadata;
+	readonly exitCode: number;
+	readonly signal: number | null;
+}
+
+/**
+ * A byte range this attachment will never receive.
+ *
+ * It travels in the delivery lane's own FIFO, in the place the bytes would
+ * have occupied, so a client can act on it in order rather than reconciling
+ * an advisory that was computed against a position it has already passed.
+ * `fromPosition` lets the client tell a server-initiated skip apart from a
+ * genuinely corrupted stream.
+ */
+export interface TerminalSkipEvent extends TerminalIdentity {
+	readonly type: 'skip';
+	readonly fromPosition: number;
+	readonly toPosition: number;
+	readonly reason: TerminalSkipReason;
+}
+
+/**
+ * `hydration` is a gap established while a display is being attached: the
+ * bytes are already accounted for by the position it starts from. It is not a
+ * signal to recover, because re-attaching produces the same boundary again.
+ * The other two mean a live display fell behind and must re-hydrate.
+ */
+export type TerminalSkipReason =
+	| 'congestion'
+	| 'attachment_closed'
+	| 'hydration';
+
+export type TerminalEvent =
+	| TerminalOutputEvent
+	| TerminalExitEvent
+	| TerminalSkipEvent;
+export type TerminalEventListener = (event: TerminalEvent) => void;
+export type TerminalInputListener = (
+	identity: TerminalIdentity,
+	bytes: Uint8Array,
+) => void;
+export type TerminalCloseReason =
+	| 'client'
+	| 'slow_consumer'
+	| 'service_shutdown'
+	| 'skip';
+
+export interface TerminalSubscriptionOptions {
+	readonly authorization?: TerminalAuthorization;
+	readonly fromPosition?: number;
+	readonly onEvent?: TerminalEventListener;
+	/** Maximum queued output when no onEvent consumer is supplied. */
+	readonly maxQueuedBytes?: number;
+}
+
+/**
+ * A bounded, byte-exact read of retained PTY output. Positions are offsets in
+ * the terminal's immutable output stream, not character or display columns.
+ */
+export interface TerminalRetainedOutputReadOptions {
+	readonly authorization?: TerminalAuthorization;
+	/** First output byte requested. Omit to start at the retained replay head. */
+	readonly fromPosition?: number;
+	/** Hard cap for returned PTY bytes. A read may end in the middle of UTF-8 or a VT sequence. */
+	readonly maxBytes: number;
+}
+
+export interface TerminalRetainedOutputRead extends TerminalIdentity {
+	/** Caller-requested cursor, retained for an unambiguous history-loss signal. */
+	readonly requestedFromPosition: number;
+	/** First byte actually returned. This advances to replayFrom after history loss. */
+	readonly fromPosition: number;
+	/** Cursor for the next raw read. */
+	readonly nextPosition: number;
+	readonly replayFrom: number;
+	readonly outputPosition: number;
+	/** The requested cursor predates the retained ring; no exception is needed to resync. */
+	readonly historyLost: boolean;
+	/** Number of raw stream bytes unavailable before fromPosition. */
+	readonly droppedBytes: number;
+	/** More retained output is available after nextPosition. */
+	readonly hasMore: boolean;
+	readonly bytes: Uint8Array;
+}
+
+export type TerminalPresentationFormat = 'text' | 'ansi';
+
+/** A bounded view of the canonical server-side xterm emulator. */
+export interface TerminalPresentationReadOptions {
+	readonly authorization?: TerminalAuthorization;
+	readonly format?: TerminalPresentationFormat;
+	/** Hard cap for the returned text payload in UTF-8 bytes. */
+	readonly maxBytes: number;
+	/** Applies to text reads only and selects the newest visual rows. */
+	readonly maxRows?: number;
+}
+
+export interface TerminalPresentationRead extends TerminalIdentity {
+	readonly format: TerminalPresentationFormat;
+	/** Geometry of the canonical emulator that produced this presentation. */
+	readonly dimensions: TerminalDimensions;
+	/** Emulator position represented by this read after its parser queue drained. */
+	readonly position: number;
+	/** PTY stream head at the point the snapshot was taken. */
+	readonly outputPosition: number;
+	/** Returned payload was shortened to satisfy maxBytes or maxRows. */
+	readonly truncated: boolean;
+	/** Omitted UTF-8 payload bytes. */
+	readonly droppedBytes: number;
+	/** Omitted visual rows (text reads only). */
+	readonly droppedRows: number;
+	readonly rows?: readonly string[];
+	readonly ansi?: string;
+}
+
+export interface TerminalWriteResult {
+	readonly sessionId: string;
+	readonly bytes: number;
+	readonly outputPosition: number;
+}
+
+export interface TerminalServiceLimits {
+	readonly maxSessions?: number;
+	readonly maxInputBytes?: number;
+	readonly maxOutputChunkBytes?: number;
+	readonly maxReplayBytes?: number;
+	readonly maxQueuedOutputBytes?: number;
+	readonly maxSubscribersPerSession?: number;
+	readonly maxCols?: number;
+	readonly maxRows?: number;
+}
+
+export interface TerminalServiceOptions extends TerminalServiceLimits {
+	readonly serverId: string;
+	readonly ptyFactory: PtyFactory;
+	/** Host-owned base environment for every terminal. It is never client input;
+	 * per-session values and lifecycle credentials are merged over it. */
+	readonly defaultEnvironment?: Readonly<Record<string, string | undefined>>;
+	/** @internal Compatibility hook for low-level TerminalService tests only.
+	 * Production launch policy belongs to TerminalLaunchResolver. */
+	readonly resolveDefaultShell?: () => Readonly<{
+		shellPath: string;
+		args?: readonly string[];
+	}>;
+	readonly now?: () => number;
+	readonly generateSessionId?: (projectId: string) => string;
+	/** Optional host-neutral timer implementation for inactivity supervision. */
+	readonly inactivityTimer?: TerminalInactivityTimer;
+	/** What bounds how long a fresh presentation waits for the checkpoint
+	 * authority to drain. Defaults to the global timers, unreferenced. */
+	readonly presentationSettleTimer?: TerminalInactivityTimer;
+	/** Optional hold consulted before a quiet period resolves a wait. */
+	readonly inactivityHold?: TerminalInactivityHold;
+	readonly onEvent?: TerminalEventListener;
+	/** Server-owned lifecycle observers such as agent journal tracking. */
+	readonly sessionLifecycle?: TerminalSessionLifecycle;
+	/** Optional bounded canonical emulator used only for fresh presentation recovery. */
+	readonly presentationCheckpoints?: TerminalPresentationCheckpointAuthority;
+}
+
+export interface TerminalCreateOptions extends TerminalDimensions {
+	readonly serverId?: string;
+	readonly projectId: string;
+	readonly sessionId?: string;
+	readonly shellPath?: string;
+	readonly args?: readonly string[];
+	readonly cwd?: string;
+	readonly env?: Readonly<Record<string, string | undefined>>;
+	readonly name?: string;
+	readonly createdAt?: number;
+}
+
+export interface TerminalShutdownOptions {
+	readonly reason?: 'shutdown' | 'interrupted';
+	readonly at?: number;
+	readonly signal?: number | string;
+	/**
+	 * Stop supervising sessions without signalling their processes or recording
+	 * an exit. Only meaningful when the PTY factory holds processes outside this
+	 * server process, so the next server can adopt them.
+	 */
+	readonly detach?: boolean;
+}
+
+/**
+ * A session that ended while no server was watching. It has no process; it
+ * exists so its panel can still show the output it ended with.
+ */
+export interface TerminalRestoreEndedOptions extends TerminalDimensions {
+	readonly identity: TerminalIdentity;
+	readonly cwd: string;
+	readonly createdAt: number;
+	readonly launch?: TerminalSessionSnapshot['launch'];
+	readonly status: 'exited' | 'interrupted';
+	readonly exitCode?: number;
+	readonly signal?: number | null;
+	readonly endedAt: number;
+	/** Output position of the first byte of `bytes`. */
+	readonly outputPosition: number;
+	readonly bytes: Uint8Array;
+}
+
+/** A process another server process started and this one is taking over. */
+export interface TerminalAdoptOptions extends TerminalDimensions {
+	readonly identity: TerminalIdentity;
+	readonly cwd: string;
+	readonly createdAt: number;
+	readonly launch?: TerminalSessionSnapshot['launch'];
+	readonly process: PtyProcess;
+	/** Output position of the first byte `process` will deliver. */
+	readonly outputPosition: number;
+}

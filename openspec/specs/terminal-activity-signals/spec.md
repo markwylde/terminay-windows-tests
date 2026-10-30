@@ -1,0 +1,669 @@
+# terminal-activity-signals Specification
+
+## Purpose
+
+Terminal activity signals describe activity in any terminal — shells, builds, and agents without authoritative journals — by parsing structured terminal escape sequences, foreground-process evidence, and raw output on the server, without competing with journal-backed canonical agent status.
+
+## Requirements
+
+### Requirement: Two distinct activity systems
+
+Agent status SHALL describe the lifecycle of a recognized AI agent, with a process-bound provider journal as its authoritative source. Terminal activity SHALL describe activity in any terminal, including shells, builds, and agents for which authoritative journals are unavailable. Terminal escape sequences and raw PTY output are fallback evidence and SHALL never overwrite, synthesize transitions for, or otherwise compete with an authoritative journal-backed agent entry.
+
+#### Scenario: Fallback evidence on a journal-backed agent
+
+- **WHEN** a terminal with an authoritative journal-backed agent entry emits escape sequences or raw output
+- **THEN** that evidence does not overwrite or synthesize a transition for the agent entry
+
+#### Scenario: Terminal with no journal
+
+- **WHEN** a shell or build tool runs in a terminal with no journal-backed agent entry
+- **THEN** terminal activity describes it from structured signals and raw output
+
+### Requirement: Authority and fallback order
+
+For a terminal session Terminay SHALL use the first available source in order: process-bound provider journals for a recognized Codex session, which produce canonical agent events and are the sole source of that agent's operational state; structured terminal signals (`OSC 9;4` progress, `OSC 133`/`633` shell command markers, notifications, `BEL`, and foreground-process changes) when no journal-backed agent entry exists; and recent raw output only when neither an authoritative agent entry nor a claimed structured-signal interpreter is available.
+
+#### Scenario: Journal available
+
+- **WHEN** a process-bound provider journal exists for a recognized session
+- **THEN** its canonical agent events are the sole source of that agent's operational state
+
+#### Scenario: No journal but structured signals present
+
+- **WHEN** no journal-backed agent entry exists and structured terminal signals are present
+- **THEN** the structured signals determine fallback activity
+
+#### Scenario: Neither journal nor interpreter
+
+- **WHEN** neither an authoritative agent entry nor a claimed structured-signal interpreter is available
+- **THEN** recent raw output determines fallback activity
+
+### Requirement: Session-scoped authority
+
+Authority SHALL be scoped by the exact Terminay terminal session ID. A journal-backed agent in one terminal SHALL NOT suppress fallback activity detection in another terminal.
+
+#### Scenario: Agent in one terminal, shell in another
+
+- **WHEN** one terminal has a journal-backed agent and another runs an ordinary shell
+- **THEN** each uses its own source independently
+
+### Requirement: Rendering alongside authoritative state
+
+Once a terminal has an authoritative agent entry, spinner frames, status-bar repaints, terminal bells, and notification escape sequences SHALL still render normally but SHALL NOT change the agent's canonical state. The terminal-activity UI MAY omit a duplicate fallback item for that session. Fallback state SHALL NOT be presented as provider-authoritative agent status.
+
+#### Scenario: Bell on a journal-backed agent terminal
+
+- **WHEN** a terminal with an authoritative agent entry rings a bell
+- **THEN** the bell renders normally and the agent's canonical state is unchanged
+
+#### Scenario: Duplicate fallback item
+
+- **WHEN** a session already has an authoritative agent entry
+- **THEN** the terminal-activity UI may omit a duplicate fallback item for it
+
+### Requirement: OSC parsing and terminators
+
+An `OSC` sequence starts with `ESC ]` and is terminated by `BEL` or `ST` (`ESC \`). The parser SHALL accept both terminators and SHALL handle sequences split across PTY chunks.
+
+#### Scenario: Sequence split across chunks
+
+- **WHEN** an OSC sequence is split across two PTY chunks
+- **THEN** the parser reassembles and interprets it correctly
+
+#### Scenario: Either terminator
+
+- **WHEN** an OSC sequence ends with `BEL` or with `ST`
+- **THEN** the parser accepts both terminators
+
+### Requirement: OSC 9;4 progress signal
+
+`ESC ] 9 ; 4 ; <state> [ ; <progress> ] BEL/ST` SHALL always be parsed as progress and never as an `OSC 9` notification. State `0` ends working; states `1` (normal progress, optionally `0`–`100`), `2` (error progress), `3` (indeterminate), and `4` (paused or warning) mean working. An active progress signal SHALL expire after the configured progress-signal timeout, 15 seconds by default, if it is not refreshed, and SHALL be cleared when the PTY exits.
+
+#### Scenario: Indeterminate then removed
+
+- **WHEN** a terminal emits `OSC 9;4;3` and later `OSC 9;4;0`
+- **THEN** fallback activity is working and then finished
+
+#### Scenario: Stale progress
+
+- **WHEN** an active progress signal is not refreshed within the configured progress-signal timeout
+- **THEN** it expires and no longer pins fallback activity in the working state
+
+#### Scenario: PTY exit with active progress
+
+- **WHEN** the PTY exits while a progress signal is active
+- **THEN** the progress signal is cleared
+
+#### Scenario: OSC 9;4 is never a notification
+
+- **WHEN** a terminal emits `OSC 9;4;...`
+- **THEN** it is interpreted as progress and not as an `OSC 9` notification
+
+### Requirement: OSC 133 and OSC 633 command tracking
+
+`ESC ] 133 ; A ST` marks prompt start, `; B` command-line editing, `; C` command executing, and `; D [; exit] ST` command finished. `OSC 633` subcommands `A`, `B`, `C`, and `D` SHALL be aliases and other `633` subcommands SHALL be ignored. `C` without a later `D` or `A` means working; `D` ends working and MAY include an exit code. A `D` immediately after `B` without a `C` SHALL be treated as an aborted command and its exit code SHALL be ignored. Exit codes SHALL be retained for control APIs but SHALL NOT add a separate failed colour to terminal tabs.
+
+#### Scenario: Command executes and finishes
+
+- **WHEN** a terminal emits `OSC 133;C` and later `OSC 133;D;0`
+- **THEN** fallback activity is working and then finished, and exit code `0` is captured
+
+#### Scenario: Aborted command
+
+- **WHEN** `OSC 133;D` arrives immediately after `OSC 133;B` with no `C`
+- **THEN** the command is treated as aborted and its exit code is ignored
+
+#### Scenario: Unknown 633 subcommand
+
+- **WHEN** a terminal emits an `OSC 633` subcommand other than `A`, `B`, `C`, or `D`
+- **THEN** it is ignored
+
+#### Scenario: Failed exit code
+
+- **WHEN** a tracked command finishes with a non-zero exit code
+- **THEN** the exit code is available to control APIs and no separate failed colour is added to the terminal tab
+
+### Requirement: Notifications and bell
+
+The fallback parser SHALL recognize terminal `BEL`, `OSC 9;<message>` excluding `OSC 9;4`, and `OSC 777;notify;<title>;<body>`. When no authoritative agent entry exists, these MAY set terminal attention for an unfocused terminal, and attention SHALL remain pending until that terminal is viewed or receives user input. For a journal-backed agent, provider events SHALL determine `waiting` and `blocked`; a bell or OSC notification SHALL NOT be an authoritative agent transition.
+
+#### Scenario: Bell on an unfocused non-authoritative terminal
+
+- **WHEN** an unfocused terminal with no authoritative agent entry rings a bell
+- **THEN** sticky fallback attention is set until the terminal is viewed or receives user input
+
+#### Scenario: OSC 777 notification
+
+- **WHEN** a terminal emits `OSC 777;notify;<title>;<body>`
+- **THEN** the fallback parser recognizes it as a notification
+
+### Requirement: Foreground-process evidence
+
+The PTY host MAY report whether the foreground process differs from the spawned shell. This SHALL be weak evidence for working, useful for silent commands, and MAY help select a terminal-signal interpreter. A process name alone SHALL NOT create an authoritative agent entry or infer a canonical provider state.
+
+#### Scenario: Silent command running
+
+- **WHEN** a non-shell foreground process runs without producing output
+- **THEN** foreground-process evidence indicates working
+
+#### Scenario: Recognized process name
+
+- **WHEN** the foreground process name matches a known agent
+- **THEN** no authoritative agent entry is created and no canonical provider state is inferred from the name
+
+### Requirement: Provider process retirement window
+
+For an existing journal-backed Codex session, a recognized provider process returning to the known shell MAY retire the live association after a short confirmation window. A journal event during that window SHALL cancel the retirement.
+
+#### Scenario: Provider process exits
+
+- **WHEN** a recognized provider process returns to the known shell for a journal-backed session
+- **THEN** the live association is retired after a short confirmation window
+
+#### Scenario: Journal event during the window
+
+- **WHEN** a journal event arrives during the confirmation window
+- **THEN** the retirement is cancelled
+
+### Requirement: foregroundBusy in the activity snapshot
+
+The canonical activity snapshot SHALL expose a `foregroundBusy` boolean that is true only while the PTY host reports that a process other than the spawned shell owns the foreground process group. Unlike the presentation-oriented `working` status, `foregroundBusy` SHALL NOT be suppressed by provider authority, command completion signals, acknowledgement, output timers, or activity-indicator settings. Clients SHALL use it solely for destructive close protection and SHALL NOT infer it from output.
+
+#### Scenario: Non-shell process owns the foreground group
+
+- **WHEN** the PTY host reports a process other than the spawned shell owning the foreground process group
+- **THEN** `foregroundBusy` is true regardless of provider authority, completion signals, acknowledgement, output timers, or indicator settings
+
+#### Scenario: Client use of foregroundBusy
+
+- **WHEN** a client evaluates destructive close protection
+- **THEN** it uses `foregroundBusy` and does not infer it from terminal output
+
+### Requirement: Session-owned bounded foreground observation
+
+Foreground-process observation SHALL be exact-session, bounded derived state. Each session SHALL own its observation work with at most one sample executing and one latest requested sample pending. Continued output SHALL replace obsolete pending work and SHALL NOT require a terminal to become silent before the current state can settle. A slow, unavailable, or capability-limited observation SHALL be an explicit limited state for that session and SHALL NOT delay activity, commands, workspace mutations, or close protection for another session. Activity snapshots SHALL return the latest committed projection and SHALL NOT wait for live host observation.
+
+Output SHALL be evidence that the foreground may have changed, and SHALL NOT be a unit of observation work. Output that follows a quiet period SHALL refresh the session's foreground projection without waiting for a timer. While output continues, output-driven host samples for a session SHALL be spaced by the shared damping ramp that fronts all change-driven work: no sooner than 1 s after the previous one, widening while output continues and returning to its floor after a quiet period, however many output events arrive and however quickly a sample completes. Output that arrives inside a ramp interval SHALL collapse into exactly one further sample when that interval ends, whether or not more output follows. This pacing SHALL NOT apply to a fresh observation requested for destructive close protection.
+
+#### Scenario: Continuously outputting terminal
+
+- **WHEN** a terminal produces continuous output
+- **THEN** obsolete pending observation work is replaced and the current state settles without requiring silence
+
+#### Scenario: Slow observation on one session
+
+- **WHEN** foreground observation is slow or unavailable for one session
+- **THEN** it becomes an explicit limited state for that session and does not delay another session's activity, commands, workspace mutations, or close protection
+
+#### Scenario: Snapshot read
+
+- **WHEN** a client reads an activity snapshot
+- **THEN** it receives the latest committed projection without waiting for live host observation
+
+#### Scenario: Output after a quiet period
+
+- **WHEN** a terminal that has been quiet for at least the current ramp interval produces output
+- **THEN** a host sample for that session begins at once, without waiting for a timer
+
+#### Scenario: Repainting terminal
+
+- **WHEN** a terminal produces hundreds of output events a second and each host sample completes immediately
+- **THEN** the session begins one output-driven host sample at once and no more than one per ramp interval after it
+
+#### Scenario: Output stops inside a ramp interval
+
+- **WHEN** a terminal's last output arrives inside the ramp interval that followed its most recent output-driven host sample
+- **THEN** exactly one further host sample begins when that interval ends, and the settled projection reflects the state after the last output
+
+#### Scenario: Close requested while output is being paced
+
+- **WHEN** destructive close protection requests a fresh observation for a session whose output-driven sampling is inside a ramp interval
+- **THEN** the fresh sample begins immediately and is not delayed by the ramp
+
+### Requirement: Destructive close protection
+
+Destructive close protection SHALL obtain a bounded fresh observation only for its addressed session. If that sample cannot complete it SHALL report the limited state. Close protection SHALL warn only when a non-shell foreground process is known to be running; limited observation without that evidence SHALL NOT prompt and SHALL NOT wait. Helper children of a non-shell foreground process SHALL NOT make the session look idle.
+
+#### Scenario: Known busy terminal closed
+
+- **WHEN** a user closes a terminal whose non-shell foreground process is known to be running
+- **THEN** close protection warns
+
+#### Scenario: Limited observation on close
+
+- **WHEN** the bounded fresh observation for the addressed session cannot complete
+- **THEN** the limited state is reported, no prompt is shown, and the close does not wait
+
+#### Scenario: Helper child processes
+
+- **WHEN** a non-shell foreground process has helper children
+- **THEN** the session is not reported as idle
+
+### Requirement: Fallback interpreter profiles
+
+Fallback interpretation SHALL remain provider-aware only to avoid known false positives and SHALL NOT be the canonical agent-driver layer. The generic interpreter SHALL prioritize active progress, then an executing shell command, then foreground-process evidence, then raw output. The legacy Claude Code interpreter SHALL treat `OSC 9;4` as a turn boundary and ignore cosmetic output after progress clears. The legacy Codex interpreter SHALL treat a notification as a turn boundary and ignore spinner output after the boundary. These profiles SHALL apply only when the session has no authoritative journal-backed agent entry.
+
+#### Scenario: Generic interpreter precedence
+
+- **WHEN** the generic interpreter evaluates a session
+- **THEN** it prioritizes active progress, then an executing shell command, then foreground-process evidence, then raw output
+
+#### Scenario: Profile on a journal-backed session
+
+- **WHEN** a session has an authoritative journal-backed agent entry
+- **THEN** no interpreter profile applies to it
+
+#### Scenario: Trailing cosmetic output
+
+- **WHEN** progress clears and cosmetic output continues under the Claude Code interpreter
+- **THEN** the turn boundary stands and working does not restart
+
+### Requirement: Interpreter claim disables the raw-output timer
+
+An interpreter that claims a session SHALL disable the raw-output timer for that session, preventing continuously repainting TUIs from oscillating between working and finished.
+
+#### Scenario: Repainting TUI
+
+- **WHEN** an interpreter has claimed a session and the TUI repaints continuously
+- **THEN** the raw-output timer is disabled and the session does not oscillate between working and finished
+
+### Requirement: Output that follows user input is not raw-output activity
+
+In the raw-output tier, PTY output that arrives within one second of user input to that session SHALL NOT count as raw-output activity: it SHALL neither begin `working` nor extend it. Output that arrives one second or more after the most recent user input SHALL count as raw output otherwise does. Output that does not count SHALL NOT publish an activity event. This requirement SHALL apply only to the raw-output tier: `working` derived from active progress, an executing shell command, foreground-process evidence, or a provider-backed agent SHALL be unaffected by how recently the user typed.
+
+#### Scenario: Typing at a prompt
+
+- **WHEN** a user types a character into an idle terminal in the raw-output tier and the shell echoes it
+- **THEN** the terminal stays idle
+- **AND** its tab shows no amber or yellow indicator
+
+#### Scenario: Continuous typing
+
+- **WHEN** a user types into an idle terminal in the raw-output tier for several seconds with less than one second between keystrokes
+- **THEN** the terminal stays idle for the whole period
+- **AND** no activity event is published for the echoed output
+
+#### Scenario: Typing just after output
+
+- **WHEN** a terminal in the raw-output tier is working because it has just printed output, and the user starts typing before that working period ends
+- **THEN** the echoed output does not extend the working period
+- **AND** the terminal becomes idle when the period that began with the earlier output ends
+
+#### Scenario: Output continues after typing stops
+
+- **WHEN** a terminal in the raw-output tier produces output continuously, the user types into it, and output is still arriving one second after the last keystroke
+- **THEN** the terminal is working when that output arrives
+
+#### Scenario: Command whose output outlasts the window
+
+- **WHEN** a user presses Enter in a terminal in the raw-output tier and the command is still producing output one second after that keystroke
+- **THEN** the terminal becomes working when that output arrives
+
+#### Scenario: Command that finishes inside the window
+
+- **WHEN** a user presses Enter in a terminal in the raw-output tier and all of the command's output arrives within one second of that keystroke
+- **THEN** the terminal does not become working
+
+#### Scenario: Session claimed by structured signals
+
+- **WHEN** a user types a command and presses Enter in a terminal whose shell integration emits a command-executing marker
+- **THEN** the terminal becomes working when the marker arrives, however recently the user typed
+
+### Requirement: Fallback activity display language
+
+Terminal fallback activity SHALL use the existing tab-activity language: amber or yellow for working or recent activity, green for finished unviewed activity, red for fallback attention, and no indicator after acknowledgement. Working indicators SHALL remain while the terminal is working, including on the focused tab. Finished and attention indicators SHALL be unviewed signals and SHALL NOT remain once the terminal is viewed. Canonical agent RAG indicators SHALL use the same broad colour vocabulary but SHALL remain a different model, in which an agent's operational state and its acknowledgement flag are orthogonal and viewing an agent acknowledges it without changing `working`, `waiting`, `blocked`, `done`, or `idle`.
+
+#### Scenario: Working fallback activity
+
+- **WHEN** a terminal has fallback working or recent activity
+- **THEN** its tab shows the amber or yellow indicator
+
+#### Scenario: Working on the focused tab
+
+- **WHEN** the focused terminal is working
+- **THEN** its tab keeps the amber or yellow indicator
+
+#### Scenario: Viewing an agent
+
+- **WHEN** a user views a terminal with a canonical agent entry
+- **THEN** the agent is acknowledged and its operational state is unchanged
+
+### Requirement: Fallback acknowledgement
+
+For terminal fallback activity, clicking the terminal tab, clicking into the terminal, typing into it, or dismissing its notification from the header Notifications list SHALL clear pending finished and attention indicators. Activating the project, including clicking its tab or activity dot, SHALL NOT acknowledge that project's terminals. Selecting a terminal tab and dismissing a terminal's notification SHALL each report the same server-owned acknowledgement as typing; a panel becoming Dockview-active because its project was activated SHALL NOT. Late fallback lifecycle output produced while switching projects SHALL be part of the same viewing acknowledgement for the terminal the user was interacting with at handoff. A terminal counts as the one the user is interacting with only while it is both the terminal they last clicked or typed in and the focused terminal; once focus moves to another terminal, including a newly created one, it no longer does. Structured completion or attention that arrives while the user is already interacting with that terminal SHALL be acknowledged as viewed and SHALL NOT leave a finished or attention indicator on that tab, the project activity dot, or the header Notifications number.
+
+#### Scenario: Viewing clears the indicator
+
+- **WHEN** a user clicks a terminal tab, clicks into the terminal, or types into a terminal with a pending fallback indicator
+- **THEN** the indicator clears
+
+#### Scenario: Tab selection acknowledgement
+
+- **WHEN** a user clicks a terminal tab
+- **THEN** it reports the same server-owned acknowledgement as typing into that terminal
+
+#### Scenario: Dismissal acknowledgement
+
+- **WHEN** a user dismisses a terminal's notification from the header Notifications list
+- **THEN** it reports the same server-owned acknowledgement as typing into that terminal, and the terminal is not selected
+
+#### Scenario: Activating a project does not acknowledge
+
+- **WHEN** a background project has a terminal with a finished or attention indicator and the user activates that project without clicking the terminal tab, clicking into the terminal, or typing
+- **THEN** the terminal indicator, project activity dot, and header Notifications number remain
+
+#### Scenario: Focusing a finished tab
+
+- **WHEN** a user clicks a terminal tab that shows a finished unviewed indicator
+- **THEN** the terminal indicator and that terminal's contribution to its project's activity dot and to the header Notifications number all clear
+
+#### Scenario: Focusing an attention tab
+
+- **WHEN** a user clicks a terminal tab that shows a fallback attention indicator
+- **THEN** the terminal indicator and that terminal's contribution to its project's activity dot and to the header Notifications number all clear
+
+#### Scenario: Completion on an already interacting terminal
+
+- **WHEN** structured completion arrives for the terminal the user is already clicking or typing in
+- **THEN** no finished indicator appears on that tab, the project activity dot, or the header Notifications number
+
+#### Scenario: Attention on an already interacting terminal
+
+- **WHEN** a bell or notification arrives for the terminal the user is already clicking or typing in
+- **THEN** no attention indicator appears on that tab, the project activity dot, or the header Notifications number
+
+#### Scenario: Completion after moving to another terminal
+
+- **WHEN** a user types in one terminal, then opens or focuses another terminal, and structured or agent completion then arrives for the first
+- **THEN** the first terminal shows a finished indicator, and its project activity dot and the header Notifications number include it
+
+#### Scenario: Project switch handoff
+
+- **WHEN** late fallback lifecycle output is produced while switching projects
+- **THEN** it belongs to the same viewing acknowledgement for the terminal that was visible at handoff
+
+### Requirement: Sessions settle before fallback finished activity
+
+A terminal session SHALL be considered settled once it has received user input or a structured command-executing or progress-busy marker. Until a session is settled, raw output, foreground busy-to-idle transitions, and a command-finished marker without a preceding command-executing marker SHALL NOT clear acknowledgement and therefore SHALL NOT produce the finished indicator. Working status SHALL still be derived from that evidence so the active indicator stays accurate during shell start-up. Bell and notification attention SHALL be unaffected by settlement. Provider-backed agent state SHALL be unaffected by settlement.
+
+#### Scenario: Shell start-up noise on an unviewed terminal
+
+- **WHEN** a new terminal prints its prompt and its start-up child processes exit without any user input
+- **THEN** the session remains acknowledged and no finished indicator appears
+
+#### Scenario: First command after typing
+
+- **WHEN** a user types a command into a new terminal and output later stops
+- **THEN** the session is settled and the finished indicator appears as usual
+
+#### Scenario: Lone finished marker at the first prompt
+
+- **WHEN** a shell integration emits a command-finished marker at its first prompt with no prior command-executing marker and no user input
+- **THEN** the session remains acknowledged
+
+#### Scenario: Structured marker settles without typing
+
+- **WHEN** a session receives a command-executing or progress-busy marker before any user input
+- **THEN** the session is settled and the following completion produces the finished indicator
+
+#### Scenario: Bell before settlement
+
+- **WHEN** an unfocused, unsettled terminal rings a bell
+- **THEN** fallback attention is still set
+
+### Requirement: Server-side parsing pipeline
+
+Structured terminal parsing SHALL run in Terminay Server independently of client mounting, native windows, and xterm view lifecycle. The terminal signal parser SHALL parse PTY bytes with a headless xterm parser and emit typed protocol signals; signal interpreters SHALL reduce those signals to a `SemanticActivity` snapshot; the server SHALL publish ordered changes through the application protocol; and the canonical activity reducer SHALL combine fallback activity with scoped focus, acknowledgement, and recent-input facts.
+
+#### Scenario: No client attached
+
+- **WHEN** no client is mounted for a terminal
+- **THEN** structured terminal parsing still runs on the server and publishes ordered changes
+
+### Requirement: PTY stream integrity and ordering
+
+The original data SHALL remain in the PTY stream and parsing SHALL NOT strip escape sequences before xterm receives them. Each chunk SHALL be parsed before its raw bytes are forwarded, so semantic activity state is ordered before client rendering and fallback state cannot flash for one frame.
+
+#### Scenario: Chunk containing an OSC sequence
+
+- **WHEN** a PTY chunk containing escape sequences is processed
+- **THEN** it is parsed first and then forwarded unmodified to the client
+
+### Requirement: Agent lifecycle service separation
+
+The agent lifecycle service SHALL be a separate upstream source. The server SHALL choose authoritative agent status for a session whenever such an entry exists and SHALL NOT feed provider journal events through the terminal-signal interpreters.
+
+#### Scenario: Journal event received
+
+- **WHEN** a provider journal event arrives for a session
+- **THEN** it sets authoritative agent status and is not routed through the terminal-signal interpreters
+
+### Requirement: Client projection of activity
+
+Clients SHALL render ordered activity events and report scoped focus and input acknowledgement; no renderer SHALL become the fallback authority. Transport-neutral clients SHALL maintain a bounded projection of the server snapshot and SHALL apply only contiguous revisions. A replay gap SHALL request a fresh snapshot, and reload or resync SHALL replace the projection without replaying old transitions as new local activity. A resync is an explicit authority boundary and SHALL therefore accept a lower revision when the server has restarted its revision sequence. Host transport adapters SHALL forward the projection client's resync callback rather than substituting an ordinary refresh, and presentation layers SHALL NOT impose a second revision comparison. Project-scoped projections SHALL advance the global cursor while omitting sessions owned by other projects.
+
+#### Scenario: Replay gap
+
+- **WHEN** a client detects a non-contiguous revision
+- **THEN** it requests a fresh snapshot rather than applying the gap
+
+#### Scenario: Server revision sequence restarts
+
+- **WHEN** the server restarts its revision sequence and the client resyncs
+- **THEN** the client accepts the lower revision at that explicit authority boundary
+
+#### Scenario: Project-scoped projection
+
+- **WHEN** a projection is scoped to one project
+- **THEN** it advances the global cursor and omits sessions owned by other projects
+
+### Requirement: Activity protocol surface
+
+The protocol SHALL expose the projection as `activity.snapshot` and `activity.delta`, SHALL emit canonical `activity` events on the normal ordered event journal, and SHALL accept `activity.acknowledge` only with the exact immutable `projectId` and `sessionId`. Destructive close protection SHALL use `activity.close-preflight` with that same exact project identity and, for a terminal close, the exact session identity. The preflight SHALL return a bounded fresh observation for only those sessions; `activity.snapshot` and `activity.delta` SHALL remain committed projection reads and SHALL never wait for live host inspection. Every activity operation name SHALL be a valid wire operation name, so that a client can encode the request and the server receives it. This is the client boundary used by both browser and Desktop hosts, and no `terminal:activity` IPC message is part of the server contract.
+
+#### Scenario: Acknowledge with mismatched ids
+
+- **WHEN** `activity.acknowledge` names a project or session other than the exact immutable pair
+- **THEN** the request is not accepted
+
+#### Scenario: Close preflight
+
+- **WHEN** a client calls `activity.close-preflight` for a terminal close
+- **THEN** it names the exact project and session identity and receives a bounded fresh observation for only those sessions
+
+#### Scenario: Close preflight over a real connection
+
+- **WHEN** a connected client sends `activity.close-preflight` for a running terminal whose committed projection still shows the shell in the foreground
+- **THEN** the request is encoded and delivered, the server takes a fresh host observation for that session, and the result reflects that observation rather than the committed projection
+
+#### Scenario: Desktop host activity
+
+- **WHEN** a Desktop host reads terminal activity
+- **THEN** it uses the same protocol surface and no `terminal:activity` IPC message
+
+### Requirement: Reducer fencing and stale events
+
+The server reducer SHALL fence every session to its first immutable project binding. An activity or acknowledgement request naming a different project SHALL be ignored without consuming a revision. Events and timeout ticks carrying an older observation time than the current session snapshot SHALL also be ignored, so delayed PTY chunks cannot rewind state or publish a second stale transition.
+
+#### Scenario: Request naming a different project
+
+- **WHEN** an activity or acknowledgement request names a project other than the session's first immutable binding
+- **THEN** it is ignored and no revision is consumed
+
+#### Scenario: Delayed PTY chunk
+
+- **WHEN** an event or timeout tick carries an older observation time than the current session snapshot
+- **THEN** it is ignored and no stale transition is published
+
+### Requirement: Activity settings
+
+Existing tab-indicator settings SHALL govern fallback terminal activity: **Use terminal signals for activity** enables structured-signal detection, **Progress signal timeout** controls `OSC 9;4` staleness, and **Show indicator for active tabs**, **Show indicator for finished tabs**, and the timing settings control fallback tab indicators. Disabling terminal-signal detection SHALL restore raw-output-based terminal activity and SHALL NOT change the **Agent status and sidebar** setting, provider lifecycle journals, or canonical agent status. The persisted **Agent status and sidebar** setting SHALL govern the agent feature as a whole, including journal discovery and its status surfaces, independently of the terminal-fallback settings.
+
+#### Scenario: Terminal-signal detection disabled
+
+- **WHEN** a user disables **Use terminal signals for activity**
+- **THEN** raw-output-based terminal activity is used
+- **AND** journal-backed agent status remains unaffected
+
+#### Scenario: Progress timeout changed
+
+- **WHEN** a user changes **Progress signal timeout**
+- **THEN** `OSC 9;4` staleness uses the new value
+
+#### Scenario: Independent agent setting
+
+- **WHEN** the **Agent status and sidebar** setting is changed
+- **THEN** journal discovery and agent status surfaces change without altering the terminal-fallback settings
+
+### Requirement: Error and recovery behaviour
+
+Malformed or oversized OSC payloads SHALL be ignored without interrupting PTY forwarding. Parser and interpreter failures SHALL stay local to the terminal-activity fallback and SHALL NOT invalidate canonical agent state. A stalled progress signal SHALL expire and a PTY exit SHALL clear its fallback timers. If authoritative journal observation stops, the in-memory entry SHALL retain its last accepted state until another journal event or terminal exit; Terminay MAY additionally show clearly fallback-derived terminal activity but SHALL NOT silently use it to mutate or relabel the canonical entry. If authoritative events later resume for the same terminal and agent identity, they SHALL take precedence immediately.
+
+#### Scenario: Malformed OSC payload
+
+- **WHEN** a malformed or oversized OSC payload arrives
+- **THEN** it is ignored and PTY forwarding continues
+
+#### Scenario: Interpreter failure
+
+- **WHEN** a parser or interpreter fails
+- **THEN** the failure stays local to the fallback and canonical agent state remains valid
+
+#### Scenario: Journal observation stops
+
+- **WHEN** authoritative journal observation stops for an agent
+- **THEN** the in-memory entry retains its last accepted state until another journal event or terminal exit
+
+#### Scenario: Journal events resume
+
+- **WHEN** authoritative events resume for the same terminal and agent identity
+- **THEN** they take precedence immediately
+
+### Requirement: Terminal activity non-goals
+
+Terminay SHALL NOT infer canonical agent states from raw text, terminal titles, spinner frames, process names, or escape-sequence message bodies; SHALL NOT treat an exit code as a canonical agent result without a provider event; SHALL NOT render progress percentages or failed-command badges; SHALL NOT install shell-integration scripts; SHALL NOT raise native desktop notifications from OSC payloads; and SHALL NOT expose a public third-party terminal-signal interpreter API.
+
+#### Scenario: Spinner frames in an unrecognized terminal
+
+- **WHEN** a terminal prints spinner frames or an agent-like title
+- **THEN** no canonical agent state is inferred from them
+
+#### Scenario: OSC notification received
+
+- **WHEN** a terminal emits an OSC notification payload
+- **THEN** no native desktop notification is raised from it
+
+#### Scenario: Progress percentage reported
+
+- **WHEN** `OSC 9;4;1;50` is received
+- **THEN** fallback activity is working and no progress percentage is rendered
+
+### Requirement: Signal sources for every session
+
+PTY-byte signals SHALL work at the server-owned terminal stream boundary for every session. Native foreground-process and journal signals SHALL be available for every session, because every session runs on the server that owns its project.
+
+#### Scenario: Terminal session signals
+
+- **WHEN** a session runs in a project
+- **THEN** PTY-byte signals are parsed at the server-owned stream boundary
+
+#### Scenario: Native signals
+
+- **WHEN** foreground-process or journal evidence is needed for a session
+- **THEN** the server's native foreground-process and journal signals are available for it
+
+### Requirement: Foreground observation availability states
+
+The activity snapshot SHALL identify foreground observation as `available` or `limited`. `limited` SHALL mean the session's observation cannot provide a current safe foreground answer and SHALL NOT mean that the terminal is idle.
+
+#### Scenario: Observation cannot answer
+
+- **WHEN** a session's observation cannot provide a current safe foreground answer
+- **THEN** the snapshot reports `limited` and this is not treated as idle
+
+### Requirement: Compact switcher activity presentation
+
+Terminal rows in the unified compact switcher SHALL present activity using the same vocabulary and priority as the terminal tab, the header activity menu, the project tab badge, and the dashboard, so no surface reads a state differently. A row SHALL indicate `working`, `waiting`, `blocked`, and `done` under the same acknowledgement rules those surfaces use, and SHALL stay neutral for `idle`. A project group heading SHALL carry that project's activity count badge with the same count, colour, and zero-hiding behaviour as that project's tab.
+
+#### Scenario: Row state matches the tab
+
+- **WHEN** a terminal is `working` and its row and its tab are both visible
+- **THEN** both indicate `working` with the same vocabulary
+
+#### Scenario: Viewing clears the row indicator
+
+- **WHEN** a terminal with an unacknowledged `done` entry is viewed
+- **THEN** its switcher row indicator clears alongside its tab indicator
+
+#### Scenario: Group heading carries the project badge
+
+- **WHEN** a project has two working terminals
+- **THEN** its switcher group heading shows the same amber badge reading `2` that its project tab shows
+
+### Requirement: Compact switcher preview line
+
+A terminal row SHALL show a preview line beneath its title when this window holds that terminal's rendered buffer, taken as the most recent non-empty line of that buffer and truncated to one line. The preview SHALL be a read of what this window already renders and SHALL NOT be requested from the server, SHALL NOT be persisted, and SHALL NOT be treated as activity authority. A row whose terminal has no rendered buffer in this window SHALL show no preview line rather than a placeholder, and SHALL remain fully operable.
+
+#### Scenario: Preview from the rendered buffer
+
+- **WHEN** a terminal rendered in this window has produced output
+- **THEN** its row shows the most recent non-empty line of that output, truncated to one line
+
+#### Scenario: No buffer, no preview
+
+- **WHEN** a terminal has no rendered buffer in this window
+- **THEN** its row shows no preview line and still activates that terminal when pressed
+
+#### Scenario: Preview never becomes authority
+
+- **WHEN** a preview line is shown for a terminal
+- **THEN** the terminal's activity state still comes from the activity projection and the preview changes no state
+
+### Requirement: Canonical terminal inactivity wait
+
+The server SHALL own one definition of terminal inactivity, used by every inactivity wait: the macro inactivity step, the MCP `wait_for_idle` tool, and the terminal inactivity protocol query. A wait for a period SHALL resolve only when the terminal has produced no non-empty output for that whole period and no live root agent bound to that terminal is `working`. Input, resize, focus, and client attachment SHALL NOT count as output.
+
+Only the `working` agent state SHALL hold a wait open. An agent that is `waiting`, `blocked`, `done`, or `idle` SHALL NOT hold it open. Subagent work SHALL hold a wait open only through the `working` state of its root. A terminal with no live bound agent, and a server whose agent integration is disabled, SHALL decide inactivity on output alone.
+
+When the last working agent bound to a terminal stops working, the quiet period of every outstanding wait on that terminal SHALL start again from that moment. A wait SHALL consult only agents bound to its own terminal session; agent state in another terminal or project SHALL NOT affect it. A wait SHALL remain cancellable throughout, and terminal exit SHALL resolve it immediately whatever the agent state.
+
+#### Scenario: Quiet terminal with no agent
+
+- **WHEN** a wait for three seconds is outstanding on a terminal with no bound agent and the terminal produces no output for three seconds
+- **THEN** the wait resolves
+
+#### Scenario: Output restarts the quiet period
+
+- **WHEN** a terminal produces output two seconds into a three-second wait
+- **THEN** the wait does not resolve until three further seconds pass without output
+
+#### Scenario: Working agent that prints nothing
+
+- **WHEN** a three-second wait is outstanding and the terminal's bound agent is `working` while the terminal produces no output for ten seconds
+- **THEN** the wait does not resolve during those ten seconds
+
+#### Scenario: Agent finishes its turn
+
+- **WHEN** a held wait's agent changes from `working` to `done` and the terminal then produces no output for the requested period
+- **THEN** the wait resolves at the end of that period, measured from the later of the state change and the last output
+
+#### Scenario: Agent asks for approval
+
+- **WHEN** a three-second wait is outstanding, the bound agent is `waiting` for approval, and the terminal produces no output for three seconds
+- **THEN** the wait resolves
+
+#### Scenario: Agent in another terminal
+
+- **WHEN** an agent is `working` in one terminal and a wait is outstanding on a different terminal that has been quiet for the requested period
+- **THEN** the wait on the quiet terminal resolves
+
+#### Scenario: Cancelling a held wait
+
+- **WHEN** a wait held open by a working agent is cancelled
+- **THEN** the wait ends as cancelled and the terminal and its agent are unaffected
+
+#### Scenario: Terminal exits while held
+
+- **WHEN** a terminal exits while a wait on it is held open by a working agent
+- **THEN** the wait resolves immediately
