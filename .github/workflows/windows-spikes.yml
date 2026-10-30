@@ -40,7 +40,7 @@ jobs:
         timeout-minutes: 5
       - name: Probe the installer
         shell: pwsh
-        timeout-minutes: 20
+        timeout-minutes: 15
         run: |
           $installer = Get-ChildItem release/*/Terminay-Windows-*-Setup.exe | Select-Object -First 1
           ./scripts/probe-windows-desktop.ps1 -Installer $installer.FullName -Record "$env:RUNNER_TEMP/windows-probe.json"
@@ -49,6 +49,14 @@ jobs:
         run: |
           cat "$RUNNER_TEMP/windows-probe.json" || true
           ls -la release/* || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-probe
+          path: |
+            ${{ runner.temp }}/windows-probe.json
+            ${{ runner.temp }}/windows-probe-failure.png
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         if: success()
         with:

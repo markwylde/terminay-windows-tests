@@ -11,10 +11,12 @@
 //
 //   node scripts/probe-windows-desktop.mjs --executable <Terminay.exe> --data-dir <dir> --record <file>
 //
-// The record names each step and its outcome; the first failure ends the run.
+// Every step is bounded and logged as it starts and ends. The record names each
+// step and its outcome; the first failure ends the run, with a screenshot of
+// the window beside the record.
 import assert from 'node:assert/strict';
 import { readdir, readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { _electron as electron } from '@playwright/test';
 
 function argument(name) {
@@ -28,23 +30,38 @@ const executablePath = argument('--executable');
 const dataDir = argument('--data-dir');
 const recordPath = argument('--record');
 const steps = [];
+const STEP_TIMEOUT_MS = 180_000;
+const ACTION_TIMEOUT_MS = 90_000;
+
+function log(message) {
+	console.log(`[${new Date().toISOString()}] ${message}`);
+}
 
 async function step(name, run) {
 	const started = Date.now();
+	log(`start: ${name}`);
+	let timer;
 	try {
-		const detail = await run();
+		const detail = await Promise.race([
+			run(),
+			new Promise((_, reject) => {
+				timer = setTimeout(() => reject(new Error(`${name} did not finish within ${STEP_TIMEOUT_MS} ms`)), STEP_TIMEOUT_MS);
+			}),
+		]);
 		steps.push({ name, ok: true, ms: Date.now() - started, ...(detail ? { detail } : {}) });
+		log(`ok: ${name} (${Date.now() - started} ms)`);
 	} catch (error) {
 		steps.push({ name, ok: false, ms: Date.now() - started, error: String(error?.stack ?? error).slice(0, 4000) });
+		log(`FAILED: ${name}: ${error?.message ?? error}`);
 		throw error;
+	} finally {
+		clearTimeout(timer);
 	}
 }
 
 async function launch() {
 	const app = await electron.launch({
-		// The probe waits for states the application reaches; a slow runner is
-		// not a failure, and the workflow step carries the overall bound.
-		timeout: 0,
+		timeout: ACTION_TIMEOUT_MS,
 		executablePath,
 		env: {
 			...process.env,
@@ -54,8 +71,10 @@ async function launch() {
 			VITE_DEV_SERVER_URL: '',
 		},
 	});
-	app.context().setDefaultTimeout(0);
-	const window = await app.firstWindow({ timeout: 0 });
+	app.process().stdout?.on('data', (chunk) => process.stdout.write(`[app] ${chunk}`));
+	app.process().stderr?.on('data', (chunk) => process.stdout.write(`[app] ${chunk}`));
+	app.context().setDefaultTimeout(ACTION_TIMEOUT_MS);
+	const window = await app.firstWindow();
 	await window.locator('[data-terminay-app-component]').waitFor({ state: 'visible' });
 	await window.locator('.terminal-tab-content').first().waitFor({ state: 'visible' });
 	return { app, window };
@@ -161,7 +180,12 @@ try {
 } catch (error) {
 	failure = error;
 } finally {
-	if (session) session.app.process().kill();
+	if (session) {
+		await session.window
+			.screenshot({ path: join(dirname(recordPath), 'windows-probe-failure.png'), timeout: 10_000 })
+			.catch(() => {});
+		session.app.process().kill();
+	}
 	const failed = steps.find((entry) => !entry.ok);
 	await writeFile(
 		recordPath,
@@ -175,3 +199,5 @@ if (failure) {
 	process.exit(1);
 }
 console.log(`Windows Desktop probe passed: ${steps.map((entry) => entry.name).join(', ')}`);
+// A held terminal's holder is not this process's to wait for.
+process.exit(0);

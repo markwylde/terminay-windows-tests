@@ -39,10 +39,13 @@ function Write-Record {
 
 function Invoke-Step([string] $Name, [scriptblock] $Body) {
 	$started = Get-Date
+	Write-Host "[$($started.ToString('o'))] start: $Name"
 	try {
 		& $Body
 		$result.steps += [ordered]@{ name = $Name; ok = $true; ms = [int]((Get-Date) - $started).TotalMilliseconds }
+		Write-Host "[$((Get-Date).ToString('o'))] ok: $Name"
 	} catch {
+		Write-Host "[$((Get-Date).ToString('o'))] FAILED: $Name`: $_"
 		$result.steps += [ordered]@{ name = $Name; ok = $false; ms = [int]((Get-Date) - $started).TotalMilliseconds; error = "$_" }
 		$result.failedStep = $Name
 		throw
@@ -52,7 +55,10 @@ function Invoke-Step([string] $Name, [scriptblock] $Body) {
 try {
 	Invoke-Step 'install' {
 		# /D must come last and unquoted (NSIS).
-		$process = Start-Process -FilePath $installer -ArgumentList '/S', "/D=$installDir" -Wait -PassThru
+		# WaitForExit waits for the installer alone; -Wait would also wait for
+		# anything it leaves running.
+		$process = Start-Process -FilePath $installer -ArgumentList '/S', "/D=$installDir" -PassThru
+		if (-not $process.WaitForExit(300000)) { throw 'installer did not finish within 5 minutes' }
 		if ($process.ExitCode -ne 0) { throw "installer exited $($process.ExitCode)" }
 		if (-not (Test-Path (Join-Path $installDir 'Terminay.exe'))) { throw "Terminay.exe is not in $installDir" }
 	}
@@ -73,7 +79,8 @@ try {
 		Get-CimInstance Win32_Process |
 			Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($dataDir, [StringComparison]::OrdinalIgnoreCase) } |
 			ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-		$process = Start-Process -FilePath (Join-Path $installDir 'Uninstall Terminay.exe') -ArgumentList '/S' -Wait -PassThru
+		$process = Start-Process -FilePath (Join-Path $installDir 'Uninstall Terminay.exe') -ArgumentList '/S' -PassThru
+		if (-not $process.WaitForExit(300000)) { throw 'uninstaller did not finish within 5 minutes' }
 		if ($process.ExitCode -ne 0) { throw "uninstaller exited $($process.ExitCode)" }
 		# The uninstaller copies itself out and finishes in the background.
 		for ($i = 0; $i -lt 60 -and (Test-Path (Join-Path $installDir 'Terminay.exe')); $i++) { Start-Sleep -Milliseconds 500 }
@@ -85,6 +92,8 @@ try {
 	Write-Host "Windows Desktop probe failed at: $($result.failedStep)"
 	Write-Host $_
 } finally {
+	$screenshot = Join-Path $scratch 'windows-probe-failure.png'
+	if (Test-Path $screenshot) { Copy-Item $screenshot (Join-Path (Split-Path -Parent $Record) 'windows-probe-failure.png') }
 	Write-Record
 }
 
