@@ -20,7 +20,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24.15.0
+      - run: npm install --prefix "$env:RUNNER_TEMP\koffi" koffi@2.16.3 --no-audit --no-fund
       - run: node scripts/windows-spikes/named-pipe.mjs
+        env:
+          KOFFI_DIR: ${{ runner.temp }}\koffi\node_modules
 
   git-trace2-directory:
     runs-on: windows-latest
