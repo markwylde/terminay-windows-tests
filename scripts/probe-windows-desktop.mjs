@@ -342,7 +342,16 @@ try {
 			.click();
 		const settings = (await opened) ?? window;
 		const states = settings.locator('.extension-card .extension-state');
-		await states.first().waitFor();
+		try {
+			await states.first().waitFor();
+		} catch (error) {
+			await settings
+				.screenshot({ path: join(dirname(recordPath), 'windows-probe-extensions-settings.png'), timeout: 10_000 })
+				.catch(() => {});
+			const text = (await settings.locator('body').innerText().catch(() => '')).slice(0, 1500);
+			if (settings !== window) await settings.close().catch(() => {});
+			throw new Error(`Settings showed no extension (${settings === window ? 'no new window' : settings.url()}): ${text}`, { cause: error });
+		}
 		// An extension starting up says pending; give each a moment to settle.
 		let seen = [];
 		await until(async () => {
@@ -378,9 +387,22 @@ try {
 		await folder(window, 'General').locator('.folders-tree__branch').getByText('main', { exact: true }).waitFor();
 
 		await type(window, `Set-Location "${repository}"`);
+		await type(window, 'Write-Output "trace2=$env:GIT_TRACE2_EVENT"');
+		const trace2 = await printed(window, 'trace2');
 		await type(window, 'git worktree add ..\\probe-worktree -b probe-worktree');
+		const folders = () =>
+			window.locator('.project-workspace--active .folders-tree__row--folder .folders-tree__name').allInnerTexts();
+		try {
+			await folder(window, 'probe-worktree').waitFor();
+		} catch (error) {
+			throw new Error(`no probe-worktree folder (folders: ${(await folders()).join(', ')}; trace2: ${trace2})`, { cause: error });
+		}
 		// The project's one terminal is the one that ran Git.
-		await folder(window, 'probe-worktree').locator('.folders-tree__row--terminal').waitFor();
+		try {
+			await folder(window, 'probe-worktree').locator('.folders-tree__row--terminal').waitFor();
+		} catch (error) {
+			throw new Error(`the folder appeared but its terminal was not moved (trace2: ${trace2})`, { cause: error });
+		}
 		await until(
 			async () => (await folder(window, 'General').locator('.folders-tree__row--terminal').count()) === 0,
 			'the terminal that ran git worktree add stayed in General',
