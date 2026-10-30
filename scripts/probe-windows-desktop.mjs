@@ -80,11 +80,24 @@ async function launch() {
 	return { app, window };
 }
 
-async function quit(app) {
+/**
+ * Quits the way the Quit menu item does, answering the quit confirmation with
+ * "keep" (the terminals stay with their holder) or "end". Playwright's own
+ * close() tears the windows down first, which is not a user quit.
+ */
+async function quit(app, choice) {
+	await app.evaluate(({ dialog }, response) => {
+		dialog.showMessageBox = async () => ({ checkboxChecked: false, response });
+	}, choice === 'keep' ? 0 : 1);
 	const child = app.process();
-	await app.close();
-	if (child.exitCode === null && child.signalCode === null)
-		await new Promise((resolve) => child.once('exit', resolve));
+	const exited = new Promise((resolve) => {
+		if (child.exitCode !== null || child.signalCode !== null) resolve();
+		else child.once('exit', resolve);
+	});
+	await app.evaluate(({ app: electronApp }) => {
+		setImmediate(() => electronApp.quit());
+	}).catch(() => undefined);
+	await exited;
 	assert.equal(child.exitCode, 0, 'Terminay must exit cleanly');
 }
 
@@ -169,7 +182,7 @@ try {
 	});
 
 	await step('server restart keeps the held terminal', async () => {
-		await quit(session.app);
+		await quit(session.app, 'keep');
 		session = await launch();
 		await output(session.window, `${marker}-42`);
 		await type(session.window, 'Write-Output "back-$(2+3)"');
@@ -177,7 +190,7 @@ try {
 	});
 
 	await step('quit', async () => {
-		await quit(session.app);
+		await quit(session.app, 'end');
 		session = undefined;
 	});
 } catch (error) {
