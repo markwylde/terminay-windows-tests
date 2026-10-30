@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createHash, sign, verify } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import {
   cp,
   lstat,
@@ -223,7 +224,26 @@ async function verifySecureWeriftSourceMirror(mirrorRoot) {
   return { cache: path.join(mirrorRoot, 'npm-cache'), license }
 }
 
+// Node refuses to spawn a .cmd without a shell on Windows, so npm runs as its
+// own script under this Node instead of through npm.cmd.
+function windowsNpm(args) {
+  const cli = process.env.npm_execpath?.endsWith('.js')
+    ? process.env.npm_execpath
+    : path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js')
+  return [process.execPath, [cli, ...args]]
+}
+
+// Windows has no patch of its own; Git for Windows, which the build needs,
+// carries GNU patch beside its exec path.
+function windowsPatch() {
+  const execPath = spawnSync('git', ['--exec-path'], { encoding: 'utf8' }).stdout?.trim()
+  const candidate = execPath && path.resolve(execPath, '..', '..', '..', 'usr', 'bin', 'patch.exe')
+  return candidate && existsSync(candidate) ? candidate : 'patch'
+}
+
 function run(command, args, options = {}) {
+  if (process.platform === 'win32' && command === 'npm.cmd') [command, args] = windowsNpm(args)
+  if (process.platform === 'win32' && command === 'patch') command = windowsPatch()
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       ...options,
