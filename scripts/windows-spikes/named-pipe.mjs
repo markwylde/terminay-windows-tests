@@ -18,7 +18,11 @@ const result = { node: process.version, uv: process.versions.uv, pipe: local };
 
 const listen = (path) =>
 	new Promise((resolve) => {
-		const server = createServer((socket) => socket.end('served\n'));
+		// The DACL probe connects and leaves at once; its write may then fail.
+		const server = createServer((socket) => {
+			socket.on('error', () => {});
+			socket.end('served\n');
+		});
 		server.once('error', (error) => resolve({ server: null, error: error.code ?? String(error) }));
 		server.listen(path, () => resolve({ server, error: null }));
 	});
@@ -89,8 +93,9 @@ async function otherUserConnect(path) {
 			'-NoProfile',
 			'-Command',
 			`$c = New-Object System.Management.Automation.PSCredential('${user}', (ConvertTo-SecureString '${password}' -AsPlainText -Force)); ` +
-				`Start-Process -FilePath '${process.execPath}' -ArgumentList '"${client}"','"${path}"','"${out}"' -Credential $c -WorkingDirectory 'C:\\Users\\Public' -Wait`,
-		]);
+				`$p = Start-Process -FilePath '${process.execPath}' -ArgumentList '"${client}"','"${path}"','"${out}"' -Credential $c -WorkingDirectory 'C:\\Users\\Public' -PassThru; ` +
+				`if (-not $p.WaitForExit(60000)) { $p.Kill(); throw 'second user client did not finish' }`,
+		], { timeout: 90_000 });
 		const { stdout } = await run('powershell.exe', ['-NoProfile', '-Command', `Get-Content -LiteralPath '${out}'`]);
 		return stdout.trim();
 	} catch (error) {
