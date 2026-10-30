@@ -1,7 +1,5 @@
-# Windows spikes for the native-windows-desktop change. Copied to
-# .github/workflows/ in the markwylde/terminay-windows-tests snapshot repository,
-# which exists only to run code on GitHub's Windows runners; nothing here runs
-# in the Terminay repository itself.
+# Windows packaging for the native-windows-desktop change. The spike jobs have
+# recorded their evidence; only packaging runs now.
 name: windows-spikes
 
 on:
@@ -11,66 +9,56 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: windows-package
+  cancel-in-progress: true
+
 jobs:
-  named-pipe:
-    runs-on: windows-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24.15.0
-      - run: npm install --prefix "$env:RUNNER_TEMP\koffi" koffi@2.16.3 --no-audit --no-fund
-      - run: node scripts/windows-spikes/named-pipe.mjs
-        env:
-          KOFFI_DIR: ${{ runner.temp }}\koffi\node_modules
-
-  git-trace2-directory:
-    runs-on: windows-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24.15.0
-      - run: node scripts/windows-spikes/git-trace2-directory.mjs
-
-  process-observation:
-    runs-on: windows-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24.15.0
-      - run: npm install -g npm@12.2.0
-      - run: npm ci --ignore-scripts --no-audit --no-fund
-      - run: npx turbo run build --filter=@terminay/server-core
-      - run: node scripts/windows-spikes/process-observation.mjs
-
   package-windows:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
+      - run: |
+          echo "image $env:ImageOS $env:ImageVersion"
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, OSArchitecture
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfLogicalProcessors
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24.15.0
       - run: npm install -g npm@12.2.0
+        timeout-minutes: 5
       - run: npm ci --no-audit --no-fund
+        timeout-minutes: 20
       - run: node node_modules/electron/install.js
-      - run: npm run build:app
+        timeout-minutes: 5
+      - run: npm run build:application-graph
+        timeout-minutes: 15
+      - run: npm run build:server-postcompile
+        timeout-minutes: 15
+      - run: npm run build:server-ui:bundle
+        timeout-minutes: 10
+      - run: npx tsc
+        timeout-minutes: 10
+      - run: npx vite build
+        timeout-minutes: 10
+      - run: npx vite build --config vite.server-preload.config.ts
+        timeout-minutes: 5
+      - shell: bash
+        run: node scripts/build-ui-bundle-manifest.mjs dist "$(node -p "require('./package.json').version")" 1 remote.html
+        timeout-minutes: 5
       - run: npx electron-builder --win nsis --x64 --publish never
+        timeout-minutes: 15
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
       - if: always()
         shell: bash
-        run: ls -la release || true
+        run: ls -laR release | head -50 || true
       - uses: actions/upload-artifact@v4
         if: success()
         with:
           name: windows-installer
           path: |
-            release/*.exe
-            release/*.yml
+            release/**/*.exe
+            release/**/*.yml
           retention-days: 7
