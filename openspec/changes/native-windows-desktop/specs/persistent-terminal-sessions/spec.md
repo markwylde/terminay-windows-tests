@@ -7,8 +7,10 @@ The pipe's name SHALL be derived from the current user's security identifier,
 the data root's absolute path, and the holder generation, so that one user and
 one data root always resolve to one name and no two users or data roots share
 it. The pipe SHALL be created as the first instance of its name, under a
-security descriptor that lets no other non-administrative user write to it, and
-SHALL refuse clients on another machine.
+security descriptor that grants write access only to the current user, the
+operating system, and administrators. A client that connects, from this
+machine or another, SHALL be admitted to the holder protocol only by the proof
+below.
 
 Before any session is listed, read, or written, each end SHALL prove to the
 other that it holds the holder credential stored in the data root, and neither
@@ -42,9 +44,11 @@ send it nothing.
 A running session holder SHALL NOT keep any file in the application's
 installation directory open or mapped, so that an update can replace the
 installation while the holder keeps its sessions. On Windows the holder SHALL
-run from a copy of its runtime that is private to its generation and kept under
-the data root. That copy SHALL be removed after the generation's holder has
-exited, and SHALL NOT be removed while it is running.
+run from a copy of its build's runtime, kept under the data root, whose
+executable has a name distinct from the application's. Holders of one build
+SHALL share that build's copy. A copy SHALL NOT be used until it is complete,
+SHALL be removed once no holder runs from it and its build is not the one
+starting, and SHALL NOT be removed while any holder runs from it.
 
 #### Scenario: Update while terminals are held on Windows
 

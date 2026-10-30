@@ -1,5 +1,5 @@
-# Windows packaging for the native-windows-desktop change. The spike jobs have
-# recorded their evidence; only packaging runs now.
+# Windows packaging for the native-windows-desktop change: the same
+# `npm run build:win` a release runs, then the PE architecture check.
 name: windows-spikes
 
 on:
@@ -21,7 +21,6 @@ jobs:
       - run: |
           echo "image $env:ImageOS $env:ImageVersion"
           Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, OSArchitecture
-          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfLogicalProcessors
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -32,28 +31,16 @@ jobs:
         timeout-minutes: 20
       - run: node node_modules/electron/install.js
         timeout-minutes: 5
-      - run: npm run build:application-graph
-        timeout-minutes: 15
-      - run: npm run build:server-postcompile
-        timeout-minutes: 15
-      - run: npm run build:server-ui:bundle
-        timeout-minutes: 10
-      - run: npx tsc
-        timeout-minutes: 10
-      - run: npx vite build
-        timeout-minutes: 10
-      - run: npx vite build --config vite.server-preload.config.ts
-        timeout-minutes: 5
-      - shell: bash
-        run: node scripts/build-ui-bundle-manifest.mjs dist "$(node -p "require('./package.json').version")" 1 remote.html
-        timeout-minutes: 5
-      - run: npx electron-builder --win nsis --x64 --publish never
-        timeout-minutes: 15
+      - run: npm run build:win
+        timeout-minutes: 30
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - shell: bash
+        run: node scripts/check-windows-pe-architecture.mjs release/*/win-unpacked
+        timeout-minutes: 5
       - if: always()
         shell: bash
-        run: ls -laR release | head -50 || true
+        run: ls -la release/* || true
       - uses: actions/upload-artifact@v4
         if: success()
         with:
@@ -61,4 +48,5 @@ jobs:
           path: |
             release/**/*.exe
             release/**/*.yml
+            !release/**/win-unpacked/**
           retention-days: 7

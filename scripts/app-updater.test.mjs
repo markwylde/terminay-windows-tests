@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
 	canInstallInPlace,
@@ -688,4 +689,12 @@ test('release notes render untrusted markdown without script, handlers, or remot
 	assert.equal(releaseNoteLinkTarget('javascript:alert(1)'), null);
 	assert.equal(releaseNoteLinkTarget('file:///etc/passwd'), null);
 	assert.equal(releaseNoteLinkTarget(null), null);
+});
+
+test('the Windows installer is per-user and one-click, so updates never need elevation', () => {
+	const config = readFileSync(new URL('../electron-builder.json5', import.meta.url), 'utf8');
+	const nsis = /"nsis":\s*\{([^}]*)\}/u.exec(config)?.[1] ?? '';
+	assert.match(nsis, /"oneClick":\s*true/u);
+	assert.match(nsis, /"perMachine":\s*false/u);
+	assert.match(nsis, /"allowToChangeInstallationDirectory":\s*false/u);
 });

@@ -139,9 +139,16 @@ The pipe is named
 libuv's `uv_pipe_bind` creates it with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so an
 existing name fails the bind with `EADDRINUSE`. It also uses the default
 security descriptor, under which only the creator, SYSTEM, and Administrators
-have write access. A spike confirms both behaviours, and whether libuv sets
-`PIPE_REJECT_REMOTE_CLIENTS`. If libuv does not set it, the holder rejects
-remote clients by checking `GetNamedPipeClientComputerNameW` through `koffi`.
+have write access. Spike 1.1 confirmed both. It also showed that libuv does not
+set `PIPE_REJECT_REMOTE_CLIENTS`, and that Node gives the server no pipe handle
+to ask who connected. So a pipe cannot tell a client on this machine from one
+reaching it over the network as the same principal. Connecting admits
+neither: the holder answers only a peer that completes the proof below, and the
+control pipe serves only a capability token (ADR-0083).
+
+The server, not the holder, closes `<dataRoot>\session-holder` to all but the
+user, SYSTEM and Administrators before it launches a holder. It passes the SID
+in `TERMINAY_SESSION_HOLDER_USER_SID`, so the holder loads no Win32 bindings.
 
 The holder protocol gains a version with mutual proof:
 
@@ -158,17 +165,19 @@ for Unix holders that are already live, as ADR-0035 requires.
 
 An installed `Terminay.exe` cannot be replaced while a process has it mapped.
 electron-builder's NSIS script also finds and kills running processes by name.
-So the first server of a new holder generation copies the minimal
-`ELECTRON_RUN_AS_NODE` runtime into `<dataRoot>\holder-runtime\<generation>\`:
+So the first holder launch of a build copies the minimal
+`ELECTRON_RUN_AS_NODE` runtime into `<dataRoot>\holder-runtime\<sha256(buildId)[:16]>\`,
+which every holder of that build shares:
 
 - the executable, renamed `terminay-session-holder.exe`;
 - its DLLs, `icudtl.dat`, and the V8 snapshot files;
 - the holder bundle and the unpacked `node-pty` (`pty.node`, `conpty.dll`,
   `OpenConsole.exe`).
 
-The holder runs from that copy. When the generation's holder has exited, and
-its pid is gone, a later server deletes the copy. It never deletes a copy whose
-holder is alive, which it checks by opening the process handle.
+The copy is made under a temporary name and renamed into place once it is
+complete. Holders run from it. A later launch removes every other build's copy,
+deleting the executable first. Windows refuses to delete a running image, so a
+copy whose executable will not go is still in use and is kept whole.
 
 The holder is spawned with `detached: true` and `windowsHide: true`, outside
 any kill-on-close job object.
@@ -212,14 +221,22 @@ server-core, which loads it only on `win32`. Desktop's
 `electron/processCwd.ts` delegates to the same module rather than duplicating
 it.
 
+PowerShell does not move its process directory on `Set-Location` (spike 1.4).
+So an interactive PowerShell that Terminay starts on Windows gets
+`-NoExit -EncodedCommand <hook>`. After the profiles load, the hook wraps the
+prompt so that each prompt sets `[Environment]::CurrentDirectory` to a
+filesystem location, then draws as before. The owner approved this as an
+exception to ADR-0051 (ADR-0084). The PEB read then needs no per-shell
+handling.
+
 *Alternatives:*
 
 - `wmic`, PowerShell `Get-CimInstance`, or `tasklist` for each observation.
   They spawn a process every time, cost 100–600 ms each, and would breach
   ADR-0021's spawn budget.
-- Shell integration through OSC 9;9 or OSC 7. This changes the user's prompt,
-  and it is the instrumentation ADR-0051 rules out. It also cannot see the
-  foreground process.
+- Shell integration through OSC 9;9 or OSC 7. It changes what the user's
+  prompt prints, needs a hook for every shell rather than PowerShell alone,
+  and cannot see the foreground process.
 - A bespoke N-API addon. That is a new native artifact to build and qualify,
   where `koffi` is already qualified.
 

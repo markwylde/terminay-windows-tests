@@ -9,8 +9,8 @@ import {
 	TerminayAiClient,
 	TerminayClientFacade,
 } from '@terminay/client-core';
-import type { DockviewApi, IDockviewPanel } from 'dockview';
-import { DockviewReact } from 'dockview';
+import type { DockviewApi, IDockviewPanel } from 'dockview-react';
+import { DockviewReact } from 'dockview-react';
 import {
 	CircleStop,
 	Eraser,
@@ -6453,6 +6453,7 @@ function App({
 		recordBootstrapDiagnostic('app.commit');
 	}, []);
 	const isMac = useMemo(() => navigator.userAgent.includes('Mac'), []);
+	const isWindows = useMemo(() => navigator.userAgent.includes('Windows'), []);
 	const hasNativeWindowControls =
 		hostPresentation?.nativeWindowControls ?? false;
 	// Fullscreen hides the traffic lights and squares the window corners, so the
@@ -10067,7 +10068,7 @@ function App({
 		>
 		<AppWindowsContext.Provider value={serverAppWindows}>
 		<div
-			className={`app-shell${isMac && hasNativeWindowControls && !isWindowFullScreen ? ' app-shell--macos' : ''}`}
+			className={`app-shell${isMac && hasNativeWindowControls && !isWindowFullScreen ? ' app-shell--macos' : ''}${isWindows && hasNativeWindowControls ? ' app-shell--windows' : ''}`}
 			data-terminay-app-component={TERMINAY_APP_COMPONENT_ID}
 			data-terminay-compact-chrome={isCompactChrome ? 'true' : 'false'}
 			data-terminay-active-project-id={displayedActiveProjectId}

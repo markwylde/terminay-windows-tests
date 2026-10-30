@@ -79,7 +79,8 @@
     "writeUpdateInfo": false
   },
   "win": {
-    "icon": "public/terminay.png",
+    // A checked-in .ico, so packaging never converts the PNG at build time.
+    "icon": "public/terminay.ico",
     "target": [
       {
         "target": "nsis",
@@ -97,6 +98,7 @@
     "oneClick": true,
     "perMachine": false,
     "allowToChangeInstallationDirectory": false,
+    "include": "build/installer.nsh",
     "deleteAppDataOnUninstall": false
   },
   "linux": {
