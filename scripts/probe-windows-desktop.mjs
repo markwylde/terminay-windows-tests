@@ -365,7 +365,7 @@ try {
 				.catch(() => {});
 			const text = (await settings.locator('body').innerText().catch(() => '')).slice(0, 3000);
 			if (settings !== window) await settings.close().catch(() => {});
-			throw new Error(`Settings showed no extension card: ${text}; log: ${await logLines(/extension|agents|koffi|canvas/iu)}`, { cause: error });
+			throw new Error(`Settings showed no extension card: ${text}; log: ${await logLines(/builtin-agents|all-your-agents|koffi/iu)}`, { cause: error });
 		}
 		// An extension starting up says pending; give each a moment to settle.
 		let seen = [];
@@ -429,7 +429,7 @@ try {
 			await type(window, 'Write-Output "trace2=$env:GIT_TRACE2_EVENT"', fresh);
 			const freshTrace2 = await printed(window, 'trace2', fresh).catch(() => '?');
 			throw new Error(
-				`the folder appeared but its terminal was not moved (trace2: "${trace2}", in a new terminal: "${freshTrace2}", trace directory exists: ${traceDirectory}; log: ${await logLines(/git|trace|worktree|capture/iu)})`,
+				`the folder appeared but its terminal was not moved (trace2: "${trace2}", in a new terminal: "${freshTrace2}", trace directory exists: ${traceDirectory}; log: ${await logLines(/worktree-capture|capture\.|stream\.listening|git-command|trace-directory/iu)})`,
 				{ cause: error },
 			);
 		}
