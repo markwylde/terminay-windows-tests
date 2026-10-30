@@ -69,6 +69,8 @@ try {
 		$journeyArgs = @((Join-Path $PSScriptRoot 'probe-windows-desktop.mjs'), '--executable', (Join-Path $installDir 'Terminay.exe'), '--data-dir', $dataDir, '--record', $journeyRecord) |
 			ForEach-Object { '"{0}"' -f $_ }
 		$process = Start-Process -FilePath (Get-Command node).Source -ArgumentList $journeyArgs -NoNewWindow -PassThru
+		# Reading Handle now keeps ExitCode available after the process exits.
+		$null = $process.Handle
 		if (-not $process.WaitForExit(900000)) { $process.Kill($true); throw 'journey did not finish within 15 minutes' }
 		$exit = $process.ExitCode
 		if (Test-Path $journeyRecord) {
