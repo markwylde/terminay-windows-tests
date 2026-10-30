@@ -67,6 +67,8 @@ async function launch() {
 			...process.env,
 			CI: '1',
 			TERMINAY_TEST: '1',
+			// A test launch keeps no holder unless asked; the probe asks.
+			TERMINAY_SESSION_HOLDER: '1',
 			TERMINAY_USER_DATA_DIR: dataDir,
 			VITE_DEV_SERVER_URL: '',
 		},
@@ -115,9 +117,9 @@ async function output(window, text) {
 	await terminal(window).locator('.xterm-rows').getByText(text, { exact: true }).first().waitFor();
 }
 
-/** Asks the shell for its width, so the answer is what the PTY reports. */
-async function columns(window, label) {
-	await type(window, `Write-Output "${label}-$([Console]::WindowWidth)"`);
+/** Has PowerShell print `<label>-<expression>`, and reads the number back. */
+async function answer(window, label, expression) {
+	await type(window, `Write-Output "${label}-${expression}"`);
 	const pattern = new RegExp(`^${label}-(\\d+)$`, 'u');
 	const line = terminal(window).locator('.xterm-rows > div').filter({ hasText: pattern }).first();
 	await line.waitFor();
@@ -150,7 +152,8 @@ try {
 	});
 
 	await step('powershell resize', async () => {
-		const before = await columns(session.window, 'cols-before');
+		// The shell's own width, so the answer is what the PTY reports.
+		const before = await answer(session.window, 'cols-before', '$([Console]::WindowWidth)');
 		await session.app.evaluate(({ BrowserWindow }) => {
 			const [window] = BrowserWindow.getAllWindows();
 			const [width, height] = window.getSize();
@@ -158,7 +161,7 @@ try {
 		});
 		let after = before;
 		for (let attempt = 0; attempt < 20 && after === before; attempt += 1)
-			after = await columns(session.window, `cols-after-${attempt}`);
+			after = await answer(session.window, `cols-after-${attempt}`, '$([Console]::WindowWidth)');
 		assert.ok(after < before, `the shell saw ${before} columns before the resize and ${after} after`);
 		return { before, after };
 	});
@@ -182,8 +185,10 @@ try {
 	});
 
 	await step('server restart keeps the held terminal', async () => {
+		const pid = await answer(session.window, 'pid-before', '$PID');
 		await quit(session.app, 'keep');
 		session = await launch();
+		assert.equal(await answer(session.window, 'pid-after', '$PID'), pid, 'the same PowerShell must answer after the restart');
 		await output(session.window, `${marker}-42`);
 		await type(session.window, 'Write-Output "back-$(2+3)"');
 		await output(session.window, 'back-5');
