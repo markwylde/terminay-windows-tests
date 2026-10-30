@@ -38,9 +38,17 @@ jobs:
       - shell: bash
         run: node scripts/check-windows-pe-architecture.mjs release/*/win-unpacked
         timeout-minutes: 5
+      - name: Probe the installer
+        shell: pwsh
+        timeout-minutes: 20
+        run: |
+          $installer = Get-ChildItem release/*/Terminay-Windows-*-Setup.exe | Select-Object -First 1
+          ./scripts/probe-windows-desktop.ps1 -Installer $installer.FullName -Record "$env:RUNNER_TEMP/windows-probe.json"
       - if: always()
         shell: bash
-        run: ls -la release/* || true
+        run: |
+          cat "$RUNNER_TEMP/windows-probe.json" || true
+          ls -la release/* || true
       - uses: actions/upload-artifact@v4
         if: success()
         with:
