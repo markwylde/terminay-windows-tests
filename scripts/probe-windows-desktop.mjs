@@ -348,8 +348,17 @@ try {
 		await terminal(window).locator('.xterm-helper-textarea').focus();
 		await window.keyboard.press('Control+C');
 		await until(async () => (await runningTerminals(app, window)) === 0, 'the terminal stayed busy after node ended');
-		await type(window, 'Write-Output "after-busy-$(1+1)"');
-		await output(window, 'after-busy-2');
+		// PSReadLine drops what is typed while it redraws the prompt after an
+		// interrupt, so the shell is asked again until it answers.
+		for (let attempt = 0; ; attempt += 1) {
+			await type(window, `Write-Output "after-busy-${attempt}-$(1+1)"`);
+			try {
+				await terminal(window).locator('.xterm-rows').getByText(`after-busy-${attempt}-2`, { exact: true }).first().waitFor({ timeout: 10_000 });
+				break;
+			} catch (error) {
+				if (attempt === 2) throw error;
+			}
+		}
 	});
 
 	await check('the MCP pipe answers from inside a terminal', async () => {
