@@ -38,6 +38,10 @@ jobs:
       # A release always carries a version; 0.0.0 is a development build,
       # which never checks for updates.
       - run: node scripts/sync-package-version.mjs 1.0.0-beta.1
+      # A release stages the WebRTC runtime from source, as here.
+      - run: node scripts/stage-selected-secure-werift-runtime.mjs
+        shell: bash
+        timeout-minutes: 10
       - run: npm run build:win
         id: build
         timeout-minutes: 30
