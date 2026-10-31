@@ -6,6 +6,7 @@ on:
   push:
     paths-ignore:
       - scripts/probe-windows-desktop.*
+      - scripts/probe-windows-update.mjs
       - .github/workflows/windows-probe.yml
   workflow_dispatch:
 
@@ -73,6 +74,15 @@ jobs:
             ${{ runner.temp }}/windows-probe.json
             ${{ runner.temp }}/windows-probe-*.png
           if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.update_probe.outcome == 'success'
+        with:
+          name: windows-update-feed
+          path: |
+            ${{ runner.temp }}/update-probe/*.exe
+            ${{ runner.temp }}/update-probe/*.blockmap
+            ${{ runner.temp }}/update-probe/beta.yml
+          retention-days: 7
       # Kept whenever it built, so the probe-only workflow can rerun against it.
       - uses: actions/upload-artifact@v4
         if: always() && steps.build.outcome == 'success'

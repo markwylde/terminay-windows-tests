@@ -6,6 +6,7 @@ on:
   push:
     paths:
       - scripts/probe-windows-desktop.*
+      - scripts/probe-windows-update.mjs
       - .github/workflows/windows-probe.yml
   workflow_dispatch:
 
@@ -38,14 +39,21 @@ jobs:
           path: installer
           run-id: ${{ steps.build.outputs.run }}
           github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-update-feed
+          path: update-feed
+          run-id: ${{ steps.build.outputs.run }}
+          github-token: ${{ github.token }}
       - run: npm install --no-save --no-audit --no-fund --ignore-scripts @playwright/test@1.60.0
         timeout-minutes: 5
       - name: Probe the installer
         shell: pwsh
-        timeout-minutes: 15
+        timeout-minutes: 25
         run: |
           $installer = Get-ChildItem -Recurse installer -Filter 'Terminay-Windows-*-Setup.exe' | Select-Object -First 1
-          ./scripts/probe-windows-desktop.ps1 -Installer $installer.FullName -Record "$env:RUNNER_TEMP/windows-probe.json"
+          $next = (Select-String -Path update-feed/beta.yml -Pattern '^version:\s*(\S+)').Matches[0].Groups[1].Value
+          ./scripts/probe-windows-desktop.ps1 -Installer $installer.FullName -Record "$env:RUNNER_TEMP/windows-probe.json" -UpdateFeed (Resolve-Path update-feed).Path -UpdateVersion $next
       - if: always()
         shell: bash
         run: cat "$RUNNER_TEMP/windows-probe.json" || true
