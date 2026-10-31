@@ -42,7 +42,9 @@ jobs:
       - run: node scripts/stage-selected-secure-werift-runtime.mjs
         shell: bash
         timeout-minutes: 10
+      # From Git Bash, as a release builds: its tar, not Windows', comes first.
       - run: npm run build:win
+        shell: bash
         id: build
         timeout-minutes: 30
         env:
