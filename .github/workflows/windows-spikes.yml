@@ -34,6 +34,9 @@ jobs:
         timeout-minutes: 20
       - run: node node_modules/electron/install.js
         timeout-minutes: 5
+      # A release always carries a version; 0.0.0 is a development build,
+      # which never checks for updates.
+      - run: node scripts/sync-package-version.mjs 1.0.0-beta.1
       - run: npm run build:win
         id: build
         timeout-minutes: 30
