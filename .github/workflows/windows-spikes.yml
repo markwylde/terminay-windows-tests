@@ -42,12 +42,21 @@ jobs:
       - shell: bash
         run: node scripts/check-windows-pe-architecture.mjs release/*/win-unpacked
         timeout-minutes: 5
-      - name: Probe the installer
-        shell: pwsh
+      - name: Build the update probe's next version
+        id: update_probe
+        shell: bash
         timeout-minutes: 15
         run: |
+          next="$(sh scripts/build-windows-update-probe.sh "$(node -p "require('./package.json').version")" "$RUNNER_TEMP/update-probe")"
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+      - name: Probe the installer
+        shell: pwsh
+        timeout-minutes: 25
+        env:
+          UPDATE_VERSION: ${{ steps.update_probe.outputs.version }}
+        run: |
           $installer = Get-ChildItem release/*/Terminay-Windows-*-Setup.exe | Select-Object -First 1
-          ./scripts/probe-windows-desktop.ps1 -Installer $installer.FullName -Record "$env:RUNNER_TEMP/windows-probe.json"
+          ./scripts/probe-windows-desktop.ps1 -Installer $installer.FullName -Record "$env:RUNNER_TEMP/windows-probe.json" -UpdateFeed "$env:RUNNER_TEMP/update-probe" -UpdateVersion $env:UPDATE_VERSION
       - if: always()
         shell: bash
         run: |
